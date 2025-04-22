@@ -1,0 +1,17 @@
+[package]
+name = "cidrscan"
+version = "0.1.0"
+authors = ["TheRealMkadmi <wahibmkadmi16@gmail.com>"]
+edition = "2021"
+description = "A high-performance memory-resident Patricia tree with TTL support for CIDR tagging and IP lookups."
+license = "MIT"
+repository = "https://github.com/TheRealMkadmi/cidrscan-rs"
+
+[dependencies]
+shared_memory = "0.12.4"      # Cross‑platform shared memory support 
+raw_sync      = "0.1.5"       # Provides Mutex, RwLock for shared memory
+spin          = "0.10.0"       # Spin-based locks for synchronization
+
+[lib]
+name = "cidrscan"
+crate-type = ["rlib", "cdylib"]
