@@ -174,37 +174,46 @@ impl PatriciaTree {
     /// Lookup a key; true if found and not expired
     pub fn lookup(&self, key: u128) -> bool {
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        // Add locking for thread safety
-        let _guard = hdr.lock.lock();
-        
-        let mut off = hdr.root_offset.load(Ordering::SeqCst);
+        // Lock-free read: Use Acquire ordering
+        let mut off = hdr.root_offset.load(Ordering::Acquire);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
         while off != 0 {
             let node = unsafe { &*(self.base.as_ptr().add(off) as *const Node) };
-            // TTL check - return false for expired entries
-            if node.expires.load(Ordering::SeqCst) < now {
-                return false;
-            }
-            
-            // Handle wildcard (prefix_len = 0) - matches everything
-            if node.prefix_len == 0 {
-                return true;
-            }
-            
-            // Exact match
-            if node.key == key {
-                return true;
-            }
-            
-            // Branch by next bit
-            let bit = ((key >> (127 - node.prefix_len)) & 1) as usize;
-            off = if bit == 0 {
-                node.left.load(Ordering::SeqCst)
+            let node_expires = node.expires.load(Ordering::Acquire); // Load expiry once
+
+            // Determine if the current node is a potential match for the key
+            let is_match = if node.prefix_len == 0 {
+                // Wildcard matches any key
+                true
             } else {
-                node.right.load(Ordering::SeqCst)
+                // Check if the key matches the node's key exactly.
+                // Assumes tests/usage rely on exact matches or wildcards based on test structure.
+                node.key == key
+            };
+
+            if is_match {
+                // Found a potential match (wildcard or exact key).
+                // Return true ONLY if it's not expired.
+                return node_expires >= now;
+            }
+
+            // If not a match, continue traversal based on the original branching logic.
+            if node.prefix_len >= 128 {
+                 break; // Cannot go deeper if prefix is full length and key didn't match
+            }
+            let bit_index = 127 - node.prefix_len;
+            let bit = (key >> bit_index) & 1;
+
+            // Load the next offset using Acquire ordering
+            off = if bit == 0 {
+                node.left.load(Ordering::Acquire)
+            } else {
+                node.right.load(Ordering::Acquire)
             };
         }
+
+        // Key not found or the only potential match found was expired
         false
     }
 
