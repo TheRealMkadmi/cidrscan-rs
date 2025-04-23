@@ -105,10 +105,10 @@ impl PatriciaTree {
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
         let region_size = size_of::<Header>() + capacity * size_of::<Node>();
         
-        // Try to create, fallback to open if it already exists
-        let shmem = match ShmemConf::new().os_id(name).size(region_size).create() {
-            Ok(map) => map,
-            Err(ShmemError::MappingIdExists) => ShmemConf::new().os_id(name).open()?,
+        // Try to create, mark if new, else open existing mapping
+        let (shmem, is_new) = match ShmemConf::new().os_id(name).size(region_size).create() {
+            Ok(map) => (map, true),
+            Err(ShmemError::MappingIdExists) => (ShmemConf::new().os_id(name).open()?, false),
             Err(e) => return Err(e),
         };
 
@@ -117,16 +117,22 @@ impl PatriciaTree {
         let hdr_ptr = base_ptr as *mut Header;
         let hdr = NonNull::new(hdr_ptr).unwrap();
 
-        // Initialize header exactly once per new mapping
+        // Initialize or reset the mapping based on creation success
         let hdr_mut = unsafe { &mut *hdr_ptr };
-        if hdr_mut.capacity == 0 {
-            // fresh header state
+        if is_new {
+            // brand–new mapping: initialize header
             *hdr_mut = Header {
                 lock: RwLock::new(()),
                 node_count: AtomicUsize::new(0),
                 root_offset: AtomicUsize::new(0),
                 capacity,
             };
+        } else {
+            // existing mapping: wipe out previous contents
+            let _w = hdr_mut.lock.write();
+            hdr_mut.node_count.store(0, Ordering::SeqCst);
+            hdr_mut.root_offset.store(0, Ordering::SeqCst);
+            hdr_mut.capacity = capacity;
         }
 
         Ok(Self { shmem, base, hdr, free_list: Mutex::new(Vec::new()) })
@@ -538,6 +544,15 @@ impl PatriciaTree {
     /// Bulk insert multiple entries
     pub fn bulk_insert(&self, items: &[(u128, u8, u64)]) {
         for &(k, l, t) in items { self.insert(k, l, t) }
+    }
+
+    /// Clears the entire tree (drops all nodes).
+    pub fn clear(&self) {
+        let hdr = unsafe { &mut *self.hdr.as_ptr() };
+        let _w = hdr.lock.write();
+        hdr.node_count.store(0, Ordering::SeqCst);
+        hdr.root_offset.store(0, Ordering::SeqCst);
+        self.free_list.lock().clear();
     }
 } // end impl PatriciaTree
 
