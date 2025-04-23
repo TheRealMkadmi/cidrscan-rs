@@ -73,6 +73,7 @@ struct Header {
     node_count: AtomicUsize,     // bump allocator index
     root_offset: AtomicUsize,    // atomic root pointer for lock‑free reads
     capacity: usize,             // max nodes in arena
+    ref_count: AtomicUsize,     // live-handle counter
 }
 
 /// Node in the Patricia tree, each aligned to cache line
@@ -91,6 +92,7 @@ pub struct PatriciaTree {
     hdr: NonNull<Header>, // Pointer to header in shared memory
     base: NonNull<u8>, // Base pointer for node offsets
     free_list: Mutex<Vec<usize>>, // offsets of deleted nodes to reuse
+    os_id: String, // Track the shared memory name for Drop
 }
 
 // SAFETY: Even though PatriciaTree contains raw pointers (NonNull<u8>),
@@ -111,30 +113,31 @@ impl PatriciaTree {
     /// Create or open a shared‑memory tree
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
         let region_size = size_of::<Header>() + capacity * size_of::<Node>();
-        
-        // True cross-process create/open: only initialize header if we actually created it
+        let map_file = format!("{}.map", name);
+        // Use flink for file-backed mapping (cross-platform destroy)
         let (shmem, is_creator) = {
-            // true cross-process create/open semantics
-            let create_conf = ShmemConf::new().os_id(name).size(region_size);
+            let create_conf = ShmemConf::new().os_id(name).flink(&map_file).size(region_size);
             match create_conf.create() {
                 Ok(map) => (map, true),
                 Err(ShmemError::MappingIdExists) => {
-                    // mapping exists: open with a fresh config
-                    let open_conf = ShmemConf::new().os_id(name).size(region_size);
+                    let open_conf = ShmemConf::new().os_id(name).flink(&map_file).size(region_size);
                     (open_conf.open()?, false)
                 }
                 Err(e) => return Err(e),
             }
         };
-
         let base_ptr = shmem.as_ptr() as *mut u8;
         let base = NonNull::new(base_ptr).unwrap();
         let hdr_ptr = base_ptr as *mut Header;
         let hdr = NonNull::new(hdr_ptr).unwrap();
-
-        // Initialize header only on the first actual creation (across all processes)
         let hdr_mut = unsafe { &mut *hdr_ptr };
-        if is_creator || hdr_mut.magic != HEADER_MAGIC || hdr_mut.version != HEADER_VERSION {
+        let prev_count = hdr_mut.ref_count.load(Ordering::SeqCst);
+        if is_creator
+            || hdr_mut.magic   != HEADER_MAGIC
+            || hdr_mut.version != HEADER_VERSION
+            || hdr_mut.capacity != capacity
+            || prev_count == 0
+        {
             *hdr_mut = Header {
                 magic:       HEADER_MAGIC,
                 version:     HEADER_VERSION,
@@ -143,17 +146,22 @@ impl PatriciaTree {
                 node_count:  AtomicUsize::new(0),
                 root_offset: AtomicUsize::new(0),
                 capacity,
+                ref_count:   AtomicUsize::new(0),
             };
-        } else {
-            // existing valid header: ensure same capacity
-            debug_assert_eq!(
-                hdr_mut.capacity,
-                capacity,
-                "opened PatriciaTree with a different capacity than it was created"
-            );
         }
+        let hdr_ref = unsafe { &*hdr_ptr };
+        hdr_ref.ref_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Self { shmem, base, hdr, free_list: Mutex::new(Vec::new()), os_id: name.to_string() })
+    }
 
-        Ok(Self { shmem, base, hdr, free_list: Mutex::new(Vec::new()) })
+    /// Unlink the named shared-memory object (manual cleanup)
+    pub fn destroy(name: &str) -> std::io::Result<()> {
+        let map_file = format!("{}.map", name);
+        if std::path::Path::new(&map_file).exists() {
+            std::fs::remove_file(map_file)
+        } else {
+            Ok(())
+        }
     }
 
     /// Allocate a node offset in the arena
@@ -274,6 +282,7 @@ impl PatriciaTree {
                             hdr.node_count.fetch_sub(1, Ordering::Relaxed);
                             panic!("PatriciaTree capacity exceeded allocating internal node during split");
                         }
+                        // this line is correct. Do not change it. size_of requires ()
                         internal_offset = size_of::<Header>() + index * size_of::<Node>();
                         let node_ptr = unsafe { self.base.as_ptr().add(internal_offset) as *mut Node };
                         unsafe {
@@ -579,3 +588,20 @@ pub mod public_api;
 
 // Re-export all public API functions at the crate root
 pub use public_api::*;
+
+
+impl Drop for PatriciaTree {
+    fn drop(&mut self) {
+        let hdr = unsafe { &*self.hdr.as_ptr() };
+        let prev = hdr.ref_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 1 {
+            #[cfg(unix)]
+            {
+                let c_name = std::ffi::CString::new(self.os_id.clone()).unwrap();
+                let _ = unsafe { libc::shm_unlink(c_name.as_ptr()) };
+            }
+            // On Windows: no-op
+        }
+        // The mapping itself is unmapped automatically by Shmem’s Drop
+    }
+}

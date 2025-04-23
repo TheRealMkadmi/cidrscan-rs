@@ -12,6 +12,7 @@ fn ipv4_to_u128(a: u8, b: u8, c: u8, d: u8) -> u128 {
 
 #[test]
 fn basic_insert_lookup_delete() {
+    let _ = PatriciaTree::destroy("test_basic"); // cleanup before
     let tree = PatriciaTree::open("test_basic", 128).expect("open failed");
     let key = ipv4_to_u128(192, 168, 0, 1);
     // initially not found
@@ -22,10 +23,12 @@ fn basic_insert_lookup_delete() {
     // delete & re-check
     tree.delete(key);
     assert!(!tree.lookup(key));
+    let _ = PatriciaTree::destroy("test_basic"); // cleanup after
 }
 
 #[test]
 fn ttl_expiry_various() {
+    let _ = PatriciaTree::destroy("test_ttl");
     let tree = PatriciaTree::open("test_ttl", 128).unwrap();
     let key1 = ipv4_to_u128(10, 0, 0, 1);
     // zero TTL → immediate expiry
@@ -37,11 +40,13 @@ fn ttl_expiry_various() {
     assert!(tree.lookup(key2));
     thread::sleep(Duration::from_secs(2));
     assert!(!tree.lookup(key2));
+    let _ = PatriciaTree::destroy("test_ttl");
 }
 
 #[test]
 #[should_panic(expected = "exceeded")]
 fn capacity_overflow_panics() {
+    let _ = PatriciaTree::destroy("test_cap");
     // capacity = 2 nodes
     let tree = PatriciaTree::open("test_cap", 2).unwrap();
     // Insert 3 unique keys → panic
@@ -50,10 +55,12 @@ fn capacity_overflow_panics() {
     tree.insert(ipv4_to_u128(2, 2, 2, 2), 32, 60);
     // Third should panic on unwrap due to Err(CapacityExceeded)
     tree.insert(ipv4_to_u128(3, 3, 3, 3), 32, 60);
+    let _ = PatriciaTree::destroy("test_cap");
 }
 
 #[test]
 fn ipv6_prefix_behavior() {
+    let _ = PatriciaTree::destroy("test_ipv6");
     let tree = PatriciaTree::open("test_ipv6", 64).unwrap();
     // a sample IPv6 address: 2001:0db8::1
     let segments = [
@@ -69,10 +76,12 @@ fn ipv6_prefix_behavior() {
     let key = segments.iter().fold(0u128, |acc, &part| acc | part);
     tree.insert(key, 64, 60);
     assert!(tree.lookup(key));
+    let _ = PatriciaTree::destroy("test_ipv6");
 }
 
 #[test]
 fn shared_memory_visibility_between_handles() {
+    let _ = PatriciaTree::destroy("test_shared");
     let tree1 = PatriciaTree::open("test_shared", 128).unwrap();
     let key = ipv4_to_u128(172, 16, 0, 1);
     tree1.insert(key, 32, 60);
@@ -84,10 +93,12 @@ fn shared_memory_visibility_between_handles() {
     // ensure delete in one handle is visible in the other
     tree2.delete(key);
     assert!(!tree1.lookup(key));
+    let _ = PatriciaTree::destroy("test_shared");
 }
 
 #[test]
 fn concurrent_threaded_inserts_and_lookups() {
+    let _ = PatriciaTree::destroy("test_conc");
     const THREADS: usize = 8;
     const OPS_PER_THREAD: usize = 1_000;
     // Use Arc directly, PatriciaTree handles internal locking
@@ -115,10 +126,12 @@ fn concurrent_threaded_inserts_and_lookups() {
         }));
     }
     for h in handles { let _ = h.join(); }
+    let _ = PatriciaTree::destroy("test_conc");
 }
 
 #[test]
 fn stress_test_timing() {
+    let _ = PatriciaTree::destroy("test_stress");
     // Reduced parameters for faster execution (under 1 min goal)
     const CAPACITY: usize = 65_536;
     const NUM_KEYS: usize = 20_000;
@@ -144,10 +157,12 @@ fn stress_test_timing() {
     println!("avg lookup ({} keys): {:.2} μs", NUM_KEYS, avg);
     // Keep the performance check, but it's less critical now
     // assert!(avg < 10.0, "lookup too slow: {:.2}μs", avg);
+    let _ = PatriciaTree::destroy("test_stress");
 }
 
 #[test]
 fn edge_cases_zero_capacity_and_large_prefix() {
+    let _ = PatriciaTree::destroy("test_zero_cap");
     // zero capacity → only header; any insert panics
     let tree = PatriciaTree::open("test_zero_cap", 0).unwrap();
     let k = ipv4_to_u128(8, 8, 8, 8);
@@ -162,10 +177,13 @@ fn edge_cases_zero_capacity_and_large_prefix() {
                 "Expected panic message about zero capacity, got: {}", msg);
     }
 
+    let _ = PatriciaTree::destroy("test_zero_cap");
     // insert with prefix_len = 0 matches all keys
+    let _ = PatriciaTree::destroy("test_prefix0");
     let tree2 = PatriciaTree::open("test_prefix0", 16).unwrap();
     let wildcard = 0u128;
     tree2.insert(wildcard, 0, 60);
     assert!(tree2.lookup(ipv4_to_u128(1,2,3,4)), "Wildcard should match any IP");
     assert!(tree2.lookup(ipv4_to_u128(255,255,255,255)), "Wildcard should match any IP");
+    let _ = PatriciaTree::destroy("test_prefix0");
 }
