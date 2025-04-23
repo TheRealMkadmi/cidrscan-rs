@@ -42,7 +42,7 @@ jobs:
       - name: Package artifacts
         run: |
           mkdir artifacts
-          cp cidrscan.h artifacts/
+          cp target/${{ matrix.target }}/release/cidrscan.h artifacts/
           case "${{ matrix.target }}" in
             *windows-msvc)
               cp target/${{ matrix.target }}/release/cidrscan.dll artifacts/ || true
@@ -92,7 +92,7 @@ jobs:
       - name: Package artifacts
         run: |
           mkdir artifacts
-          cp cidrscan.h artifacts/
+          cp target/${{ matrix.target }}/release/cidrscan.h artifacts/
           cp target/${{ matrix.target }}/release/libcidrscan.dylib artifacts/ || true
           cd artifacts
           zip -r ../${{ matrix.artifact_name }}.zip *
