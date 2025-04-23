@@ -119,11 +119,13 @@ impl PatriciaTree {
             let create_conf = ShmemConf::new().os_id(name).flink(&map_file).size(region_size);
             match create_conf.create() {
                 Ok(map) => (map, true),
-                Err(ShmemError::MappingIdExists) => {
-                    let open_conf = ShmemConf::new().os_id(name).flink(&map_file).size(region_size);
-                    (open_conf.open()?, false)
-                }
-                Err(e) => return Err(e),
+                Err(e) => match e {
+                    ShmemError::MappingIdExists | ShmemError::LinkExists => {
+                        let open_conf = ShmemConf::new().os_id(name).flink(&map_file).size(region_size);
+                        (open_conf.open()?, false)
+                    }
+                    _ => return Err(e),
+                },
             }
         };
         let base_ptr = shmem.as_ptr() as *mut u8;
