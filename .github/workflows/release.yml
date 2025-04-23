@@ -36,7 +36,7 @@ jobs:
         with:
           command: build
           target: ${{ matrix.target }}
-          args: "--release --locked"
+          args: "--release"
           strip: true
 
       - name: Package artifacts
@@ -76,7 +76,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
+      - name: Setup Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
       - name: Install cbindgen
         run: brew install cbindgen
 
