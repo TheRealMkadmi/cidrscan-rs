@@ -59,9 +59,16 @@ use std::{
 /// Maximum nodes if not specified
 const DEFAULT_CAPACITY: usize = 1_048_576;
 
+/// Magic and ABI version for header integrity checks
+const HEADER_MAGIC: u64 = 0x434944525343414E; // "CIDRSCAN"
+const HEADER_VERSION: u16 = 1;
+
 /// Shared‑memory header (aligned to cache line)
 #[repr(C, align(64))]
 struct Header {
+    magic: u64,            // identifies valid CIDRScan header
+    version: u16,          // ABI version
+    _reserved: [u8; 6],    // padding to 16 bytes total
     lock: RwLock<()>,            // readers–writer lock
     node_count: AtomicUsize,     // bump allocator index
     root_offset: AtomicUsize,    // atomic root pointer for lock‑free reads
@@ -105,11 +112,19 @@ impl PatriciaTree {
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
         let region_size = size_of::<Header>() + capacity * size_of::<Node>();
         
-        // Try to create, mark if new, else open existing mapping
-        let (shmem, is_new) = match ShmemConf::new().os_id(name).size(region_size).create() {
-            Ok(map) => (map, true),
-            Err(ShmemError::MappingIdExists) => (ShmemConf::new().os_id(name).open()?, false),
-            Err(e) => return Err(e),
+        // True cross-process create/open: only initialize header if we actually created it
+        let (shmem, is_creator) = {
+            // true cross-process create/open semantics
+            let create_conf = ShmemConf::new().os_id(name).size(region_size);
+            match create_conf.create() {
+                Ok(map) => (map, true),
+                Err(ShmemError::MappingIdExists) => {
+                    // mapping exists: open with a fresh config
+                    let open_conf = ShmemConf::new().os_id(name).size(region_size);
+                    (open_conf.open()?, false)
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         let base_ptr = shmem.as_ptr() as *mut u8;
@@ -117,22 +132,25 @@ impl PatriciaTree {
         let hdr_ptr = base_ptr as *mut Header;
         let hdr = NonNull::new(hdr_ptr).unwrap();
 
-        // Initialize or reset the mapping based on creation success
+        // Initialize header only on the first actual creation (across all processes)
         let hdr_mut = unsafe { &mut *hdr_ptr };
-        if is_new {
-            // brand–new mapping: initialize header
+        if is_creator || hdr_mut.magic != HEADER_MAGIC || hdr_mut.version != HEADER_VERSION {
             *hdr_mut = Header {
-                lock: RwLock::new(()),
-                node_count: AtomicUsize::new(0),
+                magic:       HEADER_MAGIC,
+                version:     HEADER_VERSION,
+                _reserved:   [0; 6],
+                lock:        RwLock::new(()),
+                node_count:  AtomicUsize::new(0),
                 root_offset: AtomicUsize::new(0),
                 capacity,
             };
         } else {
-            // existing mapping: wipe out previous contents
-            let _w = hdr_mut.lock.write();
-            hdr_mut.node_count.store(0, Ordering::SeqCst);
-            hdr_mut.root_offset.store(0, Ordering::SeqCst);
-            hdr_mut.capacity = capacity;
+            // existing valid header: ensure same capacity
+            debug_assert_eq!(
+                hdr_mut.capacity,
+                capacity,
+                "opened PatriciaTree with a different capacity than it was created"
+            );
         }
 
         Ok(Self { shmem, base, hdr, free_list: Mutex::new(Vec::new()) })

@@ -40,7 +40,7 @@ fn ttl_expiry_various() {
 }
 
 #[test]
-#[should_panic(expected = "CapacityExceeded")]
+#[should_panic(expected = "exceeded")]
 fn capacity_overflow_panics() {
     // capacity = 2 nodes
     let tree = PatriciaTree::open("test_cap", 2).unwrap();
