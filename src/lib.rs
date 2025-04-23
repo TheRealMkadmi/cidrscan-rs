@@ -345,13 +345,11 @@ impl PatriciaTree {
                 return false; // prefix diverged
             }
             let exp = node.expires.load(Ordering::Acquire);
-            if node.key == key {
-                // Skip internal routing nodes (they use u64::MAX for expires)
-                if exp != u64::MAX {
-                    return exp >= now;
-                }
-                // Internal node, continue traversal to find leaf
+            // If this node is a leaf/prefix node (not internal) and key matches its prefix, return its TTL state
+            if exp != u64::MAX && cpl == node.prefix_len {
+                return exp >= now;
             }
+            // Otherwise it's an internal node: traverse based on next bit
             if node.prefix_len >= 128 {
                 return false;
             }
