@@ -2,7 +2,12 @@
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
 
-use core::panic;
+// Disable debug printing: override println! macro to no-op
+// #[macro_export]
+// macro_rules! println {
+//     ($($arg:tt)*) => {};
+// }
+
 // Helper function to calculate the length of the common prefix (up to max_len bits)
 fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
     if max_len == 0 { return 0; } // Handle zero length prefix comparison
@@ -142,6 +147,9 @@ impl PatriciaTree {
         if prefix_len > 128 { panic!("Prefix length cannot exceed 128"); }
 
         let hdr = unsafe { &*self.hdr.as_ptr() };
+        if hdr.capacity == 0 {
+            panic!("Cannot insert into a zero-capacity tree");
+        }
         let _guard = hdr.lock.lock(); // Acquire exclusive write lock
         println!("[INSERT] Lock acquired. Current node_count={}", hdr.node_count.load(Ordering::Relaxed));
 
@@ -185,7 +193,7 @@ impl PatriciaTree {
             println!("[INSERT] max_cmp_len={}, cpl={}", max_cmp_len, cpl);
 
             // --- Subcase 2a: Exact Match ---
-            if cpl == prefix_len && cpl == current_node.prefix_len {
+            if cpl == prefix_len && cpl == current_node.prefix_len && key == current_node.key {
                 println!("[INSERT] Subcase 2a: Exact match found. Updating TTL.");
                 current_node.expires.store(expires, Ordering::Relaxed);
                 println!("[INSERT] Finished Subcase 2a.");
@@ -193,7 +201,8 @@ impl PatriciaTree {
             }
 
             // --- Subcase 2b: Split Required ---
-            if cpl < current_node.prefix_len {
+            // Split also when prefix lengths match exactly but keys differ
+            if cpl < current_node.prefix_len || (cpl == prefix_len && cpl == current_node.prefix_len && key != current_node.key) {
                  println!("[INSERT] Subcase 2b: Split required at cpl={}.", cpl);
                  let current_node_count = hdr.node_count.load(Ordering::Relaxed);
                  println!("[INSERT] Checking capacity for split: count={}, capacity={}", current_node_count, hdr.capacity);
@@ -210,15 +219,15 @@ impl PatriciaTree {
 
                  unsafe {
                      let internal_node = &mut *(self.base.as_ptr().add(internal_offset) as *mut Node);
-                     let existing_node_bit = get_bit(current_node.key, cpl);
-                     println!("[INSERT] Split branching: existing_node_bit={}", existing_node_bit);
-
-                     if existing_node_bit == 0 {
-                         internal_node.left.store(current_offset, Ordering::Relaxed);
-                         internal_node.right.store(leaf_offset, Ordering::Relaxed);
-                     } else {
-                         internal_node.right.store(current_offset, Ordering::Relaxed);
+                     // Branch based on new key's bit at split point
+                     let new_bit = get_bit(key, cpl);
+                     println!("[INSERT] Split branching: new_key_bit={}", new_bit);
+                     if new_bit == 0 {
                          internal_node.left.store(leaf_offset, Ordering::Relaxed);
+                         internal_node.right.store(current_offset, Ordering::Relaxed);
+                     } else {
+                         internal_node.right.store(leaf_offset, Ordering::Relaxed);
+                         internal_node.left.store(current_offset, Ordering::Relaxed);
                      }
                      println!("[INSERT] Linking new internal node at offset={}.", internal_offset);
                      current_link_ptr.as_ref().store(internal_offset, Ordering::Release);
@@ -285,6 +294,9 @@ impl PatriciaTree {
     fn allocate_node(&self, key: u128, prefix_len: u8, expires: u64) -> usize {
         println!("[ALLOC] key={:x}, prefix_len={}, expires={}", key, prefix_len, expires);
         let hdr = unsafe { &*self.hdr.as_ptr() };
+        if hdr.capacity == 0 {
+            panic!("Cannot insert into a zero-capacity tree");
+        }
         // Fetch_add happens *before* the check, ensuring atomicity for index reservation.
         let index = hdr.node_count.fetch_add(1, Ordering::Relaxed);
         println!("[ALLOC] Reserved index={}, capacity={}", index, hdr.capacity);
@@ -323,51 +335,33 @@ impl PatriciaTree {
 
     /// Lookup a key; true if found and not expired (Revised for Patricia structure)
     pub fn lookup(&self, key: u128) -> bool {
-        println!("[LOOKUP] key={:x}", key);
         let hdr = unsafe { &*self.hdr.as_ptr() };
         let mut current_offset = hdr.root_offset.load(Ordering::Acquire);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        println!("[LOOKUP] Starting at root_offset={}, now={}", current_offset, now);
-
         while current_offset != 0 {
-            println!("[LOOKUP] Loop: current_offset={}", current_offset);
             let node = unsafe { &*(self.base.as_ptr().add(current_offset) as *const Node) };
-            println!("[LOOKUP] Node: key={:x}, prefix_len={}, expires={}", node.key, node.prefix_len, node.expires.load(Ordering::Relaxed));
-
             let cpl = common_prefix_len(key, node.key, node.prefix_len);
-            println!("[LOOKUP] cpl={}", cpl);
-
             if cpl < node.prefix_len {
-                println!("[LOOKUP] Diverged (cpl < node.prefix_len). Not found.");
-                return false;
+                return false; // prefix diverged
             }
-
-            // Node's prefix matches start of key.
-            let node_expires = node.expires.load(Ordering::Acquire);
-            if node_expires >= now {
-                 println!("[LOOKUP] Node prefix matches and is not expired. Found match.");
-                 // In a real CIDR lookup, we might continue searching for a *more specific* match.
-                 // For the current tests assuming exact prefix insertion/lookup, this is sufficient.
-                 return true;
+            let exp = node.expires.load(Ordering::Acquire);
+            if node.key == key {
+                // Skip internal routing nodes (they use u64::MAX for expires)
+                if exp != u64::MAX {
+                    return exp >= now;
+                }
+                // Internal node, continue traversal to find leaf
             }
-            println!("[LOOKUP] Node prefix matches but is expired (expires={}, now={}). Continuing search.", node_expires, now);
-
-            // If expired, or if we needed a more specific match, continue traversal.
             if node.prefix_len >= 128 {
-                println!("[LOOKUP] Node prefix_len >= 128. Cannot go deeper. Not found (or expired).");
                 return false;
             }
-
             let next_bit = get_bit(key, node.prefix_len);
-            println!("[LOOKUP] Traversing based on bit {} = {}", node.prefix_len, next_bit);
             current_offset = if next_bit == 0 {
                 node.left.load(Ordering::Acquire)
             } else {
                 node.right.load(Ordering::Acquire)
             };
         }
-
-        println!("[LOOKUP] Reached end of branch (offset 0). Not found.");
         false
     }
 
@@ -378,7 +372,7 @@ impl PatriciaTree {
         let _guard = hdr.lock.lock(); // Need write lock to modify expiry
         println!("[DELETE] Lock acquired.");
 
-        let current_offset = hdr.root_offset.load(Ordering::Relaxed);
+        let mut current_offset = hdr.root_offset.load(Ordering::Relaxed);
         println!("[DELETE] Starting at root_offset={}", current_offset);
 
         // Need to track parent link to potentially update it if we prune nodes (future enhancement)
@@ -390,59 +384,59 @@ impl PatriciaTree {
             let node = unsafe { &*node_ptr }; // Read-only ref first
             println!("[DELETE] Node: key={:x}, prefix_len={}", node.key, node.prefix_len);
 
+            // Compare the full key against the node's key up to the node's prefix length.
             let cpl = common_prefix_len(key, node.key, node.prefix_len);
             println!("[DELETE] cpl={}", cpl);
 
             if cpl < node.prefix_len {
                 println!("[DELETE] Diverged (cpl < node.prefix_len). Key not found.");
-                return; // Key not found
+                return; // Key not found in this subtree
             }
 
-            // Node's prefix matches start of key.
-            // Does the *entire* node match the key we want to delete?
-            // This assumes delete targets an exact key+prefix combo that was inserted.
-            // If we just match prefix, we might delete a parent node unintentionally.
-            // Let's refine: Delete only if cpl == node.prefix_len (prefix matches)
-            // AND maybe check if key == node.key? Or assume prefix match is enough?
-            // The tests seem to imply deleting the specific inserted prefix.
+            // If the common prefix length matches the node's prefix length,
+            // it means the node's prefix matches the beginning of the key.
+            // Now, check if this node is the *exact* one we want to delete.
+            // For simplicity, we assume delete targets the exact key (prefix 128 implicitly).
+            // A more robust implementation might take prefix_len as an argument.
             if cpl == node.prefix_len {
-                println!("[DELETE] Found node with matching prefix. Expiring node at offset={}.", current_offset);
-                let node_mut = unsafe { &mut *node_ptr };
-                node_mut.expires.store(0, Ordering::Release); // Expire the node
-                println!("[DELETE] Finished.");
-                return; // Return after expiring the first matching node found.
+                // Check if the node's key *exactly* matches the target key.
+                // This implicitly checks if node.prefix_len is also 128 (or matches the key's significant bits).
+                // We also need to consider the case where the node represents a shorter prefix (e.g., /64)
+                // and the key matches that prefix exactly. The current test inserts with prefix 64,
+                // but deletes with the full key. Let's expire if the node key matches the target key
+                // *masked by the node's prefix length*.
+                let mask = if node.prefix_len == 128 { !0u128 } else { !(!0u128 >> node.prefix_len) };
+                if (key & mask) == (node.key & mask) {
+                    // This node represents the prefix we are looking for.
+                    // Check if the *keys* are identical. If the test inserts key K with prefix P,
+                    // and we call delete(K), we should expire the node if node.key == K and node.prefix_len == P.
+                    // The current test inserts (key, 64, ttl) and calls delete(key).
+                    // Let's expire if node.key == key and node.prefix_len matches the implicit target (or the original insertion).
+                    // For the concurrent test, keys are unique, so node.key == key should suffice.
+                    if node.key == key {
+                        println!("[DELETE] Found exact key match. Expiring node at offset={}.", current_offset);
+                        let node_mut = unsafe { &mut *node_ptr };
+                        node_mut.expires.store(0, Ordering::Release); // Expire the node
+                        println!("[DELETE] Finished.");
+                        // TODO: Implement pruning of expired nodes if necessary.
+                        return;
+                    }
+                    // If keys don't match exactly, but the prefix does, it means the node we found
+                    // is a less specific prefix. We need to continue searching deeper.
+                    println!("[DELETE] Prefix matches, but key differs. Traversing down.");
+                } else {
+                    // This case (cpl == node.prefix_len but masked keys differ) should theoretically not happen
+                    // due to how common_prefix_len works. If it does, it implies an issue elsewhere.
+                    println!("[DELETE] Inconsistent state: cpl == node.prefix_len but masked keys differ. Key not found.");
+                    return;
+                }
             }
 
-            // If node.prefix_len > cpl, we already returned.
-            // If node.prefix_len == cpl, we just handled it.
-            // So, we only continue if node.prefix_len < cpl, meaning we need to traverse down.
-            // Wait, the condition is cpl == node.prefix_len for exact match.
-            // If cpl == node.prefix_len, we need to traverse if the key is *more specific*.
-            // The key is more specific if its actual length (e.g. 128) is > node.prefix_len.
-            // Let's assume delete targets the *exact* prefix length inserted.
-            // So if cpl == node.prefix_len, we expire and return.
-
-            // If we reach here, it means cpl == node.prefix_len, but we didn't return?
-            // Ah, the logic above returns if cpl == node.prefix_len. So we only get here
-            // if cpl > node.prefix_len, which is impossible by definition of common_prefix_len.
-            // Let's rethink the traversal condition.
-
-            // We traverse down if the current node is a prefix of the key, but not the exact node we want.
-            // This happens if cpl == node.prefix_len, but the key is longer/more specific.
-            // The current delete logic expires the *first* node whose prefix matches the start of the key.
-            // This might be incorrect if we inserted 10.0.0.0/8 and 10.1.0.0/16, and try to delete 10.1.0.0/16.
-            // The current logic would find 10.0.0.0/8 first and expire it.
-
-            // --- Revised Delete Traversal ---
-            // We only expire if cpl == node.prefix_len AND node.prefix_len is the length we are looking for.
-            // Since delete() doesn't take prefix_len, we have ambiguity.
-            // Let's stick to expiring the *first* matching prefix found for now, as per the code.
-            // The traversal logic below this point seems unreachable with the current return.
-
-            // If we needed to traverse (e.g., to find the most specific match to delete):
-            /*
+            // If we reach here, it means cpl == node.prefix_len, but the keys didn't match exactly,
+            // OR cpl > node.prefix_len (which is impossible).
+            // We need to traverse down based on the next bit *after* the node's prefix.
             if node.prefix_len >= 128 {
-                println!("[DELETE] Node prefix_len >= 128. Cannot go deeper. Key not found (or already expired).");
+                println!("[DELETE] Node prefix_len >= 128, but key didn't match exactly. Key not found.");
                 return; // Cannot go deeper
             }
 
@@ -453,7 +447,6 @@ impl PatriciaTree {
             } else {
                 node.right.load(Ordering::Relaxed)
             };
-            */
         }
         println!("[DELETE] Reached end of branch (offset 0). Key not found.");
         // Key not found if loop finishes
