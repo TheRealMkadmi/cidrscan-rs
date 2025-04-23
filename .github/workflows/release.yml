@@ -49,11 +49,12 @@ jobs:
       - name: Install cbindgen
         run: cargo install cbindgen
 
-      - name: Generate C header
-        run: cbindgen --config cbindgen.toml --crate cidrscan --output cidrscan.h
 
       - name: Build shared library
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Generate C header
+        run: cbindgen --config cbindgen.toml --crate cidrscan --output cidrscan.h
 
       - name: Prepare artifacts
         shell: bash
