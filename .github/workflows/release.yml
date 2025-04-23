@@ -26,14 +26,14 @@ jobs:
             IFS=":" read -r target name <<< "$pair"
             cross build --release --target $target
             mkdir -p packages/$name
-            cp target/$target/release/cidrscan.h packages/$name/
+            cp target/release/cidrscan.h packages/$name/
             case "$target" in
               *windows-msvc)
                 cp target/$target/release/cidrscan.dll packages/$name/ || true
                 cp target/$target/release/cidrscan.lib packages/$name/ || true
                 ;;
               *)
-                cp target/release/libcidrscan.* packages/$name/ || true
+                cp target/$target/release/libcidrscan.* packages/$name/ || true
                 ;;
             esac
             cd packages/$name
@@ -68,7 +68,7 @@ jobs:
             IFS=":" read -r target name <<< "$pair"
             cargo build --release --target $target
             mkdir -p packages/$name
-            cp target/release/cidrscan.h packages/$name/
+            cp target/$target/release/cidrscan.h packages/$name/
             cp target/$target/release/libcidrscan.dylib packages/$name/ || true
             cd packages/$name
             zip -r ../../$name.zip *
