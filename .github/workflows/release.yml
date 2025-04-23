@@ -1,81 +1,98 @@
 name: Build and Release Libraries
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths-ignore:
-      - .github/workflows/release.yml
   push:
-    branches:
-      - main
-
-    
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths-ignore: [.github/workflows/release.yml]
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
+  build-linux-windows:
+    name: Build Linux & Windows
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
             artifact_name: linux-x86_64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
             artifact_name: linux-aarch64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - target: x86_64-pc-windows-msvc
             artifact_name: windows-x86_64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact_name: macos-aarch64
+          - target: aarch64-pc-windows-msvc
+            artifact_name: windows-aarch64
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+      - name: Install cross
+        run: |
+          cargo install cross
+
+      - name: Build libraries
+        uses: houseabsolute/actions-rust-cross@v1
         with:
-          toolchain: stable
+          command: build
           target: ${{ matrix.target }}
-          override: true
+          args: "--release --locked"
+          strip: true
 
-      - name: Install cbindgen
-        run: cargo install cbindgen
-
-
-      - name: Build shared library
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Generate C header
-        run: cbindgen --config cbindgen.toml --crate cidrscan --output cidrscan.h
-
-      - name: Prepare artifacts
-        shell: bash
+      - name: Package artifacts
         run: |
           mkdir artifacts
           cp cidrscan.h artifacts/
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            cp target/${{ matrix.target }}/release/cidrscan.dll artifacts/ || true
-            cp target/${{ matrix.target }}/release/cidrscan.lib artifacts/ || true
-          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
-            cp target/${{ matrix.target }}/release/libcidrscan.dylib artifacts/ || true
-          else
-            cp target/${{ matrix.target }}/release/libcidrscan.so artifacts/ || true
-          fi
-
-      - name: Zip artifacts
-        run: |
+          case "${{ matrix.target }}" in
+            *windows-msvc)
+              cp target/${{ matrix.target }}/release/cidrscan.dll artifacts/ || true
+              cp target/${{ matrix.target }}/release/cidrscan.lib artifacts/ || true
+              ;;
+            *)
+              cp target/${{ matrix.target }}/release/libcidrscan.* artifacts/ || true
+              ;;
+          esac
           cd artifacts
-          zip ../${{ matrix.artifact_name }}.zip *
+          zip -r ../${{ matrix.artifact_name }}.zip *
 
       - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact_name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            artifact_name: macos-x86_64
+          - target: aarch64-apple-darwin
+            artifact_name: macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cbindgen
+        run: brew install cbindgen
+
+      - name: Build library
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifacts
+        run: |
+          mkdir artifacts
+          cp cidrscan.h artifacts/
+          cp target/${{ matrix.target }}/release/libcidrscan.dylib artifacts/ || true
+          cd artifacts
+          zip -r ../${{ matrix.artifact_name }}.zip *
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.artifact_name }}.zip
