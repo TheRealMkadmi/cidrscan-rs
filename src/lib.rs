@@ -2,12 +2,6 @@
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
 
-// Disable debug printing: override println! macro to no-op
-// #[macro_export]
-// macro_rules! println {
-//     ($($arg:tt)*) => {};
-// }
-
 // Helper function to calculate the length of the common prefix (up to max_len bits)
 fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
     if max_len == 0 { return 0; } // Handle zero length prefix comparison
