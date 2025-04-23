@@ -35,8 +35,20 @@ fn get_bit(key: u128, index: u8) -> u8 {
     ((key >> (127 - index)) & 1) as u8
 }
 
+// Helper function to create a mask for a given prefix length
+#[inline]
+fn mask(prefix_len: u8) -> u128 {
+    if prefix_len == 0 {
+        0 // No bits set for zero length prefix
+    } else if prefix_len >= 128 {
+        !0u128 // All bits set for 128 or more
+    } else {
+        !(!0u128 >> prefix_len) // Create mask by shifting
+    }
+}
+
 use shared_memory::{Shmem, ShmemConf, ShmemError};  // Shared memory mapping :contentReference[oaicite:13]{index=13}
-use parking_lot::RwLock;  // Readers–writer lock for safe concurrent access
+use parking_lot::{RwLock, Mutex};  // RwLock for header, Mutex for free_list
 use std::{
     mem::size_of,
     ptr::NonNull,
@@ -71,6 +83,7 @@ pub struct PatriciaTree {
     shmem: Shmem, // The shared memory mapping
     hdr: NonNull<Header>, // Pointer to header in shared memory
     base: NonNull<u8>, // Base pointer for node offsets
+    free_list: Mutex<Vec<usize>>, // offsets of deleted nodes to reuse
 }
 
 // SAFETY: Even though PatriciaTree contains raw pointers (NonNull<u8>),
@@ -116,7 +129,7 @@ impl PatriciaTree {
             };
         }
 
-        Ok(Self { shmem, base, hdr })
+        Ok(Self { shmem, base, hdr, free_list: Mutex::new(Vec::new()) })
     }
 
     /// Allocate a node offset in the arena
@@ -207,37 +220,96 @@ impl PatriciaTree {
             // --- Subcase 2b: Split Required ---
             // Split also when prefix lengths match exactly but keys differ
             if cpl < current_node.prefix_len || (cpl == prefix_len && cpl == current_node.prefix_len && key != current_node.key) {
-                 println!("[INSERT] Subcase 2b: Split required at cpl={}.", cpl);
-                 let current_node_count = hdr.node_count.load(Ordering::Relaxed);
-                 println!("[INSERT] Checking capacity for split: count={}, capacity={}", current_node_count, hdr.capacity);
-                 // Need space for internal + leaf node (+1 already fetched by one allocate_node, need +1 more)
-                 if current_node_count + 1 >= hdr.capacity { // Check if adding *one more* exceeds capacity
-                     println!("[INSERT] PANIC: Capacity exceeded before split allocation.");
-                     panic!("PatriciaTree capacity exceeded (split requires 2 nodes)");
-                 }
-                 let internal_offset = self.allocate_node(key, cpl, u64::MAX);
-                 println!("[INSERT] Allocated internal node at offset={}.", internal_offset);
-                 // Capacity check for the second node is implicitly handled by the next allocate_node call
-                 let leaf_offset = self.allocate_node(key, prefix_len, expires);
-                 println!("[INSERT] Allocated leaf node for split at offset={}.", leaf_offset);
-
-                 unsafe {
-                     let internal_node = &mut *(self.base.as_ptr().add(internal_offset) as *mut Node);
-                     // Branch based on new key's bit at split point
-                     let new_bit = get_bit(key, cpl);
-                     println!("[INSERT] Split branching: new_key_bit={}", new_bit);
-                     if new_bit == 0 {
-                         internal_node.left.store(leaf_offset, Ordering::Relaxed);
-                         internal_node.right.store(current_offset, Ordering::Relaxed);
-                     } else {
-                         internal_node.right.store(leaf_offset, Ordering::Relaxed);
-                         internal_node.left.store(current_offset, Ordering::Relaxed);
-                     }
-                     println!("[INSERT] Linking new internal node at offset={}.", internal_offset);
-                     current_link_ptr.as_ref().store(internal_offset, Ordering::Release);
-                 }
-                 println!("[INSERT] Finished Subcase 2b.");
-                 return;
+                println!("[INSERT] Subcase 2b: Split required at cpl={}.", cpl);
+                // ATOMIC: Hold free_list lock for both check and allocation
+                let (internal_offset, leaf_offset);
+                {
+                    let mut free_list = self.free_list.lock();
+                    let reserved = hdr.node_count.load(Ordering::Acquire);
+                    let free_len = free_list.len();
+                    let available = free_len + hdr.capacity.saturating_sub(reserved);
+                    if available < 2 {
+                        println!("[INSERT] PANIC: Not enough capacity for split (need 2 slots, have={}).", available);
+                        panic!("PatriciaTree capacity exceeded (split requires 2 nodes)");
+                    }
+                    // Allocate internal node
+                    if let Some(offset) = free_list.pop() {
+                        println!("[ALLOC] Reusing freed node for internal at offset={}", offset);
+                        let node_ptr = unsafe { self.base.as_ptr().add(offset) as *mut Node };
+                        unsafe {
+                            core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(cpl));
+                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, cpl);
+                            (*node_ptr).left.store(0, Ordering::Relaxed);
+                            (*node_ptr).right.store(0, Ordering::Relaxed);
+                            (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
+                        }
+                        internal_offset = offset;
+                    } else {
+                        let index = hdr.node_count.fetch_add(1, Ordering::Relaxed);
+                        if index >= hdr.capacity {
+                            hdr.node_count.fetch_sub(1, Ordering::Relaxed);
+                            panic!("PatriciaTree capacity exceeded allocating internal node during split");
+                        }
+                        internal_offset = size_of::<Header>() + index * size_of::<Node>();
+                        let node_ptr = unsafe { self.base.as_ptr().add(internal_offset) as *mut Node };
+                        unsafe {
+                            core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(cpl));
+                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, cpl);
+                            (*node_ptr).left.store(0, Ordering::Relaxed);
+                            (*node_ptr).right.store(0, Ordering::Relaxed);
+                            (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
+                        }
+                    }
+                    // Allocate leaf node
+                    if let Some(offset) = free_list.pop() {
+                        println!("[ALLOC] Reusing freed node for leaf at offset={}", offset);
+                        let node_ptr = unsafe { self.base.as_ptr().add(offset) as *mut Node };
+                        unsafe {
+                            core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                            (*node_ptr).left.store(0, Ordering::Relaxed);
+                            (*node_ptr).right.store(0, Ordering::Relaxed);
+                            (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                        }
+                        leaf_offset = offset;
+                    } else {
+                        let index = hdr.node_count.fetch_add(1, Ordering::Relaxed);
+                        if index >= hdr.capacity {
+                            hdr.node_count.fetch_sub(1, Ordering::Relaxed);
+                            // Roll back internal node if it was newly allocated
+                            let internal_index = (internal_offset - size_of::<Header>()) / size_of::<Node>();
+                            if internal_index == index - 1 {
+                                free_list.push(internal_offset);
+                            }
+                            panic!("PatriciaTree capacity exceeded allocating leaf node during split");
+                        }
+                        leaf_offset = size_of::<Header>() + index * size_of::<Node>();
+                        let node_ptr = unsafe { self.base.as_ptr().add(leaf_offset) as *mut Node };
+                        unsafe {
+                            core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                            (*node_ptr).left.store(0, Ordering::Relaxed);
+                            (*node_ptr).right.store(0, Ordering::Relaxed);
+                            (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                        }
+                    }
+                }
+                unsafe {
+                    let internal_node = &mut *(self.base.as_ptr().add(internal_offset) as *mut Node);
+                    let new_bit = get_bit(key, cpl);
+                    println!("[INSERT] Split branching: new_key_bit={}", new_bit);
+                    if new_bit == 0 {
+                        internal_node.left.store(leaf_offset, Ordering::Relaxed);
+                        internal_node.right.store(current_offset, Ordering::Relaxed);
+                    } else {
+                        internal_node.right.store(leaf_offset, Ordering::Relaxed);
+                        internal_node.left.store(current_offset, Ordering::Relaxed);
+                    }
+                    println!("[INSERT] Linking new internal node at offset={}.", internal_offset);
+                    current_link_ptr.as_ref().store(internal_offset, Ordering::Release);
+                }
+                println!("[INSERT] Finished Subcase 2b.");
+                return;
             }
 
             // --- Subcase 2c: Insert Above Required ---
@@ -296,6 +368,19 @@ impl PatriciaTree {
 
     // Helper to allocate a new node (assumes lock is held)
     fn allocate_node(&self, key: u128, prefix_len: u8, expires: u64) -> usize {
+        // Try to reuse a freed node
+        if let Some(offset) = self.free_list.lock().pop() {
+            println!("[ALLOC] Reusing freed node at offset={}", offset);
+            let node_ptr = unsafe { self.base.as_ptr().add(offset) as *mut Node };
+            unsafe {
+                core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                (*node_ptr).left.store(0, Ordering::Relaxed);
+                (*node_ptr).right.store(0, Ordering::Relaxed);
+                (*node_ptr).expires.store(expires, Ordering::Relaxed);
+            }
+            return offset;
+        }
         println!("[ALLOC] key={:x}, prefix_len={}, expires={}", key, prefix_len, expires);
         let hdr = unsafe { &*self.hdr.as_ptr() };
         if hdr.capacity == 0 {
@@ -413,6 +498,8 @@ impl PatriciaTree {
                         println!("[DELETE] Found exact key match. Expiring node at offset={}.", current_offset);
                         let node_mut = unsafe { &mut *node_ptr };
                         node_mut.expires.store(0, Ordering::Release); // Expire the node
+                        // Add this offset to free_list for reuse
+                        self.free_list.lock().push(current_offset);
                         println!("[DELETE] Finished.");
                         // TODO: Implement pruning of expired nodes if necessary.
                         return;
