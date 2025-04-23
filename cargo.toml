@@ -11,6 +11,7 @@ repository = "https://github.com/TheRealMkadmi/cidrscan-rs"
 shared_memory = "0.12.4"      # Cross‑platform shared memory support 
 raw_sync      = "0.1.5"       # Provides Mutex, RwLock for shared memory
 spin          = "0.10.0"       # Spin-based locks for synchronization
+parking_lot = "0.12.3"
 
 [lib]
 name = "cidrscan"

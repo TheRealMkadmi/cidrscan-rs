@@ -36,7 +36,7 @@ fn get_bit(key: u128, index: u8) -> u8 {
 }
 
 use shared_memory::{Shmem, ShmemConf, ShmemError};  // Shared memory mapping :contentReference[oaicite:13]{index=13}
-use spin::Mutex;                                   // Spin‑based user‑space locks :contentReference[oaicite:14]{index=14}
+use parking_lot::RwLock;  // Readers–writer lock for safe concurrent access
 use std::{
     mem::size_of,
     ptr::NonNull,
@@ -50,7 +50,7 @@ const DEFAULT_CAPACITY: usize = 1_048_576;
 /// Shared‑memory header (aligned to cache line)
 #[repr(C, align(64))]
 struct Header {
-    lock: Mutex<()>,             // exclusive writer lock :contentReference[oaicite:15]{index=15}
+    lock: RwLock<()>,            // readers–writer lock
     node_count: AtomicUsize,     // bump allocator index
     root_offset: AtomicUsize,    // atomic root pointer for lock‑free reads
     capacity: usize,             // max nodes in arena
@@ -104,19 +104,16 @@ impl PatriciaTree {
         let hdr_ptr = base_ptr as *mut Header;
         let hdr = NonNull::new(hdr_ptr).unwrap();
 
-        // Initialize header on first creation
-        let hdr_ref = unsafe { &*hdr_ptr };
-        if hdr_ref.capacity == 0 {
-            let _guard = hdr_ref.lock.lock(); // init lock
-            // Double-check after acquiring the lock
-            if unsafe { (*hdr_ptr).capacity == 0 } {
-                unsafe {
-                    std::ptr::write(&mut (*hdr_ptr).capacity, capacity);
-                    std::ptr::write(&mut (*hdr_ptr).node_count, AtomicUsize::new(0));
-                    std::ptr::write(&mut (*hdr_ptr).root_offset, AtomicUsize::new(0));
-                    // lock is already default‑constructed by spin::Mutex::new()
-                }
-            }
+        // Initialize header exactly once per new mapping
+        let hdr_mut = unsafe { &mut *hdr_ptr };
+        if hdr_mut.capacity == 0 {
+            // fresh header state
+            *hdr_mut = Header {
+                lock: RwLock::new(()),
+                node_count: AtomicUsize::new(0),
+                root_offset: AtomicUsize::new(0),
+                capacity,
+            };
         }
 
         Ok(Self { shmem, base, hdr })
@@ -150,7 +147,7 @@ impl PatriciaTree {
         if hdr.capacity == 0 {
             panic!("Cannot insert into a zero-capacity tree");
         }
-        let _guard = hdr.lock.lock(); // Acquire exclusive write lock
+        let _w_guard = unsafe { &*self.hdr.as_ptr() }.lock.write(); // Acquire write lock
         println!("[INSERT] Lock acquired. Current node_count={}", hdr.node_count.load(Ordering::Relaxed));
 
         let expires = if ttl_secs == 0 { 0 } else {
@@ -175,7 +172,14 @@ impl PatriciaTree {
                 }
                 let leaf_offset = self.allocate_node(key, prefix_len, expires);
                 println!("[INSERT] Allocated leaf node at offset={}. Storing link.", leaf_offset);
-                unsafe { current_link_ptr.as_ref().store(leaf_offset, Ordering::Release); }
+                // Atomically set new leaf if still empty
+                let link_atomic = unsafe { &*(current_link_ptr.as_ptr()) };
+                link_atomic.compare_exchange(
+                    0,
+                    leaf_offset,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ).expect("Concurrent insertion conflict");
                 println!("[INSERT] Finished Case 1.");
                 return;
             }
@@ -312,22 +316,15 @@ impl PatriciaTree {
         println!("[ALLOC] Calculated offset={}", offset);
         // Unsafe block for pointer arithmetic, bounds check, and writing
         unsafe {
-            // Bounds check against total shared memory size.
-            if offset + size_of::<Node>() > self.shmem.len() {
-                 hdr.node_count.fetch_sub(1, Ordering::Relaxed); // Rollback
-                 println!("[ALLOC] PANIC: Offset exceeds shared memory bounds.");
-                 panic!("Calculated offset {} + node size {} exceeds shared memory bounds {}!", offset, size_of::<Node>(), self.shmem.len());
-            }
-
             let node_ptr = self.base.as_ptr().add(offset) as *mut Node;
             println!("[ALLOC] Writing node data at offset={}", offset);
             // Initialize the node
             core::ptr::write_volatile(&mut (*node_ptr).key, key);
             core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-            // Use direct initialization for atomics within the unsafe block
-            (*node_ptr).left = AtomicUsize::new(0);
-            (*node_ptr).right = AtomicUsize::new(0);
-            (*node_ptr).expires = AtomicU64::new(expires);
+            // Proper atomic initialization via store()
+            (*node_ptr).left.store(0, Ordering::Relaxed);
+            (*node_ptr).right.store(0, Ordering::Relaxed);
+            (*node_ptr).expires.store(expires, Ordering::Relaxed);
             println!("[ALLOC] Node initialized at offset={}", offset);
         }
         offset
@@ -336,6 +333,7 @@ impl PatriciaTree {
     /// Lookup a key; true if found and not expired (Revised for Patricia structure)
     pub fn lookup(&self, key: u128) -> bool {
         let hdr = unsafe { &*self.hdr.as_ptr() };
+        let _r_guard = hdr.lock.read(); // Acquire read lock for safe traversal
         let mut current_offset = hdr.root_offset.load(Ordering::Acquire);
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         while current_offset != 0 {
@@ -367,7 +365,7 @@ impl PatriciaTree {
     pub fn delete(&self, key: u128) {
         println!("[DELETE] key={:x}", key);
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        let _guard = hdr.lock.lock(); // Need write lock to modify expiry
+        let _w_guard = unsafe { &*self.hdr.as_ptr() }.lock.write(); // Acquire write lock
         println!("[DELETE] Lock acquired.");
 
         let mut current_offset = hdr.root_offset.load(Ordering::Relaxed);
