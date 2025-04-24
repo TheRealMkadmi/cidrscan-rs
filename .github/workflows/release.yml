@@ -18,11 +18,13 @@ jobs:
       - name: Install Rust stable toolchain
         run: rustup default stable
       - name: Add Rust targets
-        run: rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+        run: rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+      - name: Install MinGW dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
       - name: Build and package cross targets
         run: |
           mkdir packages
-          for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-msvc:windows-x86_64" "aarch64-pc-windows-msvc:windows-aarch64"; do
+          for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-gnu:windows-x86_64"; do
             IFS=":" read -r target name <<< "$pair"
             cross build --release --target $target
             # Determine source directory: Use target/release for native Linux build, target/$target/release otherwise
@@ -34,11 +36,10 @@ jobs:
             mkdir -p packages/$name
             cp $src_dir/cidrscan.h packages/$name/
             # Preprocess the header file to remove macros
-            cpp -P $src_dir/cidrscan.h -o packages/$name/cidrscan_ffi.h
             case "$target" in
-              *windows-msvc)
+              *windows-gnu)
+                # For MinGW builds
                 cp $src_dir/cidrscan.dll packages/$name/ || true
-                cp $src_dir/cidrscan.lib packages/$name/ || true
                 ;;
               *)
                 cp $src_dir/libcidrscan.* packages/$name/ || true
@@ -84,8 +85,6 @@ jobs:
             fi
             mkdir -p packages/$name
             cp $src_dir/cidrscan.h packages/$name/
-            # Preprocess the header file to remove macros
-            cpp -P $src_dir/cidrscan.h -o packages/$name/cidrscan_ffi.h
             cp $src_dir/libcidrscan.dylib packages/$name/ || true
             cd packages/$name
             zip -r ../../$name.zip *
