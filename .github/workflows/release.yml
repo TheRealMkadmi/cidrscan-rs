@@ -32,10 +32,11 @@ jobs:
               src_dir="target/release"
             else
               src_dir="target/$target/release"
-            fi
-            mkdir -p packages/$name
+            fi            mkdir -p packages/$name
+            # Copy both header files
             cp $src_dir/cidrscan.h packages/$name/
-            # Preprocess the header file to remove macros
+            cp $src_dir/cidrscan_ffi.h packages/$name/
+            # Copy binary files based on target
             case "$target" in
               *windows-gnu)
                 # For MinGW builds
