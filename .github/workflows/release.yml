@@ -25,15 +25,23 @@ jobs:
           for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-msvc:windows-x86_64" "aarch64-pc-windows-msvc:windows-aarch64"; do
             IFS=":" read -r target name <<< "$pair"
             cross build --release --target $target
+            # Determine source directory: Use target/release for native Linux build, target/$target/release otherwise
+            if [ "$target" = "x86_64-unknown-linux-gnu" ]; then
+              src_dir="target/release"
+            else
+              src_dir="target/$target/release"
+            fi
             mkdir -p packages/$name
-            cp target/release/cidrscan.h packages/$name/
+            cp $src_dir/cidrscan.h packages/$name/
+            # Preprocess the header file to remove macros
+            cpp -P $src_dir/cidrscan.h -o packages/$name/cidrscan_ffi.h
             case "$target" in
               *windows-msvc)
-                cp target/$target/release/cidrscan.dll packages/$name/ || true
-                cp target/$target/release/cidrscan.lib packages/$name/ || true
+                cp $src_dir/cidrscan.dll packages/$name/ || true
+                cp $src_dir/cidrscan.lib packages/$name/ || true
                 ;;
               *)
-                cp target/$target/release/libcidrscan.* packages/$name/ || true
+                cp $src_dir/libcidrscan.* packages/$name/ || true
                 ;;
             esac
             cd packages/$name
@@ -64,12 +72,21 @@ jobs:
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
           mkdir packages
+          host_triple=$(rustc -vV | sed -n 's/host: //p') # Get the host triple
           for pair in "x86_64-apple-darwin:macos-x86_64" "aarch64-apple-darwin:macos-aarch64"; do
             IFS=":" read -r target name <<< "$pair"
             cargo build --release --target $target
+            # Determine source directory: Use target/release if target matches host, target/$target/release otherwise
+            if [ "$target" = "$host_triple" ]; then
+              src_dir="target/release"
+            else
+              src_dir="target/$target/release"
+            fi
             mkdir -p packages/$name
-            cp target/$target/release/cidrscan.h packages/$name/
-            cp target/$target/release/libcidrscan.dylib packages/$name/ || true
+            cp $src_dir/cidrscan.h packages/$name/
+            # Preprocess the header file to remove macros
+            cpp -P $src_dir/cidrscan.h -o packages/$name/cidrscan_ffi.h
+            cp $src_dir/libcidrscan.dylib packages/$name/ || true
             cd packages/$name
             zip -r ../../$name.zip *
             cd ../../

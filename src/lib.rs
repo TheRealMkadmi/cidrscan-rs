@@ -1,4 +1,6 @@
 //! Monolithic, high‑performance, shared Patricia tree with TTL
+//! Monolithic to allow stealing the entire tree in one go. 
+
 #![allow(dead_code)]
 #![allow(clippy::missing_safety_doc)]
 
@@ -584,7 +586,6 @@ pub mod public_api;
 
 // Re-export all public API functions at the crate root
 pub use public_api::*;
-
 
 impl Drop for PatriciaTree {
     fn drop(&mut self) {
