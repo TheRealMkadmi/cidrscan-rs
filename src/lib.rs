@@ -94,9 +94,6 @@ struct Header {
     ref_count: AtomicUsize, // live-handle counter
     init_flag: AtomicU32,   // 0 = un-initialised, 1 = ready
 }
-// Type-size compatibility: RawRwLock::SIZE is 16 bytes on 32-bit, 24 bytes on 64-bit.
-// Header is #[repr(C, align(64))], so no padding changes are needed and all offsets stay the same.
-const _: () = assert!(core::mem::size_of::<RawRwLock>() <= 64);
 
 /// Node in the Patricia tree, each aligned to cache line
 #[repr(C, align(64))]

@@ -1,26 +1,23 @@
 use cidrscan::shmem_rwlock::RawRwLock;
+use raw_sync::Timeout;
 use std::{
     sync::Arc,
     thread,
     time::{Duration, Instant},
 };
-use raw_sync::Timeout;
 
 /// Helper: allocate and initialise a RawRwLock on the heap, wrapped in Arc.
 fn make_lock() -> Arc<RawRwLock> {
-    // Allocate zeroed memory on the heap suitable for RawRwLock
-    let boxed = Box::new(unsafe { std::mem::zeroed::<RawRwLock>() });
-    // Get a raw pointer to the allocated memory, consuming the box
-    let ptr = Box::into_raw(boxed);
-    // Initialize the lock in place using the raw pointer
+    // Allocate the RawRwLock inside an Arc (control block + T)
+    let lock = Arc::new(unsafe { std::mem::zeroed::<RawRwLock>() });
+    // Grab a *mut RawRwLock to the data inside the Arc
+    let ptr = Arc::as_ptr(&lock) as *mut RawRwLock;
+    // Now initialize it in place
     unsafe {
-        // Safety: ptr is valid, aligned, and points to zeroed memory
-        // as required by new_in_place's implicit contract (via init)
-        RawRwLock::new_in_place(ptr);
-        // Create Arc directly from the raw pointer, taking ownership
-        // This avoids copying the RawRwLock struct
-        Arc::from_raw(ptr)
+        // Safety: `ptr` points to properly‐aligned, zeroed memory for RawRwLock
+        RawRwLock::new_in_place(ptr).unwrap();
     }
+    lock
 }
 
 #[test]
