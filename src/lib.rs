@@ -347,10 +347,10 @@ impl PatriciaTree {
             {
                 println!("[INSERT] Subcase 2b: Split required at cpl={}.", cpl);
                 // ATOMIC: Hold free_list lock for both check and allocation
-                let mut internal_offset: Offset;
-                let mut internal_gen: u32;
-                let mut leaf_offset: Offset;
-                let mut leaf_gen: u32;
+                let internal_offset: Offset;
+                let internal_gen: u32;
+                let leaf_offset: Offset;
+                let leaf_gen: u32;
                 {
                     let mut free_list = self.free_list.lock();
                     let reserved = hdr.next_index.load(Ordering::Acquire) as usize;

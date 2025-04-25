@@ -5,7 +5,7 @@
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 use raw_sync::events::{Event as RawEvent, EventImpl, EventInit};
-use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex, LockGuard};
+use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
 
 

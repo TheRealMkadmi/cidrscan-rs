@@ -1,7 +1,7 @@
 use cidrscan::shmem_rwlock::RawRwLock;
 use raw_sync::Timeout;
 use std::{
-    sync::Arc,
+    sync::{atomic::Ordering, Arc, Barrier},
     thread,
     time::{Duration, Instant},
 };
@@ -156,4 +156,142 @@ fn reopen_in_place_retains_state() {
         // Guards handle this automatically.
         std::alloc::dealloc(ptr, layout);
     }
+}
+
+#[test]
+fn init_and_reopen_in_place_roundtrip() {
+    // allocate zeroed memory for one lock
+    let mut storage = vec![0u8; std::mem::size_of::<RawRwLock>()];
+    let ptr = storage.as_mut_ptr() as *mut RawRwLock;
+
+    // initialize it
+    unsafe {
+        RawRwLock::new_in_place(ptr).expect("new_in_place failed");
+    }
+
+    // exercise a trivial read and write lock
+    let lock_ref = unsafe { &*ptr };
+    {
+        let _r = lock_ref.read_lock();
+    }
+    {
+        let _w = lock_ref.write_lock();
+    }
+
+    // now "re-open" in-place (as if in another process/view)
+    unsafe {
+        RawRwLock::reopen_in_place(ptr).expect("reopen_in_place failed");
+    }
+
+    // and do it again
+    let lock_ref2 = unsafe { &*ptr };
+    {
+        let _r = lock_ref2.read_lock();
+    }
+    {
+        let _w = lock_ref2.write_lock();
+    }
+}
+
+/// Spawn multiple reader threads, ensure they all acquire simultaneously
+/// and block a writer until they're done.
+#[test]
+fn multiple_readers_block_writer() {
+    let lock = Arc::new({
+        // safe because Box lives static for test duration
+        let mut storage = Box::new([0u8; std::mem::size_of::<RawRwLock>()]);
+        let ptr = storage.as_mut_ptr() as *mut RawRwLock;
+        unsafe { RawRwLock::new_in_place(ptr).unwrap() };
+        unsafe { &*ptr }.to_owned() // clone the struct (bytes)
+    });
+
+    let n_readers = 4;
+    let barrier = Arc::new(Barrier::new(n_readers + 1));
+    let mut handles = Vec::new();
+
+    for _ in 0..n_readers {
+        let c = Arc::clone(&lock);
+        let b = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let r = c.read_lock();
+            // signal ready
+            b.wait();
+            // hold lock for a bit
+            thread::sleep(Duration::from_millis(50));
+            drop(r);
+        }));
+    }
+
+    // wait until all readers have locked
+    barrier.wait();
+
+    // now in main thread try to acquire writer; should only succeed after readers drop
+    let start = Instant::now();
+    let _w = lock.write_lock();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "writer did not wait for readers: waited only {:?}",
+        elapsed
+    );
+
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+/// Test try_write_lock with timeout: immediate failure when readers present.
+#[test]
+fn try_write_lock_timeout_behavior() {
+    let lock = Arc::new({
+        let mut storage = Box::new([0u8; std::mem::size_of::<RawRwLock>()]);
+        let ptr = storage.as_mut_ptr() as *mut RawRwLock;
+        unsafe { RawRwLock::new_in_place(ptr).unwrap() };
+        unsafe { &*ptr }.to_owned()
+    });
+
+    // spawn a reader that holds the lock
+    let c = Arc::clone(&lock);
+    let handle = thread::spawn(move || {
+        let _r = c.read_lock();
+        thread::sleep(Duration::from_millis(100));
+        // reader drops here
+    });
+
+    // give reader a moment to acquire
+    thread::sleep(Duration::from_millis(10));
+
+    // try to get write lock with short timeout → should fail
+    let deadline = Timeout::Val(Duration::from_millis(20));
+    let maybe_guard = lock.try_write_lock(deadline);
+    assert!(
+        maybe_guard.is_none(),
+        "try_write_lock unexpectedly succeeded"
+    );
+
+    handle.join().unwrap();
+
+    // now that reader is gone, try again and should succeed
+    let guard = lock.try_write_lock(Timeout::Val(Duration::from_millis(50)));
+    assert!(
+        guard.is_some(),
+        "try_write_lock did not succeed after reader dropped"
+    );
+}
+
+/// Basic test that many sequential read locks do not overflow the counter
+#[test]
+fn reader_counter_overflow_safety() {
+    let mut storage = vec![0u8; std::mem::size_of::<RawRwLock>()];
+    let ptr = storage.as_mut_ptr() as *mut RawRwLock;
+    unsafe { RawRwLock::new_in_place(ptr).unwrap() };
+    let lock_ref = unsafe { &*ptr };
+
+    // issue more than u32::MAX / 2 reads (but realistic test: small count)
+    for _ in 0..1000 {
+        let r = lock_ref.read_lock();
+        drop(r);
+    }
+    // if we reach here, no panic or overflow trap.
+    assert_eq!(lock_ref.readers.load(Ordering::Relaxed), 0);
 }
