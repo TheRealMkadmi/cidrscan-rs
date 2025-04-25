@@ -19,7 +19,7 @@ pub struct RawRwLock {
     mutex_buf: [u8; MUTEX_BUF_SIZE],
     /// event storage buffer
     event_buf: [u8; EVENT_BUF_SIZE],
-    /// number of readers (or u32::MAX if a writer holds it)
+    /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
 }
 
@@ -155,6 +155,9 @@ impl<'a> Drop for ReadGuard<'a> {
     }
 }
 
+const WRITER_BIT: u32 = 0x8000_0000;
+const READER_MASK: u32 = 0x7FFF_FFFF;
+
 impl RawRwLock {
     /// Helper to reopen a mutex from buffer and execute closure f.
     #[inline(always)]
@@ -193,21 +196,12 @@ impl RawRwLock {
     /// Called automatically when ReadGuard is dropped.
     #[inline(never)] // Keep distinct from other methods for clarity
     fn read_unlock(&self) {
-        let previous_readers = self.readers.fetch_sub(1, Ordering::Release); // Release barrier synchronizes with writer's Acquire
+        let previous_readers = self.readers.fetch_sub(1, Ordering::Release);
 
-        // If the count *before* decrementing was 1, we are the last reader.
-        if previous_readers == 1 {
-            // We were the last reader. Signal the event in case a writer is waiting.
-            // The writer waits only if previous_readers > 0 when it acquired the mutex.
-            // It's safe to signal unconditionally here; a waiting writer will be woken,
-            // and if no writer is waiting, the signal is harmless.
-            // Safety: event_ptr() returns a valid pointer to an initialized RawEvent buffer.
-            unsafe {
-                let _ = (*(self.event_ptr() as *mut RawEvent)).set(raw_sync::events::EventState::Signaled);
-            }
+        // Always signal the event on every reader exit, in case a writer is waiting.
+        unsafe {
+            let _ = (*(self.event_ptr() as *mut RawEvent)).set(raw_sync::events::EventState::Signaled);
         }
-        // If previous_readers > 1, other readers still exist, no signal needed.
-        // If previous_readers == u32::MAX, this indicates an logic error, but the decrement still happens.
     }
 
     /// Acquire an **exclusive** (write) lock.
@@ -221,16 +215,17 @@ impl RawRwLock {
         // Leak Box to static reference and acquire OS mutex guard
         let m_ref: &'static dyn LockImpl = Box::leak(mutex_impl);
         let guard = m_ref.lock().expect("RawMutex::lock failed in write_lock");
-        // Block new readers and get previous count
-        let previous_readers = self.readers.swap(u32::MAX, Ordering::Acquire);
-        // Wait for existing readers to finish
-        if previous_readers > 0 {
-            unsafe {
-                let event = &*(self.event_ptr() as *mut RawEvent);
-                let _ = event.set(raw_sync::events::EventState::Clear);
-                while self.readers.load(Ordering::Acquire) != 0 {
-                    let _ = event.wait(Timeout::Infinite);
-                }
+
+        // Block new readers by setting the WRITER_BIT, but preserve the reader count
+        let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+
+        // Clear any old signal
+        unsafe {
+            let event = &*(self.event_ptr() as *mut RawEvent);
+            let _ = event.set(raw_sync::events::EventState::Clear);
+            // Wait exactly `prev` times for readers to exit
+            for _ in 0..prev {
+                let _ = event.wait(Timeout::Infinite);
             }
         }
         WriteGuard { lock: self, _mutex: m_ref, _guard: guard }
