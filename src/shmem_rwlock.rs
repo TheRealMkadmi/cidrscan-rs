@@ -136,8 +136,12 @@ pub struct WriteGuard<'a> {
 
 impl<'a> Drop for WriteGuard<'a> {
     fn drop(&mut self) {
-        // allow readers again
+        // allow readers again (writer flag → 0, counter already 0)
         self.lock.readers.store(0, Ordering::Release);
+        // wake up any blocked readers
+        let _ = unsafe {
+            RawEvent::from_existing(self.lock.event_ptr())
+        }.and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
         // _guard (_mutex) drop here → OS mutex unlocked by LockGuard drop
     }
 }
@@ -155,8 +159,8 @@ impl<'a> Drop for ReadGuard<'a> {
     }
 }
 
-const WRITER_BIT: u32 = 0x8000_0000;
-const READER_MASK: u32 = 0x7FFF_FFFF;
+const WRITER_BIT:   u32 = 0x8000_0000;
+const READER_MASK: u32 = WRITER_BIT - 1;      // 0x7FFF_FFFF
 
 impl RawRwLock {
     /// Helper to reopen a mutex from buffer and execute closure f.
@@ -174,8 +178,8 @@ impl RawRwLock {
     pub fn read_lock(&self) -> ReadGuard<'_> {
         loop {
             let current_readers = self.readers.load(Ordering::Relaxed);
-            // If a writer holds the lock (readers == MAX), spin.
-            if current_readers == u32::MAX {
+            // If a writer holds the lock (flag set), spin.
+            if current_readers & WRITER_BIT != 0 {
                 core::hint::spin_loop();
                 continue;
             }
@@ -196,11 +200,14 @@ impl RawRwLock {
     /// Called automatically when ReadGuard is dropped.
     #[inline(never)] // Keep distinct from other methods for clarity
     fn read_unlock(&self) {
-        let previous_readers = self.readers.fetch_sub(1, Ordering::Release);
-
-        // Always signal the event on every reader exit, in case a writer is waiting.
-        unsafe {
-            let _ = (*(self.event_ptr() as *mut RawEvent)).set(raw_sync::events::EventState::Signaled);
+        let prev = self.readers.fetch_sub(1, Ordering::Release);
+        let was_last = (prev & READER_MASK) == 1;           // counter going to 0
+        let writer_waiting = (prev & WRITER_BIT) != 0;
+        if was_last && writer_waiting {
+            // reopen event correctly, then signal it
+            let _ = unsafe {
+                RawEvent::from_existing(self.event_ptr())
+            }.and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
         }
     }
 
@@ -216,16 +223,22 @@ impl RawRwLock {
         let m_ref: &'static dyn LockImpl = Box::leak(mutex_impl);
         let guard = m_ref.lock().expect("RawMutex::lock failed in write_lock");
 
-        // Block new readers by setting the WRITER_BIT, but preserve the reader count
+        // 1) mark myself as writer, remember how many readers are still inside
         let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
 
-        // Clear any old signal
+        // 2) clear the manual-reset event so we have a fresh, guaranteed-off latch
         unsafe {
-            let event = &*(self.event_ptr() as *mut RawEvent);
-            let _ = event.set(raw_sync::events::EventState::Clear);
-            // Wait exactly `prev` times for readers to exit
-            for _ in 0..prev {
-                let _ = event.wait(Timeout::Infinite);
+            RawEvent::from_existing(self.event_ptr())
+                .and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Clear))
+                .unwrap();
+        }
+
+        // 3) wait until the last reader wakes us
+        if prev != 0 {
+            unsafe {
+                RawEvent::from_existing(self.event_ptr())
+                    .and_then(|(ev, _)| ev.wait(Timeout::Infinite))
+                    .unwrap();
             }
         }
         WriteGuard { lock: self, _mutex: m_ref, _guard: guard }
@@ -243,7 +256,7 @@ impl RawRwLock {
         let m_ref: &'static dyn LockImpl = Box::leak(mutex_impl);
         let guard = m_ref.try_lock(timeout).ok()?;
         // Try to block new readers
-        if self.readers.compare_exchange(0, u32::MAX, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if self.readers.compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire).is_err() {
             drop(guard);
             return None;
         }
