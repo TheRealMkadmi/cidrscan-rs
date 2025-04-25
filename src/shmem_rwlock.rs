@@ -7,10 +7,14 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use raw_sync::events::{Event as RawEvent, EventImpl, EventInit};
 use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
-
+// Stable allocation imports for boxed helper
+use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 
 const MUTEX_BUF_SIZE: usize = core::mem::size_of::<RawMutex>();
 const EVENT_BUF_SIZE: usize = core::mem::size_of::<RawEvent>();
+const _: () = {
+    assert!(core::mem::size_of::<RawRwLock>() % core::mem::align_of::<RawRwLock>() == 0);
+};
 
 /// Our shared-memory lock layout: [mutex-bytes][event-bytes][reader_count]
 #[repr(C, align(8))]
@@ -55,9 +59,11 @@ impl RawRwLock {
     pub unsafe fn new_in_place(ptr: *mut RawRwLock) -> Result<(), Box<dyn std::error::Error>> {
         // Ensure the provided pointer is not null
         if ptr.is_null() {
-            // Return an error or panic, depending on desired behavior
-            // For now, let's return a simple error
             return Err("Null pointer passed to new_in_place".into());
+        }
+        // Ensure the pointer is properly aligned for RawRwLock
+        if (ptr as usize) % core::mem::align_of::<RawRwLock>() != 0 {
+            return Err("RawRwLock pointer is not properly aligned".into());
         }
 
         // Get pointers to the start of the buffers within the pointed-to struct
@@ -120,9 +126,21 @@ impl RawRwLock {
 
         // Reopen event in its buffer
         RawEvent::from_existing(event_ptr)?;
-
-        // Readers field state is preserved.
         Ok(()) // Indicate success
+    }
+    // Readers field state is preserved.
+    /// Allocate and initialize a RawRwLock on the heap with correct alignment.
+    /// Returns a boxed, zero-initialized, and fully constructed RawRwLock.
+    pub fn boxed() -> Box<RawRwLock> {
+        let layout = Layout::new::<RawRwLock>();
+        unsafe {
+            let ptr = alloc_zeroed(layout) as *mut RawRwLock;
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            RawRwLock::new_in_place(ptr).unwrap();
+            Box::from_raw(ptr)
+        }
     }
 }
 /// Represents an acquired exclusive (write) lock.
@@ -139,9 +157,8 @@ impl<'a> Drop for WriteGuard<'a> {
         // allow readers again (writer flag → 0, counter already 0)
         self.lock.readers.store(0, Ordering::Release);
         // wake up any blocked readers
-        let _ = unsafe {
-            RawEvent::from_existing(self.lock.event_ptr())
-        }.and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
+        let _ = unsafe { RawEvent::from_existing(self.lock.event_ptr()) }
+            .and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
         // _guard (_mutex) drop here → OS mutex unlocked by LockGuard drop
     }
 }
@@ -159,19 +176,10 @@ impl<'a> Drop for ReadGuard<'a> {
     }
 }
 
-const WRITER_BIT:   u32 = 0x8000_0000;
-const READER_MASK: u32 = WRITER_BIT - 1;      // 0x7FFF_FFFF
+const WRITER_BIT: u32 = 0x8000_0000;
+const READER_MASK: u32 = WRITER_BIT - 1; // 0x7FFF_FFFF
 
 impl RawRwLock {
-    /// Helper to reopen a mutex from buffer and execute closure f.
-    #[inline(always)]
-    unsafe fn with_mutex<F, R>(&self, buf: *mut u8, f: F) -> Result<R, Box<dyn std::error::Error>>
-    where
-        F: FnOnce(&dyn LockImpl) -> Result<R, Box<dyn std::error::Error>>,
-    {
-        let (mutex, _) = RawMutex::from_existing(buf, ptr::null_mut())?;
-        f(&*mutex)
-    }
     /// Acquire a **shared** (read) lock.
     /// Spins only if a writer holds the lock or is waiting.
     /// Returns a guard that releases the lock when dropped.
@@ -191,7 +199,7 @@ impl RawRwLock {
                 Ordering::Relaxed, // Relaxed on failure is fine
             ) {
                 Ok(_) => return ReadGuard { lock: self }, // Success, return guard
-                Err(_) => continue, // CAS failed, retry loop
+                Err(_) => continue,                       // CAS failed, retry loop
             }
         }
     }
@@ -201,13 +209,10 @@ impl RawRwLock {
     #[inline(never)] // Keep distinct from other methods for clarity
     fn read_unlock(&self) {
         let prev = self.readers.fetch_sub(1, Ordering::Release);
-        let was_last = (prev & READER_MASK) == 1;           // counter going to 0
-        let writer_waiting = (prev & WRITER_BIT) != 0;
-        if was_last && writer_waiting {
-            // reopen event correctly, then signal it
-            let _ = unsafe {
-                RawEvent::from_existing(self.event_ptr())
-            }.and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
+        // Only one pattern means “I was the last reader *and* a writer waits”:
+        if prev == (WRITER_BIT | 1) {
+            let _ = unsafe { RawEvent::from_existing(self.event_ptr()) }
+                .and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
         }
     }
 
@@ -216,22 +221,22 @@ impl RawRwLock {
     /// Returns a guard that releases the lock when dropped.
     pub fn write_lock(&self) -> WriteGuard<'_> {
         // Reopen OS mutex in shared memory
-        let (mutex_impl, _) = unsafe {
-            RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut())
-        }.expect("RawMutex::from_existing failed in write_lock");
+        let (mutex_impl, _) = unsafe { RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut()) }
+            .expect("RawMutex::from_existing failed in write_lock");
         // Leak Box to static reference and acquire OS mutex guard
         let m_ref: &'static dyn LockImpl = Box::leak(mutex_impl);
         let guard = m_ref.lock().expect("RawMutex::lock failed in write_lock");
 
-        // 1) mark myself as writer, remember how many readers are still inside
-        let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
-
-        // 2) clear the manual-reset event so we have a fresh, guaranteed-off latch
+        // A. clear the manual-reset event *first* – guarantees that any
+        //    SetEvent from old readers happens **after** the clear.
         unsafe {
             RawEvent::from_existing(self.event_ptr())
                 .and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Clear))
                 .unwrap();
         }
+
+        // B. publish “writer present”; save current reader count
+        let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
 
         // 3) wait until the last reader wakes us
         if prev != 0 {
@@ -240,27 +245,40 @@ impl RawRwLock {
                     .and_then(|(ev, _)| ev.wait(Timeout::Infinite))
                     .unwrap();
             }
+            // defensive: spin until the reader count really reached 0
+            while self.readers.load(Ordering::Acquire) != WRITER_BIT {
+                core::hint::spin_loop();
+            }
         }
-        WriteGuard { lock: self, _mutex: m_ref, _guard: guard }
+        WriteGuard {
+            lock: self,
+            _mutex: m_ref,
+            _guard: guard,
+        }
     }
-
 
     /// Try to acquire an **exclusive** (write) lock without blocking indefinitely.
     /// Returns Some(WriteGuard) if the lock was acquired, None otherwise.
     pub fn try_write_lock(&self, timeout: Timeout) -> Option<WriteGuard<'_>> {
         // Reopen OS mutex in shared memory
-        let (mutex_impl, _) = unsafe {
-            RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut())
-        }.ok()?;
+        let (mutex_impl, _) =
+            unsafe { RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut()) }.ok()?;
         // Leak Box to static reference and try to acquire OS mutex guard
         let m_ref: &'static dyn LockImpl = Box::leak(mutex_impl);
         let guard = m_ref.try_lock(timeout).ok()?;
         // Try to block new readers
-        if self.readers.compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if self
+            .readers
+            .compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             drop(guard);
             return None;
         }
-        Some(WriteGuard { lock: self, _mutex: m_ref, _guard: guard })
+        Some(WriteGuard {
+            lock: self,
+            _mutex: m_ref,
+            _guard: guard,
+        })
     }
 }
-

@@ -8,16 +8,7 @@ use std::{
 
 /// Helper: allocate and initialise a RawRwLock on the heap, wrapped in Arc.
 fn make_lock() -> Arc<RawRwLock> {
-    // Allocate the RawRwLock inside an Arc (control block + T)
-    let lock = Arc::new(unsafe { std::mem::zeroed::<RawRwLock>() });
-    // Grab a *mut RawRwLock to the data inside the Arc
-    let ptr = Arc::as_ptr(&lock) as *mut RawRwLock;
-    // Now initialize it in place
-    unsafe {
-        // Safety: `ptr` points to properly‐aligned, zeroed memory for RawRwLock
-        RawRwLock::new_in_place(ptr).unwrap();
-    }
-    lock
+    Arc::new(*RawRwLock::boxed())
 }
 
 #[test]
@@ -197,13 +188,7 @@ fn init_and_reopen_in_place_roundtrip() {
 /// and block a writer until they're done.
 #[test]
 fn multiple_readers_block_writer() {
-    let lock = Arc::new({
-        // safe because Box lives static for test duration
-        let mut storage = Box::new([0u8; std::mem::size_of::<RawRwLock>()]);
-        let ptr = storage.as_mut_ptr() as *mut RawRwLock;
-        unsafe { RawRwLock::new_in_place(ptr).unwrap() };
-        unsafe { &*ptr }.to_owned() // clone the struct (bytes)
-    });
+    let lock = Arc::new(RawRwLock::boxed());
 
     let n_readers = 4;
     let barrier = Arc::new(Barrier::new(n_readers + 1));
@@ -243,12 +228,7 @@ fn multiple_readers_block_writer() {
 /// Test try_write_lock with timeout: immediate failure when readers present.
 #[test]
 fn try_write_lock_timeout_behavior() {
-    let lock = Arc::new({
-        let mut storage = Box::new([0u8; std::mem::size_of::<RawRwLock>()]);
-        let ptr = storage.as_mut_ptr() as *mut RawRwLock;
-        unsafe { RawRwLock::new_in_place(ptr).unwrap() };
-        unsafe { &*ptr }.to_owned()
-    });
+    let lock = Arc::new(RawRwLock::boxed());
 
     // spawn a reader that holds the lock
     let c = Arc::clone(&lock);
