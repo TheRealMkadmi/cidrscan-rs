@@ -10,7 +10,6 @@ use raw_sync::Timeout;
 
 /// Inline size constants—now valid `const` calls
 const MUTEX_SIZE: usize = core::mem::size_of::<RawMutex>();
-const EVENT_SIZE: usize = core::mem::size_of::<RawEvent>();
 
 /// Our shared-memory lock layout: [mutex][event][reader_count]
 #[repr(C, align(4))]
@@ -22,6 +21,13 @@ pub struct RawRwLock {
     /// number of readers (or u32::MAX if a writer holds it)
     pub readers: AtomicU32,
 }
+
+// SAFETY: The underlying primitives from raw_sync are designed for cross-process
+// and potentially cross-thread use, even though they contain raw pointers.
+// Marking RawRwLock as Send + Sync is safe for use cases like the tests
+// where it's managed within a single process (e.g., via Arc).
+unsafe impl Send for RawRwLock {}
+unsafe impl Sync for RawRwLock {}
 
 impl RawRwLock {
     /// Initialize both primitives and reader count in shared memory.
@@ -39,7 +45,7 @@ impl RawRwLock {
         RawRwLock::new_in_place(this);
         Ok(())
     }
-    
+
     /// After you `mmap` or open the shared region, call this **once** at the base
     /// of your `RawRwLock` to initialize both primitives in-place.
     ///

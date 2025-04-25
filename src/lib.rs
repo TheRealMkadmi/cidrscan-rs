@@ -1,10 +1,20 @@
 //! Monolithic, high‑performance, shared Patricia tree with TTL
 //! Monolithic to allow stealing the entire tree in one go.
 
-#![allow(dead_code)]
-#![allow(clippy::missing_safety_doc)]
 
-mod cross_proc_rwlock;
+use shared_memory::{Shmem, ShmemConf, ShmemError}; // Shared memory mapping :contentReference[oaicite:13]{index=13}
+use crate::shmem_rwlock::RawRwLock;
+use raw_sync::Timeout; // needed by API
+use spin::Mutex; // **only** for the free-list
+use std::{
+    mem::size_of,
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+pub mod shmem_rwlock;
+pub mod cross_proc_rwlock;
 
 // Helper function to calculate the length of the common prefix (up to max_len bits)
 fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
@@ -47,17 +57,7 @@ fn mask(prefix_len: u8) -> u128 {
     }
 }
 
-use shared_memory::{Shmem, ShmemConf, ShmemError}; // Shared memory mapping :contentReference[oaicite:13]{index=13}
-mod shmem_rwlock;
-use crate::shmem_rwlock::RawRwLock;
-use raw_sync::Timeout; // needed by API
-use spin::Mutex; // **only** for the free-list
-use std::{
-    mem::size_of,
-    ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
 type Offset = u32; // <= 4 294 967 295 bytes from base
