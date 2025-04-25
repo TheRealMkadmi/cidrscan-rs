@@ -1,10 +1,9 @@
 //! Monolithic, high‑performance, shared Patricia tree with TTL
 //! Monolithic to allow stealing the entire tree in one go.
 
-
-use shared_memory::{Shmem, ShmemConf, ShmemError}; // Shared memory mapping :contentReference[oaicite:13]{index=13}
 use crate::shmem_rwlock::RawRwLock;
 use raw_sync::Timeout; // needed by API
+use shared_memory::{Shmem, ShmemConf, ShmemError}; // Shared memory mapping :contentReference[oaicite:13]{index=13}
 use spin::Mutex; // **only** for the free-list
 use std::{
     mem::size_of,
@@ -14,7 +13,6 @@ use std::{
 };
 
 pub mod shmem_rwlock;
-pub mod cross_proc_rwlock;
 
 // Helper function to calculate the length of the common prefix (up to max_len bits)
 fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
@@ -56,8 +54,6 @@ fn mask(prefix_len: u8) -> u128 {
         !(!0u128 >> prefix_len) // Create mask by shifting
     }
 }
-
-
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
 type Offset = u32; // <= 4 294 967 295 bytes from base
@@ -177,10 +173,11 @@ impl PatriciaTree {
             unsafe {
                 core::ptr::write_bytes(&mut hdr_mut.lock, 0, 1);
             }
+            // Handle the Result from init
             unsafe {
                 RawRwLock::init(&mut hdr_mut.lock as *mut _ as *mut u8, Timeout::Infinite)
-                    .expect("lock init failed")
-            };
+                    .expect("RawRwLock::init failed"); // Use expect to handle the Result
+            }
             *hdr_mut = Header {
                 magic: HEADER_MAGIC,
                 version: HEADER_VERSION,
@@ -253,7 +250,8 @@ impl PatriciaTree {
         if hdr.capacity == 0 {
             panic!("Cannot insert into a zero-capacity tree");
         }
-        hdr.lock.write_lock();
+        // Acquire write lock using guard
+        let _write_guard = hdr.lock.write_lock();
         println!(
             "[INSERT] Lock acquired. Current next_index={}",
             hdr.next_index.load(Ordering::Relaxed)
@@ -302,8 +300,8 @@ impl PatriciaTree {
                     .compare_exchange(
                         0,
                         pack(leaf_offset, leaf_gen),
-                        Ordering::Release,
-                        Ordering::Relaxed,
+                        Ordering::AcqRel, // Use AcqRel for CAS
+                        Ordering::Acquire,
                     )
                     .is_err()
                 {
@@ -312,7 +310,8 @@ impl PatriciaTree {
                     continue; // tail of the while loop
                 }
                 println!("[INSERT] Finished Case 1.");
-                hdr.lock.write_unlock();
+                // Remove explicit unlock, guard will handle it
+                // hdr.lock.write_unlock();
                 return;
             }
 
@@ -339,7 +338,8 @@ impl PatriciaTree {
                 println!("[INSERT] Subcase 2a: Exact match found. Updating TTL.");
                 current_node.expires.store(expires, Ordering::Relaxed);
                 println!("[INSERT] Finished Subcase 2a.");
-                hdr.lock.write_unlock();
+                // Remove explicit unlock, guard will handle it
+                // hdr.lock.write_unlock();
                 return;
             }
 
@@ -479,11 +479,12 @@ impl PatriciaTree {
                     );
                 }
                 println!("[INSERT] Finished Subcase 2b.");
-                hdr.lock.write_unlock();
+                // Remove explicit unlock, guard will handle it
+                // hdr.lock.write_unlock();
                 return;
             }
 
-            // --- Subcase 2c: Insert Above Required ---
+            // --- Subcase 2c: Descend ---
             // This case happens when the new key is a prefix of the current node.
             // cpl == current_node.prefix_len must hold (otherwise split would happen).
             // So the condition simplifies to cpl < prefix_len.
@@ -532,7 +533,8 @@ impl PatriciaTree {
                     );
                 }
                 println!("[INSERT] Finished Subcase 2c.");
-                hdr.lock.write_unlock();
+                // Remove explicit unlock, guard will handle it
+                // hdr.lock.write_unlock();
                 return;
             }
 
@@ -657,7 +659,8 @@ impl PatriciaTree {
     pub fn delete(&self, key: u128) {
         println!("[DELETE] key={:x}", key);
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        hdr.lock.write_lock();
+        // Acquire write lock using guard
+        let _write_guard = hdr.lock.write_lock();
         println!("[DELETE] Lock acquired.");
 
         let mut current_ptr = hdr.root_offset.load(Ordering::Relaxed);
@@ -694,7 +697,7 @@ impl PatriciaTree {
 
             if cpl < node.prefix_len {
                 println!("[DELETE] Diverged (cpl < node.prefix_len). Key not found.");
-                hdr.lock.write_unlock();
+                // REMOVED: hdr.lock.write_unlock();
                 return; // Key not found in this subtree
             }
 
@@ -736,7 +739,7 @@ impl PatriciaTree {
                         hdr.free_slots.fetch_add(1, Ordering::Release);
                         println!("[DELETE] Finished.");
                         // TODO: Implement pruning of expired nodes if necessary.
-                        hdr.lock.write_unlock();
+                        // REMOVED: hdr.lock.write_unlock();
                         return;
                     }
                     // If keys don't match exactly, but the prefix does, it means the node we found
@@ -746,7 +749,7 @@ impl PatriciaTree {
                     // This case (cpl == node.prefix_len but masked keys differ) should theoretically not happen
                     // due to how common_prefix_len works. If it does, it implies an issue elsewhere.
                     println!("[DELETE] Inconsistent state: cpl == node.prefix_len but masked keys differ. Key not found.");
-                    hdr.lock.write_unlock();
+                    // REMOVED: hdr.lock.write_unlock();
                     return;
                 }
             }
@@ -759,7 +762,7 @@ impl PatriciaTree {
                 println!(
                     "[DELETE] Node prefix_len >= 128, but key didn't match exactly. Key not found."
                 );
-                hdr.lock.write_unlock();
+                // REMOVED: hdr.lock.write_unlock();
                 return; // Cannot go deeper
             }
 
@@ -776,7 +779,7 @@ impl PatriciaTree {
             (current_offset, current_gen) = unpack(current_ptr);
         }
         println!("[DELETE] Reached end of branch (offset 0). Key not found.");
-        hdr.lock.write_unlock();
+        // REMOVED: hdr.lock.write_unlock();
         // Key not found if loop finishes
     }
 
@@ -789,13 +792,23 @@ impl PatriciaTree {
 
     /// Clears the entire tree (drops all nodes).
     pub fn clear(&self) {
-        let hdr = unsafe { &mut *self.hdr.as_ptr() };
-        hdr.lock.write_lock();
-        hdr.next_index.store(0, Ordering::SeqCst);
-        hdr.free_slots.store(0, Ordering::SeqCst);
-        hdr.root_offset.store(0, Ordering::SeqCst);
+        println!("[CLEAR] Clearing tree.");
+        let hdr = unsafe { &*self.hdr.as_ptr() };
+        // Acquire write lock using guard
+        let _write_guard = hdr.lock.write_lock();
+        println!("[CLEAR] Lock acquired.");
+
+        // Reset root and allocator state
+        hdr.root_offset.store(0, Ordering::Release);
+        hdr.next_index.store(0, Ordering::Release);
+        hdr.free_slots.store(0, Ordering::Release);
+
+        // Clear the Rust-side free list
         self.free_list.lock().clear();
-        hdr.lock.write_unlock();
+
+        println!("[CLEAR] Tree cleared.");
+        // Remove explicit unlock, guard will handle it
+        // hdr.lock.write_unlock();
     }
 } // end impl PatriciaTree
 
