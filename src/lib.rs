@@ -166,29 +166,41 @@ impl PatriciaTree {
             || hdr_mut.version != HEADER_VERSION
             || hdr_mut.capacity != capacity
         {
-            // zero the lock bytes first
+            // -- write full header once (lock still zero) --
             unsafe {
-                core::ptr::write_bytes(&mut hdr_mut.lock, 0, 1);
+                core::ptr::write(
+                    hdr_ptr,
+                    Header { 
+                        magic:  HEADER_MAGIC,
+                        version: HEADER_VERSION,
+                        _reserved: [0; 6],
+                        lock:    core::mem::zeroed(), // to be initialised right after
+                        next_index: AtomicU32::new(0),
+                        free_slots: AtomicU32::new(0),
+                        root_offset: AtomicU64::new(0),
+                        capacity,
+                        ref_count: AtomicUsize::new(0),
+                        init_flag: AtomicU32::new(0),
+                    },
+                );
+                // -- now bring the lock online --
+                RawRwLock::init(
+                    &mut (*hdr_ptr).lock as *mut _ as *mut u8,
+                    Timeout::Infinite,
+                )
+                .expect("RawRwLock::init failed");
             }
-            // Handle the Result from init
-            unsafe {
-                RawRwLock::init(&mut hdr_mut.lock as *mut _ as *mut u8, Timeout::Infinite)
-                    .expect("RawRwLock::init failed"); // Use expect to handle the Result
-            }
-            *hdr_mut = Header {
-                magic: HEADER_MAGIC,
-                version: HEADER_VERSION,
-                _reserved: [0; 6],
-                lock: unsafe { core::mem::zeroed() }, // already initialised above
-                next_index: AtomicU32::new(0),
-                free_slots: AtomicU32::new(0),
-                root_offset: AtomicU64::new(0),
-                capacity,
-                ref_count: AtomicUsize::new(0),
-                init_flag: AtomicU32::new(0),
-            };
         }
         let hdr_ref = unsafe { &*hdr_ptr };
+        // Non-creator (or re-opened) mapping → ensure OS handles exist in this process
+        if !is_creator {
+            // tolerate half-initialised mapping: reopen or init
+            unsafe {
+                RawRwLock::reopen_in_place(&mut (*hdr_mut).lock)
+                    .or_else(|_| RawRwLock::new_in_place(&mut (*hdr_mut).lock))
+                    .expect("RawRwLock reopen or init failed");
+            }
+        }
         hdr_ref
             .ref_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -618,32 +630,38 @@ impl PatriciaTree {
         }
     }
 
+
+    #[inline(always)]
+    fn follow(&self, packed: u64) -> Option<(&Node, u32)> {
+        if packed == 0 { return None; }
+        let (off, gen) = unpack(packed);
+        let ptr = unsafe { self.base.as_ptr().add(off as usize) as *const Node };
+        Some((unsafe { &*ptr }, gen))
+    }
+
     /// Lookup a key; true if found and not expired (Revised for Patricia structure)
     pub fn lookup(&self, key: u128) -> bool {
-        let hdr = unsafe { &*self.hdr.as_ptr() };
-        let mut current_offset = hdr.root_offset.load(Ordering::Acquire);
+        let hdr  = unsafe { &*self.hdr.as_ptr() };
+        let mut link = hdr.root_offset.load(Ordering::Acquire);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        while current_offset != 0 {
-            let node =
-                unsafe { &*(self.base.as_ptr().add(current_offset as usize) as *const Node) };
+        while let Some((node,_gen)) = self.follow(link) {
             let cpl = common_prefix_len(key, node.key, node.prefix_len);
-            if cpl < node.prefix_len {
-                return false; // prefix diverged
-            }
+            if cpl < node.prefix_len { return false; }
+
             let exp = node.expires.load(Ordering::Acquire);
-            // If this node is a leaf/prefix node (not internal) and key matches its prefix, return its TTL state
             if exp != u64::MAX && cpl == node.prefix_len {
                 return exp >= now;
             }
-            // Otherwise it's an internal node: traverse based on next bit
+
             if node.prefix_len >= 128 {
                 return false;
             }
+
             let next_bit = get_bit(key, node.prefix_len);
-            current_offset = if next_bit == 0 {
+            link = if next_bit == 0 {
                 node.left.load(Ordering::Acquire)
             } else {
                 node.right.load(Ordering::Acquire)
