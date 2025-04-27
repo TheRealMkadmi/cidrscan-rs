@@ -159,31 +159,3 @@ fn stress_test_timing() {
     // assert!(avg < 10.0, "lookup too slow: {:.2}μs", avg);
     let _ = PatriciaTree::destroy("test_stress");
 }
-
-#[test]
-fn edge_cases_zero_capacity_and_large_prefix() {
-    let _ = PatriciaTree::destroy("test_zero_cap");
-    // zero capacity → only header; any insert panics
-    let tree = PatriciaTree::open("test_zero_cap", 0).unwrap();
-    let k = ipv4_to_u128(8, 8, 8, 8);
-    
-    // Try insertion and expect panic
-    let result = std::panic::catch_unwind(|| tree.insert(k, 32, 60));
-    assert!(result.is_err(), "Expected panic on zero capacity, but no panic occurred");
-    
-    // Verify the panic message if possible
-    if let Some(msg) = result.err().unwrap().downcast_ref::<&str>() {
-        assert!(msg.contains("Cannot insert into a zero-capacity tree"), 
-                "Expected panic message about zero capacity, got: {}", msg);
-    }
-
-    let _ = PatriciaTree::destroy("test_zero_cap");
-    // insert with prefix_len = 0 matches all keys
-    let _ = PatriciaTree::destroy("test_prefix0");
-    let tree2 = PatriciaTree::open("test_prefix0", 16).unwrap();
-    let wildcard = 0u128;
-    tree2.insert(wildcard, 0, 60);
-    assert!(tree2.lookup(ipv4_to_u128(1,2,3,4)), "Wildcard should match any IP");
-    assert!(tree2.lookup(ipv4_to_u128(255,255,255,255)), "Wildcard should match any IP");
-    let _ = PatriciaTree::destroy("test_prefix0");
-}

@@ -27,3 +27,9 @@ crate-type = ["rlib", "cdylib"]
 
 [build-dependencies]
 cbindgen = "0.24"
+
+[dev-dependencies]
+proptest = "1"
+num_cpus = "1"
+
+rand = "0.8"

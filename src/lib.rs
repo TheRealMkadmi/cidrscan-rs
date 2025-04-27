@@ -259,20 +259,14 @@ impl PatriciaTree {
     fn alloc_offset(&self) -> Offset {
         // This function seems unused after the rewrite, allocate_node is used instead.
         // If it were used, logging would go here.
-        // println!("[ALLOC_OFFSET] Attempting allocation...");
         let hdr = unsafe { &*self.hdr.as_ptr() };
         let idx = hdr.next_index.fetch_add(1, Ordering::SeqCst);
-        println!("[ALLOC_OFFSET] index={}, capacity={}", idx, hdr.capacity);
         if (idx as usize) >= hdr.capacity {
             // Rollback attempt - might be too late if another thread allocated
             hdr.next_index.fetch_sub(1, Ordering::SeqCst);
-            panic!(
-                "PatriciaTree capacity exceeded (checked in alloc_offset): {} >= {}",
-                idx, hdr.capacity
-            );
+            return 0; // Or handle as appropriate; alloc_offset is unused after rewrite.
         }
         let offset = size_of::<Header>() as Offset + (idx as Offset) * size_of::<Node>() as Offset;
-        println!("[ALLOC_OFFSET] Allocated offset={}", offset);
         offset
     }
 
@@ -306,7 +300,7 @@ impl PatriciaTree {
         loop {
             let current_ptr = unsafe { (*current_link_ptr).load(Ordering::Relaxed) };
             let (current_offset, current_gen) = unpack(current_ptr);
-            println!(
+            trace!(
                 "[INSERT] Loop start. current_offset={}, current_gen={}",
                 current_offset, current_gen
             );
@@ -507,7 +501,7 @@ impl PatriciaTree {
                 trace!("[INSERT] Checking capacity for insert above: count={}, capacity={}", current_node_count, hdr.capacity);
                 if (current_node_count as usize) >= hdr.capacity {
                     trace!("[INSERT] PANIC: Capacity exceeded before insert above allocation.");
-                    panic!("PatriciaTree capacity exceeded");
+                    return Err(Error::CapacityExceeded);
                 }
                 let (new_node_offset, new_node_gen) =
                     self.allocate_node_with_gen(key, prefix_len, expires)?;
@@ -566,58 +560,47 @@ impl PatriciaTree {
     /// Allocates a new node and returns (offset, generation).
     fn allocate_node_with_gen(&self, key: u128, prefix_len: u8, expires: u64) -> Result<(Offset, u32), Error> {
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        // Try to reuse a freed node
-        if let Some(offset) = self.free_list.lock().pop() {
-            trace!("[ALLOC] Reusing freed node at offset={}", offset);
-            // Decrement free_slots since we're reusing a slot
-            hdr.free_slots.fetch_sub(1, Ordering::SeqCst);
-            let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
-            let gen = unsafe {
-                let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
-                core::ptr::write_volatile(&mut (*node_ptr).key, key);
-                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-                (*node_ptr).left.store(0, Ordering::Relaxed);
-                (*node_ptr).right.store(0, Ordering::Relaxed);
-                (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                g
-            };
-            return Ok((offset, gen));
-        }
-        trace!("[ALLOC] key={:x}, prefix_len={}, expires={}", key, prefix_len, expires);
-        if hdr.capacity == 0 {
-            return Err(Error::ZeroCapacity);
-        }
-        // Allocation path: bump next_index, check capacity, spin if free_slots > 0, else error
+        let hdr_size = size_of::<Header>() as Offset;
+        let node_size = size_of::<Node>() as Offset;
         loop {
+            // ① Try to reuse a freed slot first (cheap fast-path)
+            if let Some(offset) = self.free_list.lock().pop() {
+                hdr.free_slots.fetch_sub(1, Ordering::Relaxed);
+                let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
+                let gen = unsafe {
+                    let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                    core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                    (*node_ptr).left.store(0, Ordering::Relaxed);
+                    (*node_ptr).right.store(0, Ordering::Relaxed);
+                    (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                    g
+                };
+                return Ok((offset, gen));
+            }
+    
+            // ② Try bump allocation
             let index = hdr.next_index.fetch_add(1, Ordering::SeqCst);
             if (index as usize) < hdr.capacity {
-                let offset =
-                    size_of::<Header>() as Offset + (index as Offset) * size_of::<Node>() as Offset;
-                trace!("[ALLOC] Calculated offset={}", offset);
-                let gen = unsafe {
-                    let node_ptr = self.base.as_ptr().add(offset as usize) as *mut Node;
-                    trace!("[ALLOC] Writing node data at offset={}", offset);
+                let offset = hdr_size + index * node_size;
+                let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
+                unsafe {
                     core::ptr::write_volatile(&mut (*node_ptr).key, key);
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                     (*node_ptr).generation.store(1, Ordering::Relaxed);
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                    trace!("[ALLOC] Node initialized at offset={}", offset);
-                    1
-                };
-                return Ok((offset, gen));
-            } else {
-                // Out of capacity: check if there are free slots to reclaim
-                if hdr.free_slots.load(Ordering::Acquire) > 0 {
-                    // Spin and retry, waiting for a slot to be freed
-                    std::thread::yield_now();
-                    continue;
-                } else {
-                    trace!("[ALLOC] PANIC: PatriciaTree capacity exceeded and no free slots available.");
-                    return Err(Error::CapacityExceeded);
                 }
+                return Ok((offset, 1));
             }
+            hdr.next_index.fetch_sub(1, Ordering::SeqCst); // roll back
+    
+            // ③ Arena full – block until another thread frees something
+            if hdr.free_slots.load(Ordering::Acquire) == 0 {
+                return Err(Error::CapacityExceeded);
+            }
+            std::thread::yield_now(); // very short back-off, then loop to ①
         }
     }
 
