@@ -64,22 +64,6 @@ fn get_bit(key: u128, index: u8) -> u8 {
 
 // Helper function to find the first differing bit between two keys, up to max_len bits.
 // Returns Some(bit_index) where 0 = MSB, or None if all bits up to max_len are the same.
-fn first_differing_bit(key1: u128, key2: u128, max_len: u8) -> Option<u8> {
-    if max_len == 0 {
-        return None;
-    }
-    let mask = if max_len == 128 {
-        !0u128
-    } else {
-        !(!0u128 >> max_len)
-    };
-    let diff = (key1 & mask) ^ (key2 & mask);
-    if diff == 0 {
-        None
-    } else {
-        Some(diff.leading_zeros() as u8)
-    }
-}
 
 // Helper function to create a mask for a given prefix length
 #[inline]
@@ -387,9 +371,9 @@ impl PatriciaTree {
                 || (cpl == prefix_len && cpl == current_node.prefix_len && key != current_node.key)
             {
                 // Find the first differing bit after the common prefix
-                let max_split_len = prefix_len.max(current_node.prefix_len);
-                let split_bit = first_differing_bit(key, current_node.key, max_split_len)
-                    .unwrap_or(max_split_len); // fallback, should always find a diff here
+                // split at the *actual* first differing bit, not capped by current prefixes
+                let split_bit = (key ^ current_node.key).leading_zeros() as u8;
+                debug_assert!(split_bit > cpl, "split_bit must exceed common prefix");
                 trace!("[INSERT] Subcase 2b: Split required at split_bit={}.", split_bit);
                 // ATOMIC: Hold free_list lock for both check and allocation
                 let internal_offset: Offset;
