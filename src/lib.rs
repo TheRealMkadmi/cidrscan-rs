@@ -4,7 +4,7 @@
 use crate::shmem_rwlock::RawRwLock;
 use raw_sync::Timeout; // needed by API
 use shared_memory::{Shmem, ShmemConf, ShmemError}; // Shared memory mapping :contentReference[oaicite:13]{index=13}
-use spin::Mutex; // **only** for the free-list
+use parking_lot::Mutex;    // fast & no cpu-spin under contention
 use std::{
     mem::size_of,
     ptr::NonNull,
@@ -600,7 +600,7 @@ impl PatriciaTree {
             if hdr.free_slots.load(Ordering::Acquire) == 0 {
                 return Err(Error::CapacityExceeded);
             }
-            std::thread::yield_now(); // very short back-off, then loop to ①
+            std::thread::park_timeout(std::time::Duration::from_micros(30));
         }
     }
 

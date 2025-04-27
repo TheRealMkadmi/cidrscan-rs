@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1066376e3b258c5f9dc52aeb3f956afa195039fb18d9ebc059d414e314ce3c48 # shrinks to keys = [0, 0, 0, 0, 0, 0, 0, 25879331385300, 281713088488237303414635295160219853966, 241535972538671814530634483612046678022], prefix_lens = [92, 53, 71, 78, 24, 93, 126, 44, 102, 79, 31, 1, 5, 58, 74, 101, 113, 64, 96, 113, 2, 20, 99, 103, 128, 12, 51, 113, 15, 69, 39, 110, 90, 14, 60, 80, 9, 18, 65, 103, 22, 67, 70, 55, 93, 114, 63, 6, 32, 54, 7, 122, 32, 103, 57, 114, 93, 105, 23, 38, 74, 117, 60, 92, 103, 123, 23, 116, 13]

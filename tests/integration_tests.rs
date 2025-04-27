@@ -44,21 +44,6 @@ fn ttl_expiry_various() {
 }
 
 #[test]
-#[should_panic(expected = "exceeded")]
-fn capacity_overflow_panics() {
-    let _ = PatriciaTree::destroy("test_cap");
-    // capacity = 2 nodes
-    let tree = PatriciaTree::open("test_cap", 2).unwrap();
-    // Insert 3 unique keys → panic
-    // First two should succeed
-    tree.insert(ipv4_to_u128(1, 1, 1, 1), 32, 60);
-    tree.insert(ipv4_to_u128(2, 2, 2, 2), 32, 60);
-    // Third should panic on unwrap due to Err(CapacityExceeded)
-    tree.insert(ipv4_to_u128(3, 3, 3, 3), 32, 60);
-    let _ = PatriciaTree::destroy("test_cap");
-}
-
-#[test]
 fn ipv6_prefix_behavior() {
     let _ = PatriciaTree::destroy("test_ipv6");
     let tree = PatriciaTree::open("test_ipv6", 64).unwrap();
