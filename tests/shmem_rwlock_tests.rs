@@ -52,33 +52,28 @@ fn concurrent_readers() {
 
 #[test]
 fn writer_excludes_readers() {
+    use std::sync::mpsc;
+
     let lock = make_lock();
-    // Start the writer in a background thread
+    let (ready_tx, ready_rx) = mpsc::channel();
+
+    // writer thread
     let l = Arc::clone(&lock);
     let writer = thread::spawn(move || {
-        let _write_guard = l.write_lock();
-        // hold it for 50ms
+        let _w = l.write_lock();
+        ready_tx.send(()).unwrap();        // tell main we really own it
         thread::sleep(Duration::from_millis(50));
-        // Guard dropped here, releasing lock
+        // _w dropped → unlock
     });
 
-    // Give the writer a moment to acquire the lock
-    thread::sleep(Duration::from_millis(5));
+    // wait until writer has the lock for sure
+    ready_rx.recv().unwrap();
 
-    // Now attempt to read; this will block until the writer releases
     let start = Instant::now();
     {
-        let _read_guard = lock.read_lock();
-        let waited = start.elapsed();
-        // The reader should have waited *at least* ~45ms
-        assert!(
-            waited >= Duration::from_millis(40),
-            "reader did not wait (waited {:?})",
-            waited
-        );
-        // Guard dropped here, releasing lock
+        let _r = lock.read_lock();         // must block
     }
-
+    assert!(start.elapsed() >= Duration::from_millis(45));
     writer.join().unwrap();
 }
 
@@ -228,35 +223,34 @@ fn multiple_readers_block_writer() {
 /// Test try_write_lock with timeout: immediate failure when readers present.
 #[test]
 fn try_write_lock_timeout_behavior() {
+    use std::sync::mpsc;
+
     let lock = Arc::new(RawRwLock::boxed());
+    let (ready_tx, ready_rx) = mpsc::channel();
 
-    // spawn a reader that holds the lock
-    let c = Arc::clone(&lock);
-    let handle = thread::spawn(move || {
-        let _r = c.read_lock();
-        thread::sleep(Duration::from_millis(100));
-        // reader drops here
-    });
+    // long-lived reader
+    {
+        let c = Arc::clone(&lock);
+        thread::spawn(move || {
+            let _r = c.read_lock();
+            ready_tx.send(()).unwrap();        // hold before signalling
+            thread::sleep(Duration::from_millis(100));
+        });
+    }
 
-    // give reader a moment to acquire
-    thread::sleep(Duration::from_millis(10));
+    // wait until reader really owns the lock
+    ready_rx.recv().unwrap();
 
-    // try to get write lock with short timeout → should fail
-    let deadline = Timeout::Val(Duration::from_millis(20));
-    let maybe_guard = lock.try_write_lock(deadline);
-    assert!(
-        maybe_guard.is_none(),
-        "try_write_lock unexpectedly succeeded"
+    // now we know reader count > 0
+    assert!(lock
+        .try_write_lock(Timeout::Val(Duration::from_millis(20)))
+        .is_none(),
+        "writer should time-out while reader present",
     );
 
-    handle.join().unwrap();
-
-    // now that reader is gone, try again and should succeed
-    let guard = lock.try_write_lock(Timeout::Val(Duration::from_millis(50)));
-    assert!(
-        guard.is_some(),
-        "try_write_lock did not succeed after reader dropped"
-    );
+    // after reader is gone this should succeed
+    thread::sleep(Duration::from_millis(110));
+    assert!(lock.try_write_lock(Timeout::Val(Duration::from_millis(50))).is_some());
 }
 
 /// Basic test that many sequential read locks do not overflow the counter

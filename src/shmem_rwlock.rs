@@ -247,12 +247,11 @@ impl RawRwLock {
         // Acquire OS mutex using cached handle
         let guard = self.mutex().lock().expect("mutex lock failed");
 
-        // A. clear the manual-reset event *first* – guarantees that any
-        //    SetEvent from old readers happens **after** the clear.
-        self.event().set(raw_sync::events::EventState::Clear).unwrap();
-
-        // B. publish “writer present”; save current reader count
+        // 1. advertise writer *first*
         let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+
+        // 2. now clear the manual-reset event
+        self.event().set(raw_sync::events::EventState::Clear).unwrap();
 
         // 3) wait until the last reader wakes us
         if prev != 0 {
