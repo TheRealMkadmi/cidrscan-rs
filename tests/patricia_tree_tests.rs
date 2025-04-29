@@ -61,7 +61,7 @@ proptest! {
         let to_delete: Vec<_> = pairs.iter().take(n/2).cloned().collect();
         let to_keep: Vec<_> = pairs.iter().skip(n/2).cloned().collect();
 
-        for (k, p) in &to_delete {
+        for (k, _p) in &to_delete {
             let _ = tree.delete(*k);
         }
 

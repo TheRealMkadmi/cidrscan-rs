@@ -17,3 +17,5 @@ once_cell   = "1.21"     # per-process handle cache
 proptest = "1"
 num_cpus = "1"
 rand = "0.9.1"
+[features]
+trace = []

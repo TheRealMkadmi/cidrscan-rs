@@ -14,13 +14,34 @@ use std::{
 
 pub mod shmem_rwlock;
 
+// ===== Alignment helpers and constants =====
+
+/// Round `n` up to the next multiple of `align`  (align *must* be a power of two)
+#[inline(always)]
+const fn align_up(n: usize, align: usize) -> usize {
+    (n + align - 1) & !(align - 1)
+}
+
+/// Cache-line size used by `Node`
+const CACHE_LINE: usize = 64;
+
+/// Padded size of the header – ALWAYS a multiple of 64
+const HEADER_PADDED: usize = align_up(std::mem::size_of::<Header>(), CACHE_LINE);
+
+/// Static guarantee that the padded size is indeed aligned
+const _: () = assert!(HEADER_PADDED % CACHE_LINE == 0);
+
+/// Compile-time sanity – the arena pointer is 64-aligned
+const _: () = assert!(std::mem::align_of::<Header>() == CACHE_LINE);
+const _: () = assert!(std::mem::align_of::<Node>()   == CACHE_LINE);
+
 /// Print only if the "trace" feature is enabled.
 #[macro_export]
 macro_rules! trace {
     ($($t:tt)*) => {
-        if cfg!(feature = "trace") {
+        // if cfg!(feature = "trace") {
             println!($($t)*);
-        }
+        // }
     }
 }
 
@@ -164,27 +185,13 @@ impl PatriciaTree {
 
     /// Create or open a shared‑memory tree
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
-        let region_size = size_of::<Header>() + capacity * size_of::<Node>();
-        let map_file = format!("{}.map", name);
-        // Use flink for file-backed mapping (cross-platform destroy)
-        let (shmem, is_creator) = {
-            let create_conf = ShmemConf::new()
-                .os_id(name)
-                .flink(&map_file)
-                .size(region_size);
-            match create_conf.create() {
-                Ok(map) => (map, true),
-                Err(e) => match e {
-                    ShmemError::MappingIdExists | ShmemError::LinkExists => {
-                        let open_conf = ShmemConf::new()
-                            .os_id(name)
-                            .flink(&map_file)
-                            .size(region_size);
-                        (open_conf.open()?, false)
-                    }
-                    _ => return Err(e),
-                },
-            }
+        let region_size = HEADER_PADDED + capacity * size_of::<Node>();
+        // try-create, else open-existing
+        let conf = || ShmemConf::new().os_id(name).size(region_size);
+        let (shmem, is_creator) = match conf().create() {
+            Ok(m) => (m, true),
+            Err(ShmemError::MappingIdExists) => (conf().open()?, false),
+            Err(e) => return Err(e),
         };
         let base_ptr = shmem.as_ptr() as *mut u8;
         let base = NonNull::new(base_ptr).unwrap();
@@ -244,31 +251,6 @@ impl PatriciaTree {
         })
     }
 
-    /// Unlink the named shared-memory object (manual cleanup)
-    pub fn destroy(name: &str) -> std::io::Result<()> {
-        let map_file = format!("{}.map", name);
-        if std::path::Path::new(&map_file).exists() {
-            std::fs::remove_file(map_file)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Allocate a node offset in the arena
-    #[inline(always)]
-    fn alloc_offset(&self) -> Offset {
-        // This function seems unused after the rewrite, allocate_node is used instead.
-        // If it were used, logging would go here.
-        let hdr = unsafe { &*self.hdr.as_ptr() };
-        let idx = hdr.next_index.fetch_add(1, Ordering::SeqCst);
-        if (idx as usize) >= hdr.capacity {
-            // Rollback attempt - might be too late if another thread allocated
-            hdr.next_index.fetch_sub(1, Ordering::SeqCst);
-            return 0; // Or handle as appropriate; alloc_offset is unused after rewrite.
-        }
-        let offset = size_of::<Header>() as Offset + (idx as Offset) * size_of::<Node>() as Offset;
-        offset
-    }
 
     /// Insert a key with a given prefix length and TTL - REVISED LOGIC
     pub fn insert(&self, key: u128, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
@@ -403,7 +385,7 @@ impl PatriciaTree {
                             hdr.next_index.fetch_sub(1, Ordering::Relaxed);
                             return Err(Error::CapacityExceeded);
                         }
-                        internal_offset = size_of::<Header>() as Offset
+                        internal_offset = HEADER_PADDED as Offset
                             + (index as Offset) * size_of::<Node>() as Offset;
                         let node_ptr = unsafe {
                             self.base.as_ptr().add(internal_offset as usize) as *mut Node
@@ -445,7 +427,7 @@ impl PatriciaTree {
                             }
                             return Err(Error::CapacityExceeded);
                         }
-                        leaf_offset = size_of::<Header>() as Offset
+                        leaf_offset = HEADER_PADDED as Offset
                             + (index as Offset) * size_of::<Node>() as Offset;
                         let node_ptr =
                             unsafe { self.base.as_ptr().add(leaf_offset as usize) as *mut Node };
@@ -460,6 +442,7 @@ impl PatriciaTree {
                         leaf_gen = 1;
                     }
                 }
+                // This whole block needs to be atomic with respect to the parent link update
                 unsafe {
                     let internal_node =
                         &mut *(self.base.as_ptr().add(internal_offset as usize) as *mut Node);
@@ -468,35 +451,56 @@ impl PatriciaTree {
                     if new_bit == 0 {
                         internal_node
                             .left
-                            .store(pack(leaf_offset as u32, leaf_gen), Ordering::Release);
+                            .store(pack(leaf_offset, leaf_gen), Ordering::Release);
                         internal_node
                             .right
-                            .store(pack(current_offset as u32, current_gen), Ordering::Release);
+                            .store(pack(current_offset, current_gen), Ordering::Release);
                     } else {
                         internal_node
                             .right
-                            .store(pack(leaf_offset as u32, leaf_gen), Ordering::Release);
+                            .store(pack(leaf_offset, leaf_gen), Ordering::Release);
                         internal_node
                             .left
-                            .store(pack(current_offset as u32, current_gen), Ordering::Release);
+                            .store(pack(current_offset, current_gen), Ordering::Release);
                     }
                     trace!("[INSERT] Linking new internal node at offset={}.", internal_offset);
-                    (*current_link_ptr).store(
-                        pack(internal_offset as u32, internal_gen),
-                        Ordering::Release,
-                    );
+
+                    // Atomically update the parent link to point to the new internal node
+                    let link_atomic = &*(current_link_ptr as *const AtomicU64);
+                    // Use compare_exchange to handle potential concurrent modifications
+                    if link_atomic.compare_exchange(
+                        current_ptr, // Expected current value (offset, gen of node being split)
+                        pack(internal_offset, internal_gen), // New value (offset, gen of new internal node)
+                        Ordering::AcqRel, // Success ordering
+                        Ordering::Acquire  // Failure ordering
+                    ).is_err() {
+                        // CAS failed - another thread likely modified the link.
+                        // Recycle the allocated nodes and restart the insert operation.
+                        trace!("[INSERT] Split CAS failed. Recycling nodes and restarting.");
+                        let mut free_list = self.free_list.lock();
+                        free_list.push(internal_offset);
+                        free_list.push(leaf_offset);
+                        drop(free_list); // Release lock before continuing
+                        continue; // Restart the outer loop to retry the insertion
+                    }
+                    // CAS Succeeded
                 }
                 trace!("[INSERT] Finished Subcase 2b.");
+                // No need for explicit unlock, guard handles it
                 return Ok(());
             }
 
+            // --- Subcase 2c: Insert Above ---
+            // This case happens when the new key is a prefix of the current node's key,
+            // requiring the new node to be inserted *above* the current node.
+            // Condition: cpl == prefix_len < current_node.prefix_len
             // --- Subcase 2c: Descend ---
             // This case happens when the new key is a prefix of the current node.
             // cpl == current_node.prefix_len must hold (otherwise split would happen).
             // So the condition simplifies to cpl < prefix_len.
-            if cpl < prefix_len {
+            if cpl < prefix_len { // Adjusted condition based on logic flow
                 // Implies cpl == current_node.prefix_len
-                trace!("[INSERT] Subcase 2c: Insert Above required at cpl={}.", cpl);
+                trace!("[INSERT] Subcase 2c: Descend required at cpl={}.", cpl);
                 let current_node_count = hdr.next_index.load(Ordering::Relaxed);
                 trace!("[INSERT] Checking capacity for insert above: count={}, capacity={}", current_node_count, hdr.capacity);
                 if (current_node_count as usize) >= hdr.capacity {
@@ -560,7 +564,7 @@ impl PatriciaTree {
     /// Allocates a new node and returns (offset, generation).
     fn allocate_node_with_gen(&self, key: u128, prefix_len: u8, expires: u64) -> Result<(Offset, u32), Error> {
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        let hdr_size = size_of::<Header>() as Offset;
+        let hdr_size = HEADER_PADDED as Offset;
         let node_size = size_of::<Node>() as Offset;
         loop {
             // ① Try to reuse a freed slot first (cheap fast-path)

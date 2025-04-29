@@ -99,9 +99,6 @@ impl RawRwLock {
             return Err("RawRwLock pointer is not properly aligned".into());
         }
 
-        // Get pointers to the start of the buffers within the pointed-to struct
-        let mutex_ptr = ptr::addr_of_mut!((*ptr).mutex_buf) as *mut u8;
-        let event_ptr = ptr::addr_of_mut!((*ptr).event_buf) as *mut u8;
         let readers_ptr = ptr::addr_of_mut!((*ptr).readers);
 
         // Check if buffer sizes are sufficient (optional, for debugging)
@@ -146,9 +143,6 @@ impl RawRwLock {
         if ptr.is_null() {
             return Err("Null pointer passed to reopen_in_place".into());
         }
-        // Get pointers to the start of the buffers within the pointed-to struct
-        let mutex_ptr = ptr::addr_of_mut!((*ptr).mutex_buf) as *mut u8;
-        let event_ptr = ptr::addr_of_mut!((*ptr).event_buf) as *mut u8;
 
         // Reopen mutex in its buffer
         (&*ptr).init_handles(false)?;
