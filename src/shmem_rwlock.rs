@@ -26,41 +26,48 @@ pub struct RawRwLock {
     /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
     // NOT in shared-mem logic – just per-process caches
-    mutex_impl: OnceCell<&'static dyn LockImpl>,
-    event_impl: OnceCell<&'static dyn EventImpl>,
+    mutex_impl: OnceCell<Box<dyn LockImpl>>,
+    event_impl: OnceCell<Box<dyn EventImpl>>,
 }
 
 // SAFETY: The underlying primitives from raw_sync are designed for cross-process
 // and potentially cross-thread use, even though they contain raw pointers.
 // Marking RawRwLock as Send + Sync is safe for use cases like the tests
 // where it's managed within a single process (e.g., via Arc).
-#[inline(always)]
-    fn mutex(&self) -> &'static dyn LockImpl {
-        self.mutex_impl.get().expect("RawRwLock not initialised")
-    }
-    #[inline(always)]
-/// creator = true  for brand-new mapping, false for reopen
-    unsafe fn init_handles(&self, creator: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if creator {
-            let (m, _) = RawMutex::new(self.mutex_ptr(), ptr::null_mut())?;
-            let (e, _) = RawEvent::new(self.event_ptr(), true)?;
-            self.mutex_impl.set(Box::leak(m)).ok();
-            self.event_impl .set(Box::leak(e)).ok();
-        } else {
-            let (m, _) = RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut())?;
-            let (e, _) = RawEvent::from_existing(self.event_ptr())?;
-            self.mutex_impl.set(Box::leak(m)).ok();
-            self.event_impl .set(Box::leak(e)).ok();
-        }
-        Ok(())
-    }
-    fn event(&self) -> &'static dyn EventImpl {
-        self.event_impl.get().expect("RawRwLock not initialised")
-    }
 unsafe impl Send for RawRwLock {}
 unsafe impl Sync for RawRwLock {}
 
 impl RawRwLock {
+    #[inline(always)]
+    fn mutex<'a>(&'a self) -> &'a dyn LockImpl {
+        self.mutex_impl.get().expect("RawRwLock not initialised").as_ref()
+    }
+
+    #[inline(always)]
+    /// creator = true for brand-new mapping, false for reopen
+    unsafe fn init_handles(&self, creator: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if creator {
+            let (m_raw, _) = RawMutex::new(self.mutex_ptr(), ptr::null_mut())?;
+            let m: Box<dyn LockImpl> = m_raw;
+            let (e_raw, _) = RawEvent::new(self.event_ptr(), true)?;
+            let e: Box<dyn EventImpl> = e_raw;
+            self.mutex_impl.set(m);
+            self.event_impl.set(e);
+        } else {
+            let (m_raw, _) = RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut())?;
+            let m: Box<dyn LockImpl> = m_raw;
+            let (e_raw, _) = RawEvent::from_existing(self.event_ptr())?;
+            let e: Box<dyn EventImpl> = e_raw;
+            self.mutex_impl.set(m);
+            self.event_impl.set(e);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn event(&self) -> &dyn EventImpl {
+        self.event_impl.get().expect("RawRwLock not initialised").as_ref()
+    }
     /// Helper to get a mutable pointer to the mutex buffer.
     #[inline(always)]
     fn mutex_ptr(&self) -> *mut u8 {
@@ -167,7 +174,7 @@ impl RawRwLock {
 #[must_use = "if unused the lock will immediately unlock"]
 pub struct WriteGuard<'a> {
     lock: &'a RawRwLock,
-    _guard: raw_sync::locks::LockGuard<'static>,
+    _guard: raw_sync::locks::LockGuard<'a>,
 }
 
 impl<'a> Drop for WriteGuard<'a> {
