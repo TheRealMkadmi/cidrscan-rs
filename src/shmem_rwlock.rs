@@ -8,7 +8,9 @@ use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
 // Stable allocation imports for boxed helper
 use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
-use once_cell::sync::OnceCell;             // NEW
+use once_cell::sync::Lazy;
+use dashmap::DashMap;
+use core::marker::PhantomData;
 
 const MUTEX_BUF_SIZE: usize = core::mem::size_of::<RawMutex>();
 const EVENT_BUF_SIZE: usize = core::mem::size_of::<RawEvent>();
@@ -25,9 +27,11 @@ pub struct RawRwLock {
     event_buf: [u8; EVENT_BUF_SIZE],
     /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
-    // NOT in shared-mem logic – just per-process caches
-    mutex_impl: OnceCell<Box<dyn LockImpl>>,
-    event_impl: OnceCell<Box<dyn EventImpl>>,
+    /// OS mutex handle (lives as long as RawRwLock)
+    mutex_handle: Option<Box<dyn LockImpl + Send + Sync>>,
+    /// OS event handle (lives as long as RawRwLock)
+    event_handle: Option<Box<dyn EventImpl + Send + Sync>>,
+    _marker: PhantomData<()>, // no process-local state inside shm
 }
 
 // SAFETY: The underlying primitives from raw_sync are designed for cross-process
@@ -37,50 +41,36 @@ pub struct RawRwLock {
 unsafe impl Send for RawRwLock {}
 unsafe impl Sync for RawRwLock {}
 
+type Handles = (
+    Box<dyn LockImpl + Send + Sync>,
+    Box<dyn EventImpl + Send + Sync>,
+);
+
 impl RawRwLock {
     #[inline(always)]
-    fn mutex<'a>(&'a self) -> &'a dyn LockImpl {
-        self.mutex_impl.get().expect("RawRwLock not initialised").as_ref()
-    }
-
-    #[inline(always)]
-    /// creator = true for brand-new mapping, false for reopen
-    unsafe fn init_handles(&self, creator: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if creator {
-            let (m_raw, _) = RawMutex::new(self.mutex_ptr(), ptr::null_mut())?;
-            let m: Box<dyn LockImpl> = m_raw;
-            let (e_raw, _) = RawEvent::new(self.event_ptr(), true)?;
-            let e: Box<dyn EventImpl> = e_raw;
-            self.mutex_impl.set(m);
-            self.event_impl.set(e);
-        } else {
-            let (m_raw, _) = RawMutex::from_existing(self.mutex_ptr(), ptr::null_mut())?;
-            let m: Box<dyn LockImpl> = m_raw;
-            let (e_raw, _) = RawEvent::from_existing(self.event_ptr())?;
-            let e: Box<dyn EventImpl> = e_raw;
-            self.mutex_impl.set(m);
-            self.event_impl.set(e);
-        }
-        Ok(())
+    fn mutex(&self) -> &dyn LockImpl {
+        self.mutex_handle
+            .as_ref()
+            .expect("mutex_handle not initialized")
+            .as_ref()
     }
 
     #[inline(always)]
     fn event(&self) -> &dyn EventImpl {
-        self.event_impl.get().expect("RawRwLock not initialised").as_ref()
+        self.event_handle
+            .as_ref()
+            .expect("event_handle not initialized")
+            .as_ref()
     }
     /// Helper to get a mutable pointer to the mutex buffer.
     #[inline(always)]
     fn mutex_ptr(&self) -> *mut u8 {
-        // Cast self to a raw pointer to get the address of the buffer.
-        // This is safe because the layout is repr(C).
-        // Need to cast self to a mutable pointer first for RawMutex operations.
         ptr::addr_of!(self.mutex_buf) as *mut u8
     }
 
     /// Helper to get a mutable pointer to the event buffer.
     #[inline(always)]
     fn event_ptr(&self) -> *mut u8 {
-        // Cast self to a raw pointer to get the address of the buffer.
         ptr::addr_of!(self.event_buf) as *mut u8
     }
 
@@ -101,16 +91,18 @@ impl RawRwLock {
 
         let readers_ptr = ptr::addr_of_mut!((*ptr).readers);
 
-        // Check if buffer sizes are sufficient (optional, for debugging)
-        // assert!(MUTEX_BUF_SIZE >= RawMutex::size_of(None));
-        // assert!(EVENT_BUF_SIZE >= RawEvent::size_of(None));
-
-        // Initialize mutex in its buffer
-        // IMPORTANT: We must keep the Box<dyn LockImpl> alive, or the OS object is destroyed!
-        // See: https://docs.rs/raw_sync/latest/raw_sync/locks/struct.Mutex.html
-        // Create OS objects _and_ cache them for this process
-        let this = &*ptr;
-        this.init_handles(true)?;
+        // Initialize mutex and event handles in their buffers
+        let this = &mut *ptr;
+        let mutex = Box::from_raw(
+            Box::into_raw(RawMutex::new(this.mutex_ptr(), ptr::null_mut()).unwrap().0)
+                as *mut (dyn LockImpl + Send + Sync),
+        );
+        let event = Box::from_raw(
+            Box::into_raw(RawEvent::new(this.event_ptr(), true).unwrap().0)
+                as *mut (dyn EventImpl + Send + Sync),
+        );
+        this.mutex_handle = Some(mutex);
+        this.event_handle = Some(event);
 
         // Initialize readers field directly
         readers_ptr.write(AtomicU32::new(0));
@@ -144,8 +136,19 @@ impl RawRwLock {
             return Err("Null pointer passed to reopen_in_place".into());
         }
 
-        // Reopen mutex in its buffer
-        (&*ptr).init_handles(false)?;
+        // Reopen mutex and event handles in their buffers
+        let this = &mut *ptr;
+        let mutex = Box::from_raw(
+            Box::into_raw(RawMutex::from_existing(this.mutex_ptr(), ptr::null_mut()).unwrap().0)
+                as *mut (dyn LockImpl + Send + Sync),
+        );
+        let event = Box::from_raw(
+            Box::into_raw(RawEvent::from_existing(this.event_ptr()).unwrap().0)
+                as *mut (dyn EventImpl + Send + Sync),
+        );
+        this.mutex_handle = Some(mutex);
+        this.event_handle = Some(event);
+
         Ok(()) // Indicate success
     }
     // Readers field state is preserved.
@@ -178,6 +181,7 @@ impl<'a> Drop for WriteGuard<'a> {
         // wake up any blocked readers
         self.lock.event().set(raw_sync::events::EventState::Signaled).unwrap();
         // _guard drop here → OS mutex unlocked by LockGuard drop
+        // handle is dropped here, keeping trait object alive for guard's lifetime
     }
 }
 
@@ -229,8 +233,7 @@ impl RawRwLock {
         let prev = self.readers.fetch_sub(1, Ordering::Release);
         // Only one pattern means “I was the last reader *and* a writer waits”:
         if prev == (WRITER_BIT | 1) {
-            let _ = unsafe { RawEvent::from_existing(self.event_ptr()) }
-                .and_then(|(ev, _)| ev.set(raw_sync::events::EventState::Signaled));
+            self.event().set(raw_sync::events::EventState::Signaled).unwrap();
         }
     }
 
@@ -238,46 +241,48 @@ impl RawRwLock {
     /// Blocks new readers and waits for in-flight readers to drain.
     /// Returns a guard that releases the lock when dropped.
     pub fn write_lock(&self) -> WriteGuard<'_> {
-        // Acquire OS mutex using cached handle
-        let guard = self.mutex().lock().expect("mutex lock failed");
-
-        // 1. advertise writer *first*
-        let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
-
-        // 2. now clear the manual-reset event
-        self.event().set(raw_sync::events::EventState::Clear).unwrap();
-
-        // 3) wait until the last reader wakes us
-        if prev != 0 {
-            self.event().wait(Timeout::Infinite).unwrap();
-            // defensive: spin until the reader count really reached 0
-            while self.readers.load(Ordering::Acquire) != WRITER_BIT {
-                core::hint::spin_loop();
+        unsafe {
+            // Use cached handles for this lock
+            let e_handle = RawEvent::from_existing(self.event_ptr()).unwrap().0;
+            // Acquire OS mutex using cached handle
+            let guard = self.mutex().lock().expect("mutex lock failed");
+            // 1. advertise writer first
+            let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+            // 2. clear manual-reset event
+            e_handle.set(raw_sync::events::EventState::Clear).unwrap();
+            // 3. wait for readers to drain
+            if prev != 0 {
+                e_handle.wait(Timeout::Infinite).unwrap();
+                while self.readers.load(Ordering::Acquire) != WRITER_BIT {
+                    core::hint::spin_loop();
+                }
             }
-        }
-        WriteGuard {
-            lock: self,
-            _guard: guard,
+            WriteGuard {
+                lock: self,
+                _guard: guard,
+            }
         }
     }
 
     /// Try to acquire an **exclusive** (write) lock without blocking indefinitely.
     /// Returns Some(WriteGuard) if the lock was acquired, None otherwise.
     pub fn try_write_lock(&self, timeout: Timeout) -> Option<WriteGuard<'_>> {
-        // Acquire OS mutex using cached handle
-        let guard = self.mutex().try_lock(timeout).ok()?;
-        // Try to block new readers
-        if self
-            .readers
-            .compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            drop(guard);
-            return None;
+        unsafe {
+            let e_handle = RawEvent::from_existing(self.event_ptr()).unwrap().0;
+            let guard = self.mutex().try_lock(timeout).ok()?;
+            // Try to block new readers
+            if self
+                .readers
+                .compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                drop(guard);
+                return None;
+            }
+            Some(WriteGuard {
+                lock: self,
+                _guard: guard,
+            })
         }
-        Some(WriteGuard {
-            lock: self,
-            _guard: guard,
-        })
     }
 }
