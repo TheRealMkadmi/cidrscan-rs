@@ -16,6 +16,23 @@ pub mod shmem_rwlock;
 
 // ===== Alignment helpers and constants =====
 
+#[cfg(target_os = "windows")]
+const PREFIX: &str = "Global\\cidrscan_";
+#[cfg(not(target_os = "windows"))]
+const PREFIX: &str = "cidrscan_";
+
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME:  u64 = 0x100000001b3;
+fn fnv1a_64(s: &str) -> u64 {
+   let mut h = FNV_OFFSET;
+   for &b in s.as_bytes() {
+       h ^= b as u64;
+       h = h.wrapping_mul(FNV_PRIME);
+   }
+   h
+}
+
+
 /// Round `n` up to the next multiple of `align`  (align *must* be a power of two)
 #[inline(always)]
 const fn align_up(n: usize, align: usize) -> usize {
@@ -185,9 +202,11 @@ impl PatriciaTree {
 
     /// Create or open a shared‑memory tree
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
+        let hash = fnv1a_64(name);
+        let os_name = format!("{PREFIX}{:016x}", hash);
         let region_size = HEADER_PADDED + capacity * size_of::<Node>();
         // try-create, else open-existing
-        let conf = || ShmemConf::new().os_id(name).size(region_size);
+        let conf = || ShmemConf::new().os_id(&os_name).size(region_size);
         let (shmem, is_creator) = match conf().create() {
             Ok(m) => (m, true),
             Err(ShmemError::MappingIdExists) => (conf().open()?, false),
@@ -208,7 +227,7 @@ impl PatriciaTree {
             unsafe {
                 core::ptr::write(
                     hdr_ptr,
-                    Header { 
+                    Header {
                         magic:  HEADER_MAGIC,
                         version: HEADER_VERSION,
                         _reserved: [0; 6],
@@ -236,7 +255,7 @@ impl PatriciaTree {
             unsafe {
                 RawRwLock::reopen_in_place(&mut (*hdr_mut).lock)
                     .or_else(|_| RawRwLock::new_in_place(&mut (*hdr_mut).lock))
-                    .expect("RawRwLock reopen or init failed");
+                    .expect("RawRwLock reopen OR init failed");
             }
         }
         hdr_ref
@@ -247,7 +266,7 @@ impl PatriciaTree {
             base,
             hdr,
             free_list: Mutex::new(Vec::new()),
-            os_id: name.to_string(),
+            os_id: os_name.clone(),
         })
     }
 

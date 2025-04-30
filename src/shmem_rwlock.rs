@@ -8,8 +8,6 @@ use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
 // Stable allocation imports for boxed helper
 use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
-use once_cell::sync::Lazy;
-use dashmap::DashMap;
 use core::marker::PhantomData;
 
 const MUTEX_BUF_SIZE: usize = core::mem::size_of::<RawMutex>();
@@ -40,11 +38,6 @@ pub struct RawRwLock {
 // where it's managed within a single process (e.g., via Arc).
 unsafe impl Send for RawRwLock {}
 unsafe impl Sync for RawRwLock {}
-
-type Handles = (
-    Box<dyn LockImpl + Send + Sync>,
-    Box<dyn EventImpl + Send + Sync>,
-);
 
 impl RawRwLock {
     #[inline(always)]
@@ -139,12 +132,18 @@ impl RawRwLock {
         // Reopen mutex and event handles in their buffers
         let this = &mut *ptr;
         let mutex = Box::from_raw(
-            Box::into_raw(RawMutex::from_existing(this.mutex_ptr(), ptr::null_mut()).unwrap().0)
-                as *mut (dyn LockImpl + Send + Sync),
+            Box::into_raw(
+                RawMutex::from_existing(this.mutex_ptr(), ptr::null_mut())
+                    .map_err(|e| format!("re-open mutex failed: {e}"))?
+                    .0,
+            ) as *mut (dyn LockImpl + Send + Sync),
         );
         let event = Box::from_raw(
-            Box::into_raw(RawEvent::from_existing(this.event_ptr()).unwrap().0)
-                as *mut (dyn EventImpl + Send + Sync),
+            Box::into_raw(
+                RawEvent::from_existing(this.event_ptr())
+                    .map_err(|e| format!("re-open event failed: {e}"))?
+                    .0,
+            ) as *mut (dyn EventImpl + Send + Sync),
         );
         this.mutex_handle = Some(mutex);
         this.event_handle = Some(event);
