@@ -396,173 +396,14 @@ impl PatriciaTree {
                 trace!("[INSERT] Subcase 2a: Exact match found. Updating TTL.");
                 current_node.expires.store(expires, Ordering::Relaxed);
                 trace!("[INSERT] Finished Subcase 2a.");
-                // Remove explicit unlock, guard will handle it
-                // hdr.lock.write_unlock();
                 return Ok(());
             }
 
-            // --- Subcase 2b: Split Required ---
-            // Split also when prefix lengths match exactly but keys differ
-            if cpl < current_node.prefix_len
-                || (cpl == prefix_len && cpl == current_node.prefix_len && key != current_node.key)
-            {
-                // Find the first differing bit after the common prefix
-                // split at the *actual* first differing bit, not capped by current prefixes
-                // In a Patricia trie the split point *is* the common-prefix length
-                let xor = key ^ current_node.key;
-                let split_bit = xor.leading_zeros() as u8;
-                debug_assert!(split_bit >= cpl && split_bit < 128, "split_invariants");
-                trace!("[INSERT] Subcase 2b: Split required at split_bit={}.", split_bit);
-                // ATOMIC: Hold free_list lock for both check and allocation
-                let internal_offset: Offset;
-                let internal_gen: u32;
-                let leaf_offset: Offset;
-                let leaf_gen: u32;
-                {
-                    let mut free_list = self.free_list.lock();
-                    let available = self.available_capacity();
-                    if available < 2 {
-                        trace!("[INSERT] PANIC: Not enough capacity for split (need 2 slots, have={}).", available);
-                        return Err(Error::CapacityExceeded);
-                    }
-                    // Allocate internal node
-                    if let Some(offset) = free_list.pop() {
-                        trace!("[ALLOC] Reusing freed node for internal at offset={}", offset);
-                        let node_ptr =
-                            unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
-                        let gen =
-                            unsafe { (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1 };
-                        unsafe {
-                            core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
-                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
-                            (*node_ptr).left.store(0, Ordering::Relaxed);
-                            (*node_ptr).right.store(0, Ordering::Relaxed);
-                            (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
-                        }
-                        internal_offset = offset;
-                        internal_gen = gen;
-                    } else {
-                        let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
-                        if (index as usize) >= hdr.capacity {
-                            hdr.next_index.fetch_sub(1, Ordering::Relaxed);
-                            return Err(Error::CapacityExceeded);
-                        }
-                        internal_offset = HEADER_PADDED as Offset
-                            + (index as Offset) * size_of::<Node>() as Offset;
-                        let node_ptr = unsafe {
-                            self.base.as_ptr().add(internal_offset as usize) as *mut Node
-                        };
-                        unsafe {
-                            core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
-                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
-                            (*node_ptr).generation.store(1, Ordering::Relaxed);
-                            (*node_ptr).left.store(0, Ordering::Relaxed);
-                            (*node_ptr).right.store(0, Ordering::Relaxed);
-                            (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
-                        }
-                        internal_gen = 1;
-                    }
-                    // Allocate leaf node
-                    if let Some(offset) = free_list.pop() {
-                        trace!("[ALLOC] Reusing freed node for leaf at offset={}", offset);
-                        let node_ptr =
-                            unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
-                        let gen =
-                            unsafe { (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1 };
-                        unsafe {
-                            core::ptr::write_volatile(&mut (*node_ptr).key, key);
-                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-                            (*node_ptr).left.store(0, Ordering::Relaxed);
-                            (*node_ptr).right.store(0, Ordering::Relaxed);
-                            (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                        }
-                        leaf_offset = offset;
-                        leaf_gen = gen;
-                    } else {
-                        let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
-                        if (index as usize) >= hdr.capacity {
-                            hdr.next_index.fetch_sub(1, Ordering::Relaxed);
-                            let internal_index = ((internal_offset as usize) - size_of::<Header>())
-                                / size_of::<Node>();
-                            if internal_index == (index as usize) - 1 {
-                                free_list.push(internal_offset);
-                            }
-                            return Err(Error::CapacityExceeded);
-                        }
-                        leaf_offset = HEADER_PADDED as Offset
-                            + (index as Offset) * size_of::<Node>() as Offset;
-                        let node_ptr =
-                            unsafe { self.base.as_ptr().add(leaf_offset as usize) as *mut Node };
-                        unsafe {
-                            core::ptr::write_volatile(&mut (*node_ptr).key, key);
-                            core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-                            (*node_ptr).generation.store(1, Ordering::Relaxed);
-                            (*node_ptr).left.store(0, Ordering::Relaxed);
-                            (*node_ptr).right.store(0, Ordering::Relaxed);
-                            (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                        }
-                        leaf_gen = 1;
-                    }
-                }
-                // This whole block needs to be atomic with respect to the parent link update
-                unsafe {
-                    let internal_node =
-                        &mut *(self.base.as_ptr().add(internal_offset as usize) as *mut Node);
-                    let new_bit = get_bit(key, split_bit);
-                    trace!("[INSERT] Split branching: new_key_bit={}", new_bit);
-                    if new_bit == 0 {
-                        internal_node
-                            .left
-                            .store(pack(leaf_offset, leaf_gen), Ordering::Release);
-                        internal_node
-                            .right
-                            .store(pack(current_offset, current_gen), Ordering::Release);
-                    } else {
-                        internal_node
-                            .right
-                            .store(pack(leaf_offset, leaf_gen), Ordering::Release);
-                        internal_node
-                            .left
-                            .store(pack(current_offset, current_gen), Ordering::Release);
-                    }
-                    trace!("[INSERT] Linking new internal node at offset={}.", internal_offset);
-
-                    // Atomically update the parent link to point to the new internal node
-                    let link_atomic = &*(current_link_ptr as *const AtomicU64);
-                    // Use compare_exchange to handle potential concurrent modifications
-                    if link_atomic.compare_exchange(
-                        current_ptr, // Expected current value (offset, gen of node being split)
-                        pack(internal_offset, internal_gen), // New value (offset, gen of new internal node)
-                        Ordering::AcqRel, // Success ordering
-                        Ordering::Acquire  // Failure ordering
-                    ).is_err() {
-                        // CAS failed - another thread likely modified the link.
-                        // Recycle the allocated nodes and restart the insert operation.
-                        trace!("[INSERT] Split CAS failed. Recycling nodes and restarting.");
-                        let mut free_list = self.free_list.lock();
-                        free_list.push(internal_offset);
-                        free_list.push(leaf_offset);
-                        drop(free_list); // Release lock before continuing
-                        continue; // Restart the outer loop to retry the insertion
-                    }
-                    // CAS Succeeded
-                }
-                trace!("[INSERT] Finished Subcase 2b.");
-                // No need for explicit unlock, guard handles it
-                return Ok(());
-            }
-
-            // --- Subcase 2c: Insert Above ---
-            // This case happens when the new key is a prefix of the current node's key,
-            // requiring the new node to be inserted *above* the current node.
-            // Condition: cpl == prefix_len < current_node.prefix_len
-            // --- Subcase 2c: Descend ---
-            // This case happens when the new key is a prefix of the current node.
-            // cpl == current_node.prefix_len must hold (otherwise split would happen).
-            // So the condition simplifies to cpl < prefix_len.
-            if cpl < prefix_len { // Adjusted condition based on logic flow
-                // Implies cpl == current_node.prefix_len
-                trace!("[INSERT] Subcase 2c: Descend required at cpl={}.", cpl);
+            // --- Subcase 2b: Insert Above (Shorter Prefix) ---
+            // This case happens when the new key is a *shorter* prefix of the current node's key.
+            // Condition: cpl == prefix_len && prefix_len < current_node.prefix_len
+            if cpl == prefix_len && prefix_len < current_node.prefix_len {
+                trace!("[INSERT] Subcase 2b: Insert-above (shorter prefix) required at cpl={}.", cpl);
                 let current_node_count = hdr.next_index.load(Ordering::Relaxed);
                 trace!("[INSERT] Checking capacity for insert above: count={}, capacity={}", current_node_count, hdr.capacity);
                 if (current_node_count as usize) >= hdr.capacity {
@@ -595,10 +436,189 @@ impl PatriciaTree {
                         Ordering::Release,
                     );
                 }
-                trace!("[INSERT] Finished Subcase 2c.");
-                // Remove explicit unlock, guard will handle it
-                // hdr.lock.write_unlock();
+                trace!("[INSERT] Finished Subcase 2b (insert-above).");
                 return Ok(());
+            }
+
+            // --- Subcase 2c: Split Required ---
+            // Only split if keys truly differ
+            // Split also when prefix lengths match exactly but keys differ
+            if (cpl < current_node.prefix_len && key != current_node.key)
+                || (cpl == prefix_len && cpl == current_node.prefix_len && key != current_node.key)
+            {
+                // Find the first differing bit after the common prefix
+                // split at the *actual* first differing bit, not capped by current prefixes
+                // In a Patricia trie the split point *is* the common-prefix length
+                let xor = key ^ current_node.key;
+                // Only compute split_bit if xor != 0
+                if xor != 0 {
+                    let split_bit = xor.leading_zeros() as u8;
+                    debug_assert!(split_bit >= cpl && split_bit < 128, "split_invariants");
+                    trace!("[INSERT] Subcase 2c: Split required at split_bit={}.", split_bit);
+                    // ATOMIC: Hold free_list lock for both check and allocation
+                    let internal_offset: Offset;
+                    let internal_gen: u32;
+                    let leaf_offset: Offset;
+                    let leaf_gen: u32;
+                    {
+                        let mut free_list = self.free_list.lock();
+                        let available = self.available_capacity();
+                        if available < 2 {
+                            trace!("[INSERT] PANIC: Not enough capacity for split (need 2 slots, have={}).", available);
+                            return Err(Error::CapacityExceeded);
+                        }
+                        // Allocate internal node
+                        if let Some(offset) = free_list.pop() {
+                            trace!("[ALLOC] Reusing freed node for internal at offset={}", offset);
+                            let node_ptr =
+                                unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
+                            let gen =
+                                unsafe { (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1 };
+                            unsafe {
+                                core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
+                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
+                                (*node_ptr).left.store(0, Ordering::Relaxed);
+                                (*node_ptr).right.store(0, Ordering::Relaxed);
+                                (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
+                            }
+                            internal_offset = offset;
+                            internal_gen = gen;
+                        } else {
+                            let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
+                            if (index as usize) >= hdr.capacity {
+                                hdr.next_index.fetch_sub(1, Ordering::Relaxed);
+                                return Err(Error::CapacityExceeded);
+                            }
+                            internal_offset = HEADER_PADDED as Offset
+                                + (index as Offset) * size_of::<Node>() as Offset;
+                            let node_ptr = unsafe {
+                                self.base.as_ptr().add(internal_offset as usize) as *mut Node
+                            };
+                            unsafe {
+                                core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
+                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
+                                (*node_ptr).generation.store(1, Ordering::Relaxed);
+                                (*node_ptr).left.store(0, Ordering::Relaxed);
+                                (*node_ptr).right.store(0, Ordering::Relaxed);
+                                (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
+                            }
+                            internal_gen = 1;
+                        }
+                        // Allocate leaf node
+                        if let Some(offset) = free_list.pop() {
+                            trace!("[ALLOC] Reusing freed node for leaf at offset={}", offset);
+                            let node_ptr =
+                                unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
+                            let gen =
+                                unsafe { (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1 };
+                            unsafe {
+                                core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                                (*node_ptr).left.store(0, Ordering::Relaxed);
+                                (*node_ptr).right.store(0, Ordering::Relaxed);
+                                (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                            }
+                            leaf_offset = offset;
+                            leaf_gen = gen;
+                        } else {
+                            let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
+                            if (index as usize) >= hdr.capacity {
+                                hdr.next_index.fetch_sub(1, Ordering::Relaxed);
+                                let internal_index = ((internal_offset as usize) - size_of::<Header>())
+                                    / size_of::<Node>();
+                                if internal_index == (index as usize) - 1 {
+                                    free_list.push(internal_offset);
+                                }
+                                return Err(Error::CapacityExceeded);
+                            }
+                            leaf_offset = HEADER_PADDED as Offset
+                                + (index as Offset) * size_of::<Node>() as Offset;
+                            let node_ptr =
+                                unsafe { self.base.as_ptr().add(leaf_offset as usize) as *mut Node };
+                            unsafe {
+                                core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                                (*node_ptr).generation.store(1, Ordering::Relaxed);
+                                (*node_ptr).left.store(0, Ordering::Relaxed);
+                                (*node_ptr).right.store(0, Ordering::Relaxed);
+                                (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                            }
+                            leaf_gen = 1;
+                        }
+                    }
+                    // This whole block needs to be atomic with respect to the parent link update
+                    unsafe {
+                        let internal_node =
+                            &mut *(self.base.as_ptr().add(internal_offset as usize) as *mut Node);
+                        let new_bit = get_bit(key, split_bit);
+                        trace!("[INSERT] Split branching: new_key_bit={}", new_bit);
+                        if new_bit == 0 {
+                            internal_node
+                                .left
+                                .store(pack(leaf_offset, leaf_gen), Ordering::Release);
+                            internal_node
+                                .right
+                                .store(pack(current_offset, current_gen), Ordering::Release);
+                        } else {
+                            internal_node
+                                .right
+                                .store(pack(leaf_offset, leaf_gen), Ordering::Release);
+                            internal_node
+                                .left
+                                .store(pack(current_offset, current_gen), Ordering::Release);
+                        }
+                        trace!("[INSERT] Linking new internal node at offset={}.", internal_offset);
+
+                        // Atomically update the parent link to point to the new internal node
+                        let link_atomic = &*(current_link_ptr as *const AtomicU64);
+                        if link_atomic.compare_exchange(
+                            current_ptr,
+                            pack(internal_offset, internal_gen),
+                            Ordering::AcqRel,
+                            Ordering::Acquire
+                        ).is_err() {
+                            trace!("[INSERT] Split CAS failed. Recycling nodes and restarting.");
+                            let mut free_list = self.free_list.lock();
+                            free_list.push(internal_offset);
+                            free_list.push(leaf_offset);
+                            drop(free_list);
+                            continue;
+                        }
+                    }
+                    trace!("[INSERT] Finished Subcase 2c (split).");
+                    return Ok(());
+                } else {
+                    // xor == 0, keys are identical up to compared length, do not split
+                    // This should not happen due to earlier checks, but is a safe guard
+                }
+            }
+
+            // --- Subcase 2d: Descend (Proper Prefix) ---
+            // This case happens when the current node's prefix is a proper prefix of the key being inserted.
+            // Correct logic: only allocate a new node if the child pointer is null, otherwise descend.
+            if cpl == current_node.prefix_len && cpl < prefix_len {
+                let next_bit = get_bit(key, current_node.prefix_len);
+                let child_atomic = if next_bit == 0 {
+                    &current_node.left
+                } else {
+                    &current_node.right
+                };
+
+                let child_ptr = child_atomic.load(Ordering::Acquire);
+
+                if child_ptr == 0 {
+                    // Child missing → insert leaf *here*
+                    let (leaf_off, leaf_gen) =
+                        self.allocate_node_with_gen(key, prefix_len, expires)?;
+                    child_atomic.store(pack(leaf_off, leaf_gen), Ordering::Release);
+                    trace!("[INSERT] Inserted new leaf at offset={}, gen={}", leaf_off, leaf_gen);
+                    return Ok(());
+                } else {
+                    // Child exists → descend
+                    current_link_ptr = child_atomic as *const AtomicU64 as *mut AtomicU64;
+                    trace!("[INSERT] Descending to child at ptr={:x}", child_ptr);
+                    continue;
+                }
             }
 
             // --- Subcase 2d: Traverse Down ---
