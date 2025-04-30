@@ -1,4 +1,4 @@
-use cidrscan::PatriciaTree;
+use cidrscan::{PatriciaTree, v4_key, v4_plen};
 use rand;
 
 #[test]
@@ -6,10 +6,12 @@ fn basic_ops() {
     let name = format!("test_shm_{}", std::process::id());
     let tree = PatriciaTree::open(&name, 1024).unwrap();
     let ip = 0xC0A80001; // 192.168.0.1
-    let _ = tree.insert(ip, 32, 60);
-    assert!(tree.lookup(ip));
-    _ = tree.delete(ip);
-    assert!(!tree.lookup(ip));
+    let key = v4_key(ip);
+    let plen = v4_plen(32);
+    let _ = tree.insert(key, plen, 60);
+    assert!(tree.lookup(key));
+    _ = tree.delete(key);
+    assert!(!tree.lookup(key));
 }
 
 #[test]
@@ -17,20 +19,23 @@ fn ttl_expiry() {
     let name = format!("test_shm_ttl_{}", std::process::id());
     let tree = PatriciaTree::open(&name, 1024).unwrap();
     let ip = 0x01020304;
-    tree.insert(ip, 32, 1);
+    let key = v4_key(ip);
+    let plen = v4_plen(32);
+    tree.insert(key, plen, 1);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    assert!(!tree.lookup(ip));
+    assert!(!tree.lookup(key));
 }
 #[test]
 fn split_creates_balanced_branches() {
     // Two keys with a 31-bit common prefix, differing at bit 31 (MSB is bit 0)
-    let key1 = 0b10000000_00000000_00000000_00000000u32 as u128; // 128.0.0.0
-    let key2 = 0b00000000_00000000_00000000_00000000u32 as u128; // 0.0.0.0
+    let key1 = v4_key(0b10000000_00000000_00000000_00000000u32); // 128.0.0.0
+    let key2 = v4_key(0b00000000_00000000_00000000_00000000u32); // 0.0.0.0
+    let plen = v4_plen(32);
 
     let name = format!("test_shm_split_{}", std::process::id());
     let tree = PatriciaTree::open(&name, 1024).unwrap();
-    let _ = tree.insert(key1, 32, 60);
-    _ = tree.insert(key2, 32, 60);
+    let _ = tree.insert(key1, plen, 60);
+    _ = tree.insert(key2, plen, 60);
 
     // Both keys should be found
     assert!(tree.lookup(key1));

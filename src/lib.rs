@@ -13,6 +13,20 @@ use std::{
 };
 
 pub mod shmem_rwlock;
+
+/// Helper to encode an IPv4 address as a 128-bit key for IPv6-compatible Patricia tries.
+/// The IPv4 address is placed in the lowest 32 bits (as per IPv4-mapped IPv6 addresses).
+#[inline]
+pub fn v4_key(addr: u32) -> u128 {
+    (addr as u128) << 96
+}
+
+/// Helper to encode an IPv4 prefix length as a 128-bit prefix length for IPv6-compatible Patricia tries.
+/// Adds 96 to the IPv4 prefix length to account for the leading zeros in the 128-bit space.
+#[inline]
+pub fn v4_plen(plen: u8) -> u8 {
+    96 + plen
+}
 /// On Windows, enables SeCreateGlobalPrivilege for the current process if possible.
 /// Call once early in main() if you want to allow cross-session shared memory creation.
 /// No-op if privilege is already enabled or cannot be granted.
@@ -394,8 +408,10 @@ impl PatriciaTree {
             {
                 // Find the first differing bit after the common prefix
                 // split at the *actual* first differing bit, not capped by current prefixes
-                let split_bit = (key ^ current_node.key).leading_zeros() as u8;
-                debug_assert!(split_bit > cpl, "split_bit must exceed common prefix");
+                // In a Patricia trie the split point *is* the common-prefix length
+                let xor = key ^ current_node.key;
+                let split_bit = xor.leading_zeros() as u8;
+                debug_assert!(split_bit >= cpl && split_bit < 128, "split_invariants");
                 trace!("[INSERT] Subcase 2b: Split required at split_bit={}.", split_bit);
                 // ATOMIC: Hold free_list lock for both check and allocation
                 let internal_offset: Offset;
