@@ -3,7 +3,8 @@ use rand;
 
 #[test]
 fn basic_ops() {
-    let tree = PatriciaTree::open("test_shm", 1024).unwrap();
+    let name = format!("test_shm_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 1024).unwrap();
     let ip = 0xC0A80001; // 192.168.0.1
     let _ = tree.insert(ip, 32, 60);
     assert!(tree.lookup(ip));
@@ -13,7 +14,8 @@ fn basic_ops() {
 
 #[test]
 fn ttl_expiry() {
-    let tree = PatriciaTree::open("test_shm_ttl", 1024).unwrap();
+    let name = format!("test_shm_ttl_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 1024).unwrap();
     let ip = 0x01020304;
     tree.insert(ip, 32, 1);
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -25,7 +27,8 @@ fn split_creates_balanced_branches() {
     let key1 = 0b10000000_00000000_00000000_00000000u32 as u128; // 128.0.0.0
     let key2 = 0b00000000_00000000_00000000_00000000u32 as u128; // 0.0.0.0
 
-    let tree = PatriciaTree::open("test_shm_split", 1024).unwrap();
+    let name = format!("test_shm_split_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 1024).unwrap();
     let _ = tree.insert(key1, 32, 60);
     _ = tree.insert(key2, 32, 60);
 

@@ -52,6 +52,14 @@ fn main() {
     // Tree is automatically closed and unmapped when dropped
 }
 ```
+---
+
+## Windows: Cross-Session Sharing & Privileges
+
+> **Windows** – If you run multiple sessions (Remote Desktop / services) and need cross-session sharing, the service that *creates* the tree must hold the **SeCreateGlobalPrivilege** privilege. Grant it in *Local Security Policy → User Rights Assignment* or run under `LocalSystem`. Otherwise the library automatically falls back to a session-local mapping.
+
+- The mapping name is always neutral (e.g., `cidrscan_<hash>`), so the same code path works for all environments.
+- Privileged services gain cross-session visibility by default; non-privileged contexts degrade gracefully with no code changes.
 
 ### Calling from Other Languages
 

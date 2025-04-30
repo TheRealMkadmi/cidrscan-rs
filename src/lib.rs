@@ -13,11 +13,37 @@ use std::{
 };
 
 pub mod shmem_rwlock;
+/// On Windows, enables SeCreateGlobalPrivilege for the current process if possible.
+/// Call once early in main() if you want to allow cross-session shared memory creation.
+/// No-op if privilege is already enabled or cannot be granted.
+/// Only available if the "enable_global_priv" feature is enabled.
+#[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
+pub fn enable_se_create_global_privilege() {
+    use windows_sys::Win32::Security::*;
+    use windows_sys::Win32::System::Threading::*;
+
+    unsafe {
+        let mut token = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) != 0 {
+            let luid = {
+                let mut l = LUID { LowPart: 0, HighPart: 0 };
+                LookupPrivilegeValueA(std::ptr::null(), "SeCreateGlobalPrivilege\0".as_ptr() as _, &mut l);
+                l
+            };
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            AdjustTokenPrivileges(token, 0, &tp as *const _ as _, 0, std::ptr::null_mut(), std::ptr::null_mut());
+            CloseHandle(token);
+        }
+    }
+}
 
 // ===== Alignment helpers and constants =====
 
 #[cfg(target_os = "windows")]
-const PREFIX: &str = "Global\\cidrscan_";
+const PREFIX: &str = "cidrscan_"; // No Global\ here
 #[cfg(not(target_os = "windows"))]
 const PREFIX: &str = "cidrscan_";
 
@@ -205,13 +231,14 @@ impl PatriciaTree {
         let hash = fnv1a_64(name);
         let os_name = format!("{PREFIX}{:016x}", hash);
         let region_size = HEADER_PADDED + capacity * size_of::<Node>();
-        // try-create, else open-existing
+
         let conf = || ShmemConf::new().os_id(&os_name).size(region_size);
         let (shmem, is_creator) = match conf().create() {
             Ok(m) => (m, true),
             Err(ShmemError::MappingIdExists) => (conf().open()?, false),
             Err(e) => return Err(e),
         };
+
         let base_ptr = shmem.as_ptr() as *mut u8;
         let base = NonNull::new(base_ptr).unwrap();
         let hdr_ptr = base_ptr as *mut Header;
