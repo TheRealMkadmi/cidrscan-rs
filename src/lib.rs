@@ -536,6 +536,7 @@ impl PatriciaTree {
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
                                 (*node_ptr).right.store(0, Ordering::Relaxed);
                                 (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                                (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // ← NEW: mark leaf as terminal
                             }
                             leaf_offset = offset;
                             leaf_gen = gen;
@@ -566,6 +567,7 @@ impl PatriciaTree {
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
                                 (*node_ptr).right.store(0, Ordering::Relaxed);
                                 (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                                (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // ← NEW: mark leaf as terminal
                             }
                             leaf_gen = 1;
                         }
