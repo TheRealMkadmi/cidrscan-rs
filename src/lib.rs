@@ -102,9 +102,9 @@ const _: () = assert!(std::mem::align_of::<Node>()   == CACHE_LINE);
 #[macro_export]
 macro_rules! trace {
     ($($t:tt)*) => {
-        // if cfg!(feature = "trace") {
+        if cfg!(feature = "trace") {
             println!($($t)*);
-        // }
+        }
     }
 }
 
@@ -765,20 +765,34 @@ impl PatriciaTree {
 
     /// If `parent_link` now points to a node with exactly one live child,
     /// graft that child into the parent, recycle the old node.
-    fn try_prune(&self, parent_link: &AtomicU64) {
+    fn try_prune(&self, parent_link: &AtomicU64, parent_plen: u8) {
         let packed = parent_link.load(Ordering::Acquire);
         let (off, _) = unpack(packed);
         if off == 0 { return; }
         // SAFETY: off points at a valid Node
         let node = unsafe { &*(self.base.as_ptr().add(off as usize) as *const Node) };
+        // If this node still represents a stored prefix, it must stay,
+        // even if it has only one live child.
+        if node.is_terminal.load(Ordering::Acquire) == 1 &&
+           node.refcnt.load(Ordering::Acquire)      > 0 {
+            return;     // keep: cannot prune a terminal node
+        }
         let left  = node.left.load(Ordering::Acquire);
         let right = node.right.load(Ordering::Acquire);
         // only prune unary nodes (one child zero, one nonzero)
-        let child = match (left, right) {
-            (0, r) if r != 0 => r,
-            (l, 0) if l != 0 => l,
+        let (child, which_side) = match (left, right) {
+            (0, r) if r != 0 => (r, 1),
+            (l, 0) if l != 0 => (l, 0),
             _                => return,
         };
+
+        // keep the tree sound: the child must *really* live on that side
+        let (coff, _) = unpack(child);
+        let cnode     = unsafe { &*(self.base.as_ptr().add(coff as usize) as *const Node) };
+        if get_bit(cnode.key, parent_plen) != which_side {
+            return; // side mismatch – don’t prune
+        }
+
         // swap in the single child
         parent_link.store(child, Ordering::Release);
         // retire the old node offset
@@ -842,8 +856,8 @@ impl PatriciaTree {
         let stored_key = key;
 
         // Track parent links for pruning
-        let mut links: Vec<&AtomicU64> = Vec::with_capacity(128);
-        links.push(&hdr.root_offset);
+        let mut links: Vec<(&AtomicU64, u8)> = Vec::with_capacity(128);
+        links.push((&hdr.root_offset, 0)); // root has fictitious plen 0
         let mut current_ptr = hdr.root_offset.load(Ordering::Relaxed);
         let mut current_offset;
         let mut current_gen;
@@ -858,7 +872,7 @@ impl PatriciaTree {
             if node_gen != current_gen {
                 // ABA detected, restart from root
                 links.clear();
-                links.push(&hdr.root_offset);
+                links.push((&(*hdr).root_offset, 0));
                 current_ptr = hdr.root_offset.load(Ordering::Relaxed);
                 (current_offset, current_gen) = unpack(current_ptr);
                 continue;
@@ -879,8 +893,8 @@ impl PatriciaTree {
                 if node.refcnt.fetch_sub(1, Ordering::AcqRel) == 1 {
                     // last copy removed → unset flag and possibly prune
                     node.is_terminal.store(0, Ordering::Release);
-                    for parent in links.iter().rev() {
-                        self.try_prune(parent);
+                    for &(link, plen) in links.iter().rev() {
+                        self.try_prune(link, plen);
                     }
                     trace!("[DELETE] Unmarked terminal flag and pruned if needed.");
                     return Ok(());
@@ -907,7 +921,7 @@ impl PatriciaTree {
                 &node.right
             };
             current_ptr = child_atomic.load(Ordering::Relaxed);
-            links.push(child_atomic);
+            links.push((child_atomic, node.prefix_len));
             (current_offset, current_gen) = unpack(current_ptr);
         }
         trace!("[DELETE] Reached end of branch (offset 0). Key not found.");
