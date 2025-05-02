@@ -216,6 +216,7 @@ struct Node {
     left: AtomicU64,       // packed (offset, generation) to left child
     right: AtomicU64,      // packed (offset, generation) to right child
     expires: AtomicU64,    // Unix epoch seconds: TTL expiration
+    refcnt: AtomicU32,     // ← NEW: how many identical prefixes are stored
 }
 
 pub struct PatriciaTree {
@@ -338,6 +339,9 @@ impl PatriciaTree {
         let _write_guard = hdr.lock.write_lock();
         trace!("[INSERT] Lock acquired. Current next_index={}", hdr.next_index.load(Ordering::Relaxed));
 
+        // Store the full key – do *not* canonicalise
+        let stored_key = key;
+
         let expires = if ttl_secs == 0 {
             0
         } else {
@@ -367,7 +371,7 @@ impl PatriciaTree {
                     trace!("[INSERT] PANIC: Capacity exceeded before allocation.");
                     return Err(Error::CapacityExceeded);
                 }
-                let (leaf_offset, leaf_gen) = self.allocate_node_with_gen(key, prefix_len, expires)?;
+                let (leaf_offset, leaf_gen) = self.allocate_node_with_gen(stored_key, prefix_len, expires)?;
                 trace!("[INSERT] Allocated leaf node at offset={}, gen={}. Storing link.", leaf_offset, leaf_gen);
                 // Atomically set new leaf if still empty
                 let link_atomic = unsafe { &*(current_link_ptr as *const AtomicU64) };
@@ -404,14 +408,17 @@ impl PatriciaTree {
             trace!("[INSERT] Current node: key={:x}, prefix_len={}", current_node.key, current_node.prefix_len);
 
             let max_cmp_len = prefix_len.min(current_node.prefix_len);
-            let cpl = common_prefix_len(key, current_node.key, max_cmp_len);
+            let cpl = common_prefix_len(stored_key, current_node.key, max_cmp_len);
             trace!("[INSERT] max_cmp_len={}, cpl={}", max_cmp_len, cpl);
 
-            // --- Subcase 2a: Exact Match ---
-            if cpl == prefix_len && cpl == current_node.prefix_len && key == current_node.key {
-                trace!("[INSERT] Subcase 2a: Exact match found. Updating TTL.");
+            // --- Subcase 2a: Exact Match (full key) ---
+            if cpl == prefix_len && cpl == current_node.prefix_len
+                && stored_key == current_node.key
+            {
+                trace!("[INSERT] Subcase 2a: Exact match found (full key). Updating TTL.");
                 current_node.expires.store(expires, Ordering::Relaxed);
                 current_node.is_terminal.store(1, Ordering::Release); // mark as stored
+                current_node.refcnt.fetch_add(1, Ordering::AcqRel);   // increment multiplicity
                 trace!("[INSERT] Finished Subcase 2a.");
                 return Ok(());
             }
@@ -428,7 +435,7 @@ impl PatriciaTree {
                     return Err(Error::CapacityExceeded);
                 }
                 let (new_node_offset, new_node_gen) =
-                    self.allocate_node_with_gen(key, prefix_len, expires)?;
+                    self.allocate_node_with_gen(stored_key, prefix_len, expires)?;
                 trace!("[INSERT] Allocated new node for insert above at offset={}, gen={}.", new_node_offset, new_node_gen);
 
                 unsafe {
@@ -461,13 +468,13 @@ impl PatriciaTree {
             // --- Subcase 2c: Split Required ---
             // Only split if keys truly differ
             // Split also when prefix lengths match exactly but keys differ
-            if (cpl < current_node.prefix_len && key != current_node.key)
-                || (cpl == prefix_len && cpl == current_node.prefix_len && key != current_node.key)
+            if (cpl < current_node.prefix_len && stored_key != current_node.key)
+                || (cpl == prefix_len && cpl == current_node.prefix_len && stored_key != current_node.key)
             {
                 // Find the first differing bit after the common prefix
                 // split at the *actual* first differing bit, not capped by current prefixes
                 // In a Patricia trie the split point *is* the common-prefix length
-                let xor = key ^ current_node.key;
+                let xor = stored_key ^ current_node.key;
                 // Only compute split_bit if xor != 0
                 if xor != 0 {
                     let split_bit = xor.leading_zeros() as u8;
@@ -492,7 +499,7 @@ impl PatriciaTree {
                             let gen =
                                 unsafe { (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1 };
                             unsafe {
-                                core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
+                                core::ptr::write_volatile(&mut (*node_ptr).key, stored_key & mask(split_bit));
                                 core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
                                 (*node_ptr).is_terminal.store(0, Ordering::Relaxed); // internal nodes are not terminal
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
@@ -513,7 +520,7 @@ impl PatriciaTree {
                                 self.base.as_ptr().add(internal_offset as usize) as *mut Node
                             };
                             unsafe {
-                                core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
+                                core::ptr::write_volatile(&mut (*node_ptr).key, stored_key & mask(split_bit));
                                 core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
                                 (*node_ptr).generation.store(1, Ordering::Relaxed);
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
@@ -531,12 +538,13 @@ impl PatriciaTree {
                             let gen =
                                 unsafe { (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1 };
                             unsafe {
-                                core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                                core::ptr::write_volatile(&mut (*node_ptr).key, stored_key);
                                 core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
                                 (*node_ptr).right.store(0, Ordering::Relaxed);
                                 (*node_ptr).expires.store(expires, Ordering::Relaxed);
                                 (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // ← NEW: mark leaf as terminal
+                                (*node_ptr).refcnt.store(1, Ordering::Relaxed);      // first occurrence
                             }
                             leaf_offset = offset;
                             leaf_gen = gen;
@@ -561,13 +569,14 @@ impl PatriciaTree {
                             let node_ptr =
                                 unsafe { self.base.as_ptr().add(leaf_offset as usize) as *mut Node };
                             unsafe {
-                                core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                                core::ptr::write_volatile(&mut (*node_ptr).key, stored_key);
                                 core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                                 (*node_ptr).generation.store(1, Ordering::Relaxed);
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
                                 (*node_ptr).right.store(0, Ordering::Relaxed);
                                 (*node_ptr).expires.store(expires, Ordering::Relaxed);
                                 (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // ← NEW: mark leaf as terminal
+                                (*node_ptr).refcnt.store(1, Ordering::Relaxed);      // first occurrence
                             }
                             leaf_gen = 1;
                         }
@@ -632,7 +641,7 @@ impl PatriciaTree {
             // This case happens when the current node's prefix is a proper prefix of the key being inserted.
             // Correct logic: only allocate a new node if the child pointer is null, otherwise descend.
             if cpl == current_node.prefix_len && cpl < prefix_len {
-                let next_bit = get_bit(key, current_node.prefix_len);
+                let next_bit = get_bit(stored_key, current_node.prefix_len);
                 let child_atomic = if next_bit == 0 {
                     &current_node.left
                 } else {
@@ -644,7 +653,7 @@ impl PatriciaTree {
                 if child_ptr == 0 {
                     // Child missing → insert leaf *here*
                     let (leaf_off, leaf_gen) =
-                        self.allocate_node_with_gen(key, prefix_len, expires)?;
+                        self.allocate_node_with_gen(stored_key, prefix_len, expires)?;
                     child_atomic.store(pack(leaf_off, leaf_gen), Ordering::Release);
                     trace!("[INSERT] Inserted new leaf at offset={}, gen={}", leaf_off, leaf_gen);
                     return Ok(());
@@ -692,6 +701,7 @@ impl PatriciaTree {
                     core::ptr::write_volatile(&mut (*node_ptr).key, key);
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                     (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // new leaves are stored prefixes
+                    (*node_ptr).refcnt.store(1, Ordering::Relaxed);      // first occurrence
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
@@ -710,6 +720,7 @@ impl PatriciaTree {
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                     (*node_ptr).generation.store(1, Ordering::Relaxed);
                     (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // new leaves are stored prefixes
+                    (*node_ptr).refcnt.store(1, Ordering::Relaxed);      // first occurrence
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
@@ -733,6 +744,7 @@ impl PatriciaTree {
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                    (*node_ptr).refcnt.store(1, Ordering::Relaxed);      // first occurrence
                     g
                 };
                 return Ok((offset, gen));
@@ -796,7 +808,9 @@ impl PatriciaTree {
             let exp = node.expires.load(Ordering::Acquire);
             if exp != u64::MAX && cpl == node.prefix_len {
                 // Return if this node was explicitly stored (leaf or internal)
-                if node.is_terminal.load(Ordering::Acquire) == 1 {
+                if node.is_terminal.load(Ordering::Acquire) == 1 &&
+                   node.refcnt.load(Ordering::Acquire)      > 0 &&
+                   key == node.key {
                     return exp >= now;
                 }
                 // else: internal node expired, but traversal continues
@@ -824,6 +838,9 @@ impl PatriciaTree {
         let _write_guard = hdr.lock.write_lock();
         trace!("[DELETE] Lock acquired.");
 
+        // Store the full key – do *not* canonicalise
+        let stored_key = key;
+
         // Track parent links for pruning
         let mut links: Vec<&AtomicU64> = Vec::with_capacity(128);
         links.push(&hdr.root_offset);
@@ -848,8 +865,8 @@ impl PatriciaTree {
             }
             trace!("[DELETE] Node: key={:x}, prefix_len={}, gen={}", node.key, node.prefix_len, node_gen);
 
-            // Compare the full key against the node's key up to the node's prefix length.
-            let cpl = common_prefix_len(key, node.key, node.prefix_len);
+            // Compare the canonical key against the node's key up to the node's prefix length.
+            let cpl = common_prefix_len(stored_key, node.key, node.prefix_len);
             trace!("[DELETE] cpl={}", cpl);
 
             if cpl < node.prefix_len {
@@ -857,12 +874,11 @@ impl PatriciaTree {
                 return Ok(()); // Key not found in this subtree
             }
 
-            // Unmark the stored-prefix flag first
-            if cpl == node.prefix_len && node.key == key && node.prefix_len == prefix_len {
-                if node.is_terminal.swap(0, Ordering::AcqRel) == 1 {
-                    // If it *had* been terminal, we succeed immediately:
-                    // 1) no structural detach needed if children remain
-                    // 2) later pruning will remove node if it now has ≤1 child
+            // Unmark the stored-prefix flag first (masked)
+            if cpl == node.prefix_len && node.key == stored_key && node.prefix_len == prefix_len {
+                if node.refcnt.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    // last copy removed → unset flag and possibly prune
+                    node.is_terminal.store(0, Ordering::Release);
                     for parent in links.iter().rev() {
                         self.try_prune(parent);
                     }
@@ -883,7 +899,7 @@ impl PatriciaTree {
                 return Ok(()); // Cannot go deeper
             }
 
-            let next_bit = get_bit(key, node.prefix_len);
+            let next_bit = get_bit(stored_key, node.prefix_len);
             trace!("[DELETE] Traversing based on bit {} = {}", node.prefix_len, next_bit);
             let child_atomic = if next_bit == 0 {
                 &node.left
