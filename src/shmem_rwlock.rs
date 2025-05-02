@@ -7,8 +7,8 @@ use raw_sync::events::{Event as RawEvent, EventImpl, EventInit};
 use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
 // Stable allocation imports for boxed helper
-use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 use core::marker::PhantomData;
+use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 
 const MUTEX_BUF_SIZE: usize = core::mem::size_of::<RawMutex>();
 const EVENT_BUF_SIZE: usize = core::mem::size_of::<RawEvent>();
@@ -26,9 +26,9 @@ pub struct RawRwLock {
     /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
     /// OS mutex handle (lives as long as RawRwLock)
-    mutex_handle: Option<Box<dyn LockImpl + Send + Sync>>,
+    mutex_handle: Option<Box<dyn LockImpl>>,
     /// OS event handle (lives as long as RawRwLock)
-    event_handle: Option<Box<dyn EventImpl + Send + Sync>>,
+    event_handle: Option<Box<dyn EventImpl>>,
     _marker: PhantomData<()>, // no process-local state inside shm
 }
 
@@ -86,14 +86,8 @@ impl RawRwLock {
 
         // Initialize mutex and event handles in their buffers
         let this = &mut *ptr;
-        let mutex = Box::from_raw(
-            Box::into_raw(RawMutex::new(this.mutex_ptr(), ptr::null_mut()).unwrap().0)
-                as *mut (dyn LockImpl + Send + Sync),
-        );
-        let event = Box::from_raw(
-            Box::into_raw(RawEvent::new(this.event_ptr(), true).unwrap().0)
-                as *mut (dyn EventImpl + Send + Sync),
-        );
+        let (mutex, _) = RawMutex::new(this.mutex_ptr(), ptr::null_mut())?;
+        let (event, _) = RawEvent::new(this.event_ptr(), true)?;
         this.mutex_handle = Some(mutex);
         this.event_handle = Some(event);
 
@@ -131,20 +125,10 @@ impl RawRwLock {
 
         // Reopen mutex and event handles in their buffers
         let this = &mut *ptr;
-        let mutex = Box::from_raw(
-            Box::into_raw(
-                RawMutex::from_existing(this.mutex_ptr(), ptr::null_mut())
-                    .map_err(|e| format!("re-open mutex failed: {e}"))?
-                    .0,
-            ) as *mut (dyn LockImpl + Send + Sync),
-        );
-        let event = Box::from_raw(
-            Box::into_raw(
-                RawEvent::from_existing(this.event_ptr())
-                    .map_err(|e| format!("re-open event failed: {e}"))?
-                    .0,
-            ) as *mut (dyn EventImpl + Send + Sync),
-        );
+        let (mutex, _) = RawMutex::from_existing(this.mutex_ptr(), ptr::null_mut())
+            .map_err(|e| format!("re-open mutex failed: {e}"))?;
+        let (event, _) = RawEvent::from_existing(this.event_ptr())
+            .map_err(|e| format!("re-open event failed: {e}"))?;
         this.mutex_handle = Some(mutex);
         this.event_handle = Some(event);
 
@@ -178,7 +162,10 @@ impl<'a> Drop for WriteGuard<'a> {
         // allow readers again (writer flag → 0, counter already 0)
         self.lock.readers.store(0, Ordering::Release);
         // wake up any blocked readers
-        self.lock.event().set(raw_sync::events::EventState::Signaled).unwrap();
+        self.lock
+            .event()
+            .set(raw_sync::events::EventState::Signaled)
+            .unwrap();
         // _guard drop here → OS mutex unlocked by LockGuard drop
         // handle is dropped here, keeping trait object alive for guard's lifetime
     }
@@ -232,7 +219,9 @@ impl RawRwLock {
         let prev = self.readers.fetch_sub(1, Ordering::Release);
         // Only one pattern means “I was the last reader *and* a writer waits”:
         if prev == (WRITER_BIT | 1) {
-            self.event().set(raw_sync::events::EventState::Signaled).unwrap();
+            self.event()
+                .set(raw_sync::events::EventState::Signaled)
+                .unwrap();
         }
     }
 
@@ -266,22 +255,19 @@ impl RawRwLock {
     /// Try to acquire an **exclusive** (write) lock without blocking indefinitely.
     /// Returns Some(WriteGuard) if the lock was acquired, None otherwise.
     pub fn try_write_lock(&self, timeout: Timeout) -> Option<WriteGuard<'_>> {
-        unsafe {
-            let e_handle = RawEvent::from_existing(self.event_ptr()).unwrap().0;
-            let guard = self.mutex().try_lock(timeout).ok()?;
-            // Try to block new readers
-            if self
-                .readers
-                .compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                drop(guard);
-                return None;
-            }
-            Some(WriteGuard {
-                lock: self,
-                _guard: guard,
-            })
+        let guard = self.mutex().try_lock(timeout).ok()?;
+        // Try to block new readers
+        if self
+            .readers
+            .compare_exchange(0, WRITER_BIT, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            drop(guard);
+            return None;
         }
+        Some(WriteGuard {
+            lock: self,
+            _guard: guard,
+        })
     }
 }
