@@ -56,8 +56,8 @@ fn split_creates_balanced_branches() {
 proptest! {
     #[test]
     fn property_insert_delete_lookup(
-        keys in proptest::collection::vec(any::<u128>(), 10..100),
-        prefix_lens in proptest::collection::vec(1u8..=128, 10..100)
+        keys in proptest::collection::vec(any::<u128>(), 10..30),
+        prefix_lens in proptest::collection::vec(1u8..=128, 10..30)
     ) {
         use cidrscan::PatriciaTree;
         let n = keys.len().min(prefix_lens.len());

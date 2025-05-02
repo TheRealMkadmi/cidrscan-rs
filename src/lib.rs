@@ -99,9 +99,9 @@ const _: () = assert!(std::mem::align_of::<Node>()   == CACHE_LINE);
 #[macro_export]
 macro_rules! trace {
     ($($t:tt)*) => {
-        // if cfg!(feature = "trace") {
+        if cfg!(feature = "trace") {
             println!($($t)*);
-        // }
+        }
     }
 }
 
@@ -739,6 +739,31 @@ impl PatriciaTree {
         Some((unsafe { &*ptr }, gen))
     }
 
+    /// If `parent_link` now points to a node with exactly one live child,
+    /// graft that child into the parent, recycle the old node.
+    fn try_prune(&self, parent_link: &AtomicU64) {
+        let packed = parent_link.load(Ordering::Acquire);
+        let (off, _) = unpack(packed);
+        if off == 0 { return; }
+        // SAFETY: off points at a valid Node
+        let node = unsafe { &*(self.base.as_ptr().add(off as usize) as *const Node) };
+        let left  = node.left.load(Ordering::Acquire);
+        let right = node.right.load(Ordering::Acquire);
+        // only prune unary nodes (one child zero, one nonzero)
+        let child = match (left, right) {
+            (0, r) if r != 0 => r,
+            (l, 0) if l != 0 => l,
+            _                => return,
+        };
+        // swap in the single child
+        parent_link.store(child, Ordering::Release);
+        // retire the old node offset
+        let off_u32 = off as Offset;
+        epoch::pin().defer(move || {
+            FREELIST.push(off_u32);
+        });
+    }
+
     /// Lookup a key; true if found and not expired (Revised for Patricia structure)
     pub fn lookup(&self, key: u128) -> bool {
         let hdr  = unsafe { &*self.hdr.as_ptr() };
@@ -787,6 +812,9 @@ impl PatriciaTree {
         let _write_guard = hdr.lock.write_lock();
         trace!("[DELETE] Lock acquired.");
 
+        // Track parent links for pruning
+        let mut links: Vec<&AtomicU64> = Vec::with_capacity(128);
+        links.push(&hdr.root_offset);
         let mut current_ptr = hdr.root_offset.load(Ordering::Relaxed);
         let mut current_offset;
         let mut current_gen;
@@ -800,6 +828,8 @@ impl PatriciaTree {
             let node_gen = node.generation.load(Ordering::Acquire);
             if node_gen != current_gen {
                 // ABA detected, restart from root
+                links.clear();
+                links.push(&hdr.root_offset);
                 current_ptr = hdr.root_offset.load(Ordering::Relaxed);
                 (current_offset, current_gen) = unpack(current_ptr);
                 continue;
@@ -835,6 +865,10 @@ impl PatriciaTree {
                         let free_slots_ptr = (base_addr + free_slots_offset) as *const AtomicU32;
                         unsafe { (*free_slots_ptr).fetch_add(1, Ordering::Release); }
                     });
+                    // After removal, prune up the chain
+                    for parent in links.iter().rev() {
+                        self.try_prune(parent);
+                    }
                     trace!("[DELETE] Finished.");
                     return Ok(());
                 } else {
@@ -853,11 +887,13 @@ impl PatriciaTree {
 
             let next_bit = get_bit(key, node.prefix_len);
             trace!("[DELETE] Traversing based on bit {} = {}", node.prefix_len, next_bit);
-            current_ptr = if next_bit == 0 {
-                node.left.load(Ordering::Relaxed)
+            let child_atomic = if next_bit == 0 {
+                &node.left
             } else {
-                node.right.load(Ordering::Relaxed)
+                &node.right
             };
+            current_ptr = child_atomic.load(Ordering::Relaxed);
+            links.push(child_atomic);
             (current_offset, current_gen) = unpack(current_ptr);
         }
         trace!("[DELETE] Reached end of branch (offset 0). Key not found.");
