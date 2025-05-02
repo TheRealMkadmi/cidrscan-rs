@@ -9,7 +9,7 @@ use crossbeam_queue::SegQueue;
 use std::{
     mem::size_of,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, AtomicU8, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -190,6 +190,7 @@ struct Header {
     magic: u64,             // identifies valid CIDRScan header
     version: u16,           // ABI version
     _reserved: [u8; 6],     // padding to 16 bytes total
+    lock_init: AtomicU8,    // 0 = uninit, 1 = init (atomic process-local lock init flag)
     lock: RawRwLock,        // cross-process RW-lock (defined below)
     next_index: AtomicU32,  // bump allocator index for new allocations
     free_slots: AtomicU32,  // incremented on delete, decremented on alloc from freelist
@@ -275,6 +276,7 @@ impl PatriciaTree {
                         magic:  HEADER_MAGIC,
                         version: HEADER_VERSION,
                         _reserved: [0; 6],
+                        lock_init: AtomicU8::new(0),
                         lock:    core::mem::zeroed(), // to be initialised right after
                         next_index: AtomicU32::new(0),
                         free_slots: AtomicU32::new(0),
@@ -284,24 +286,27 @@ impl PatriciaTree {
                         init_flag: AtomicU32::new(0),
                     },
                 );
-                // -- now bring the lock online --
+            }
+        }
+        let prev = hdr_mut.lock_init.fetch_or(1, Ordering::AcqRel);
+        if prev == 0 {
+            // first opener in this process: initialise the bytes
+            unsafe {
                 RawRwLock::init(
                     &mut (*hdr_ptr).lock as *mut _ as *mut u8,
                     Timeout::Infinite,
                 )
                 .expect("RawRwLock::init failed");
             }
-        }
-        let hdr_ref = unsafe { &*hdr_ptr };
-        // Non-creator (or re-opened) mapping → ensure OS handles exist in this process
-        if !is_creator {
-            // tolerate half-initialised mapping: reopen or init
+        } else {
+            // subsequent opens: attach to existing lock state
             unsafe {
                 RawRwLock::reopen_in_place(&mut (*hdr_mut).lock)
                     .or_else(|_| RawRwLock::new_in_place(&mut (*hdr_mut).lock))
                     .expect("RawRwLock reopen OR init failed");
             }
         }
+        let hdr_ref = unsafe { &*hdr_ptr };
         hdr_ref
             .ref_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
