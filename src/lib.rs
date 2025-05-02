@@ -24,11 +24,14 @@ pub fn v4_key(addr: u32) -> u128 {
     (addr as u128) << 96
 }
 
-/// Helper to encode an IPv4 prefix length as a 128-bit prefix length for IPv6-compatible Patricia tries.
-/// Adds 96 to the IPv4 prefix length to account for the leading zeros in the 128-bit space.
+/**
+ * Helper to encode an IPv4 prefix length as a 128-bit prefix length for IPv6-compatible Patricia tries.
+ * The IPv4 bits occupy the high 32 bits, so the IPv4 prefix length is identical: /24 → 24, /32 → 32, etc.
+ * See RFC 4291 §2.5.5.2.
+ */
 #[inline]
 pub fn v4_plen(plen: u8) -> u8 {
-    96 + plen
+    plen
 }
 /// On Windows, enables SeCreateGlobalPrivilege for the current process if possible.
 /// Call once early in main() if you want to allow cross-session shared memory creation.
@@ -99,9 +102,9 @@ const _: () = assert!(std::mem::align_of::<Node>()   == CACHE_LINE);
 #[macro_export]
 macro_rules! trace {
     ($($t:tt)*) => {
-        if cfg!(feature = "trace") {
+        // if cfg!(feature = "trace") {
             println!($($t)*);
-        }
+        // }
     }
 }
 
@@ -208,6 +211,7 @@ struct Node {
     _pad: [u8; 3],         // padding to align next atomics (adjusted for AtomicU32)
     /// ABA generation counter to prevent reuse hazards (see moodycamel.com/blog/2014/solving-the-aba-problem-for-lock-free-free-lists)
     generation: AtomicU32, // ABA generation counter
+    is_terminal: AtomicU8, // 0 = not stored; 1 = stored
     _pad2: [u8; 4],        // padding to align next atomics
     left: AtomicU64,       // packed (offset, generation) to left child
     right: AtomicU64,      // packed (offset, generation) to right child
@@ -407,6 +411,7 @@ impl PatriciaTree {
             if cpl == prefix_len && cpl == current_node.prefix_len && key == current_node.key {
                 trace!("[INSERT] Subcase 2a: Exact match found. Updating TTL.");
                 current_node.expires.store(expires, Ordering::Relaxed);
+                current_node.is_terminal.store(1, Ordering::Release); // mark as stored
                 trace!("[INSERT] Finished Subcase 2a.");
                 return Ok(());
             }
@@ -443,6 +448,7 @@ impl PatriciaTree {
                             .store(pack(current_offset as u32, current_gen), Ordering::Release);
                     }
                     trace!("[INSERT] Linking new node at offset={}.", new_node_offset);
+                    new_node.is_terminal.store(1, Ordering::Release); // Mark insert-above node as terminal
                     (*current_link_ptr).store(
                         pack(new_node_offset as u32, new_node_gen),
                         Ordering::Release,
@@ -488,6 +494,7 @@ impl PatriciaTree {
                             unsafe {
                                 core::ptr::write_volatile(&mut (*node_ptr).key, key & mask(split_bit));
                                 core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
+                                (*node_ptr).is_terminal.store(0, Ordering::Relaxed); // internal nodes are not terminal
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
                                 (*node_ptr).right.store(0, Ordering::Relaxed);
                                 (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
@@ -512,6 +519,7 @@ impl PatriciaTree {
                                 (*node_ptr).left.store(0, Ordering::Relaxed);
                                 (*node_ptr).right.store(0, Ordering::Relaxed);
                                 (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
+                                (*node_ptr).is_terminal.store(0, Ordering::Relaxed); // internal nodes are not terminal
                             }
                             internal_gen = 1;
                         }
@@ -681,6 +689,7 @@ impl PatriciaTree {
                     let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
                     core::ptr::write_volatile(&mut (*node_ptr).key, key);
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                    (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // new leaves are stored prefixes
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
@@ -698,6 +707,7 @@ impl PatriciaTree {
                     core::ptr::write_volatile(&mut (*node_ptr).key, key);
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                     (*node_ptr).generation.store(1, Ordering::Relaxed);
+                    (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // new leaves are stored prefixes
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
@@ -783,8 +793,8 @@ impl PatriciaTree {
 
             let exp = node.expires.load(Ordering::Acquire);
             if exp != u64::MAX && cpl == node.prefix_len {
-                // Only return if this is a leaf node; otherwise, keep traversing
-                if node.left.load(Ordering::Acquire) == 0 && node.right.load(Ordering::Acquire) == 0 {
+                // Return if this node was explicitly stored (leaf or internal)
+                if node.is_terminal.load(Ordering::Acquire) == 1 {
                     return exp >= now;
                 }
                 // else: internal node expired, but traversal continues
@@ -845,41 +855,21 @@ impl PatriciaTree {
                 return Ok(()); // Key not found in this subtree
             }
 
-            // Only expire if this is an exact (key, prefix_len) match and a leaf node
+            // Unmark the stored-prefix flag first
             if cpl == node.prefix_len && node.key == key && node.prefix_len == prefix_len {
-                let is_leaf = node.left.load(Ordering::Acquire) == 0 && node.right.load(Ordering::Acquire) == 0;
-                if is_leaf {
-                    trace!("[DELETE] Found exact key+prefix match and is leaf. Removing node at offset={}.", current_offset);
-
-                    // 1. Detach from parent before recycling to avoid a dangling link
-                    if let Some(parent_link) = links.last() {
-                        parent_link.store(0, Ordering::Release);
-                    }
-
-                    // Retire the offset using epoch-based reclamation
-                    let off = current_offset;
-                    // Workaround: store offset of free_slots field from base pointer, reconstruct in closure
-                    let base_addr = self.hdr.as_ptr() as usize;
-                    let free_slots_offset = unsafe {
-                        (&(*self.hdr.as_ptr()).free_slots as *const AtomicU32 as usize) - base_addr
-                    };
-                    epoch::pin().defer(move || {
-                        FREELIST.push(off);
-                        // counter and queue stay consistent
-                        let free_slots_ptr = (base_addr + free_slots_offset) as *const AtomicU32;
-                        unsafe { (*free_slots_ptr).fetch_add(1, Ordering::Release); }
-                    });
-
-                    // 2. Attempt to prune unary ancestors now that the link is gone
+                if node.is_terminal.swap(0, Ordering::AcqRel) == 1 {
+                    // If it *had* been terminal, we succeed immediately:
+                    // 1) no structural detach needed if children remain
+                    // 2) later pruning will remove node if it now has ≤1 child
                     for parent in links.iter().rev() {
                         self.try_prune(parent);
                     }
-
-                    trace!("[DELETE] Finished.");
+                    trace!("[DELETE] Unmarked terminal flag and pruned if needed.");
                     return Ok(());
                 } else {
-                    trace!("[DELETE] Attempted to delete internal node with children. Returning BranchHasChildren.");
-                    return Err(Error::BranchHasChildren);
+                    // Already un-marked: idempotent no-op
+                    trace!("[DELETE] Node was already not terminal. No-op.");
+                    return Ok(());
                 }
             }
             // If keys don't match exactly, or the prefix length does not match, continue searching deeper.

@@ -131,3 +131,24 @@ fn stress_concurrent_inserts_and_lookups() {
         h.join().expect("thread failed");
     }
 }
+
+// Test: Internal node terminal flag and deletion
+#[test]
+fn test_internal_node_terminal_flag_and_delete() {
+    let tree = PatriciaTree::open("test_internal_node", 16).unwrap();
+
+    // Insert /32 and /24, so /24 is an internal node after /32
+    tree.insert(v4_key(0x01020304), v4_plen(32), 60).unwrap(); // exact /32 → 128 bits
+    tree.insert(v4_key(0x01020300), v4_plen(24), 60).unwrap(); // prefix /24
+
+    // Both should be found
+    assert!(tree.lookup(v4_key(0x01020304)));
+    assert!(tree.lookup(v4_key(0x01020300)));
+
+    // Delete /24 (internal node)
+    tree.delete(v4_key(0x01020300), v4_plen(24)).unwrap();
+
+    // /24 should be gone, /32 should remain
+    assert!(!tree.lookup(v4_key(0x01020300)));
+    assert!(tree.lookup(v4_key(0x01020304)));
+}
