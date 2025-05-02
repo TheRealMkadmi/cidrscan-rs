@@ -1,5 +1,9 @@
 use cidrscan::{PatriciaTree, v4_key, v4_plen};
 use rand;
+use proptest::prelude::*;
+use num_cpus;
+use std::sync::Arc;
+use std::thread;
 
 #[test]
 fn basic_ops() {
@@ -10,7 +14,7 @@ fn basic_ops() {
     let plen = v4_plen(32);
     let _ = tree.insert(key, plen, 60);
     assert!(tree.lookup(key));
-    _ = tree.delete(key);
+    _ = tree.delete(key, plen);
     assert!(!tree.lookup(key));
 }
 
@@ -42,11 +46,11 @@ fn split_creates_balanced_branches() {
     assert!(tree.lookup(key2));
 
     // Deleting one should not affect the other
-    _ = tree.delete(key1);
+    _ = tree.delete(key1, plen);
     assert!(!tree.lookup(key1));
     assert!(tree.lookup(key2));
 
-    _ = tree.delete(key2);
+    _ = tree.delete(key2, plen);
     assert!(!tree.lookup(key2));
 }
 proptest! {
@@ -60,7 +64,7 @@ proptest! {
         let shm_name = format!("test_shm_prop_{}", rand::random::<u64>());
         let tree = PatriciaTree::open(&shm_name, n * 2).unwrap();
 
-        let mut pairs: Vec<(u128, u8)> = keys.into_iter().zip(prefix_lens.into_iter()).take(n).collect();
+        let pairs: Vec<(u128, u8)> = keys.into_iter().zip(prefix_lens.into_iter()).take(n).collect();
         for (k, p) in &pairs {
             tree.insert(*k, *p, 60).expect("insert should not fail");
         }
@@ -70,7 +74,7 @@ proptest! {
         let to_keep: Vec<_> = pairs.iter().skip(n/2).cloned().collect();
 
         for (k, _p) in &to_delete {
-            let _ = tree.delete(*k);
+            let _ = tree.delete(*k, *_p);
         }
 
         // Deleted keys should not be found
@@ -102,7 +106,7 @@ fn stress_concurrent_inserts_and_lookups() {
                 tree.insert(key, 128, 60).expect("insert should not fail");
                 assert!(tree.lookup(key));
                 if i % 2 == 0 {
-                    let _ = tree.delete(key);
+                    let _ = tree.delete(key, 128);
                 }
             }
         }));
@@ -112,7 +116,3 @@ fn stress_concurrent_inserts_and_lookups() {
     }
 }
 
-use proptest::prelude::*;
-use num_cpus;
-use std::sync::Arc;
-use std::thread;

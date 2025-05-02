@@ -20,7 +20,7 @@ fn basic_insert_lookup_delete() {
     tree.insert(key, 32, 60);
     assert!(tree.lookup(key));
     // delete & re-check
-    tree.delete(key);
+    tree.delete(key, 32);
     assert!(!tree.lookup(key));
 }
 
@@ -69,7 +69,7 @@ fn shared_memory_visibility_between_handles() {
     assert!(tree2.lookup(key));
 
     // ensure delete in one handle is visible in the other
-    tree2.delete(key);
+    tree2.delete(key, 32);
     assert!(!tree1.lookup(key));
 }
 
@@ -96,7 +96,7 @@ fn concurrent_threaded_inserts_and_lookups() {
                 }));
                 // Lookup might fail if insert failed; that's ok for this test's goal (no panics)
                 let _ = tr.lookup(key);
-                tr.delete(key); // Delete should still work
+                tr.delete(key, 64); // Delete should still work
                 assert!(!tr.lookup(key), "delete failed for {:x}", key);
             }
         }));

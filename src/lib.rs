@@ -111,6 +111,7 @@ pub enum Error {
     CapacityExceeded,
     ZeroCapacity,
     InvalidPrefix,
+    BranchHasChildren,
     // ... (extend as needed)
 }
 
@@ -728,7 +729,11 @@ impl PatriciaTree {
 
             let exp = node.expires.load(Ordering::Acquire);
             if exp != u64::MAX && cpl == node.prefix_len {
-                return exp >= now;
+                // Only return if this is a leaf node; otherwise, keep traversing
+                if node.left.load(Ordering::Acquire) == 0 && node.right.load(Ordering::Acquire) == 0 {
+                    return exp >= now;
+                }
+                // else: internal node expired, but traversal continues
             }
 
             if node.prefix_len >= 128 {
@@ -744,10 +749,10 @@ impl PatriciaTree {
         }
         false
     }
-
-    /// Delete a key (expire immediately)
-    pub fn delete(&self, key: u128) -> Result<(), Error> {
-        trace!("[DELETE] key={:x}", key);
+    /// Delete a key with a given prefix length (expire immediately, concurrency-safe, only expires exact leaf nodes).
+    /// Both `key` and `prefix_len` must match a leaf node for deletion to occur.
+    pub fn delete(&self, key: u128, prefix_len: u8) -> Result<(), Error> {
+        trace!("[DELETE] key={:x}, prefix_len={}", key, prefix_len);
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
         let _write_guard = hdr.lock.write_lock();
@@ -758,9 +763,6 @@ impl PatriciaTree {
         let mut current_gen;
         (current_offset, current_gen) = unpack(current_ptr);
         trace!("[DELETE] Starting at root_offset={}, gen={}", current_offset, current_gen);
-
-        // Need to track parent link to potentially update it if we prune nodes (future enhancement)
-        // let mut parent_link_ptr = &hdr.root_offset as *const AtomicUsize as *mut AtomicUsize;
 
         while current_offset != 0 {
             trace!("[DELETE] Loop: current_offset={}", current_offset);
@@ -781,70 +783,37 @@ impl PatriciaTree {
 
             if cpl < node.prefix_len {
                 trace!("[DELETE] Diverged (cpl < node.prefix_len). Key not found.");
-                // REMOVED: hdr.lock.write_unlock();
                 return Ok(()); // Key not found in this subtree
             }
 
-            // If the common prefix length matches the node's prefix length,
-            // it means the node's prefix matches the beginning of the key.
-            // Now, check if this node is the *exact* one we want to delete.
-            // For simplicity, we assume delete targets the exact key (prefix 128 implicitly).
-            // A more robust implementation might take prefix_len as an argument.
-            if cpl == node.prefix_len {
-                // Check if the node's key *exactly* matches the target key.
-                // This implicitly checks if node.prefix_len is also 128 (or matches the key's significant bits).
-                // We also need to consider the case where the node represents a shorter prefix (e.g., /64)
-                // and the key matches that prefix exactly. The current test inserts with prefix 64,
-                // but deletes with the full key. Let's expire if the node key matches the target key
-                // *masked by the node's prefix length*.
-                let mask = if node.prefix_len == 128 {
-                    !0u128
-                } else {
-                    !(!0u128 >> node.prefix_len)
-                };
-                if (key & mask) == (node.key & mask) {
-                    // This node represents the prefix we are looking for.
-                    // Check if the *keys* are identical. If the test inserts key K with prefix P,
-                    // and we call delete(K), we should expire the node if node.key == K and node.prefix_len == P.
-                    // The current test inserts (key, 64, ttl) and calls delete(key).
-                    // Let's expire if node.key == key and node.prefix_len matches the implicit target (or the original insertion).
-                    // For the concurrent test, keys are unique, so node.key == key should suffice.
-                    if node.key == key {
-                        trace!("[DELETE] Found exact key match. Expiring node at offset={}.", current_offset);
-                        let node_mut = unsafe { &mut *node_ptr };
-                        node_mut.expires.store(0, Ordering::Release); // Expire the node
-                        // Retire the offset using epoch-based reclamation
-                        let off = current_offset;
-                        epoch::pin().defer(move || {
-                            FREELIST.push(off);
-                        });
-                        // Increment free_slots for reclaimable capacity
-                        let hdr = unsafe { &*self.hdr.as_ptr() };
-                        hdr.free_slots.fetch_add(1, Ordering::Release);
-                        trace!("[DELETE] Finished.");
-                        // TODO: Implement pruning of expired nodes if necessary.
-                        // REMOVED: hdr.lock.write_unlock();
-                        return Ok(());
-                    }
-                    // If keys don't match exactly, but the prefix does, it means the node we found
-                    // is a less specific prefix. We need to continue searching deeper.
-                    trace!("[DELETE] Prefix matches, but key differs. Traversing down.");
-                } else {
-                    // This case (cpl == node.prefix_len but masked keys differ) should theoretically not happen
-                    // due to how common_prefix_len works. If it does, it implies an issue elsewhere.
-                    trace!("[DELETE] Inconsistent state: cpl == node.prefix_len but masked keys differ. Key not found.");
-                    // REMOVED: hdr.lock.write_unlock();
+            // Only expire if this is an exact (key, prefix_len) match and a leaf node
+            if cpl == node.prefix_len && node.key == key && node.prefix_len == prefix_len {
+                let is_leaf = node.left.load(Ordering::Acquire) == 0 && node.right.load(Ordering::Acquire) == 0;
+                if is_leaf {
+                    trace!("[DELETE] Found exact key+prefix match and is leaf. Expiring node at offset={}.", current_offset);
+                    let node_mut = unsafe { &mut *node_ptr };
+                    node_mut.expires.store(0, Ordering::Release); // Expire the node
+                    // Retire the offset using epoch-based reclamation
+                    let off = current_offset;
+                    epoch::pin().defer(move || {
+                        FREELIST.push(off);
+                    });
+                    // Increment free_slots for reclaimable capacity
+                    let hdr = unsafe { &*self.hdr.as_ptr() };
+                    hdr.free_slots.fetch_add(1, Ordering::Release);
+                    trace!("[DELETE] Finished.");
                     return Ok(());
+                } else {
+                    trace!("[DELETE] Attempted to delete internal node with children. Returning BranchHasChildren.");
+                    return Err(Error::BranchHasChildren);
                 }
             }
+            // If keys don't match exactly, or the prefix length does not match, continue searching deeper.
+            trace!("[DELETE] Prefix matches, but key or prefix_len differs or not a leaf. Traversing down.");
 
-            // If we reach here, it means cpl == node.prefix_len, but the keys didn't match exactly,
-            // OR cpl > node.prefix_len (which is impossible).
-            // We need to traverse down based on the next bit *after* the node's prefix.
             if node.prefix_len >= 128 {
                 #[cfg(debug_assertions)]
                 trace!("[DELETE] Node prefix_len >= 128, but key didn't match exactly. Key not found.");
-                // REMOVED: hdr.lock.write_unlock();
                 return Ok(()); // Cannot go deeper
             }
 
@@ -858,10 +827,9 @@ impl PatriciaTree {
             (current_offset, current_gen) = unpack(current_ptr);
         }
         trace!("[DELETE] Reached end of branch (offset 0). Key not found.");
-        // REMOVED: hdr.lock.write_unlock();
-        // Key not found if loop finishes
         Ok(())
     }
+
 
     /// Bulk insert multiple entries
     pub fn bulk_insert(&self, items: &[(u128, u8, u64)]) -> Result<(), Error> {

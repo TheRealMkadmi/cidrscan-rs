@@ -58,10 +58,11 @@ pub extern "C" fn patricia_delete(
     handle: i32,
     key_high: u64,
     key_low: u64,
+    prefix_len: u8,
 ) {
     if let Some(tree) = REGISTRY.lock().expect("lock registry").get(&handle) {
         let key = ((key_high as u128) << 64) | (key_low as u128);
-        tree.delete(key);
+        tree.delete(key, prefix_len);
     }
 }
 
