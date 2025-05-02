@@ -31,7 +31,8 @@ pub fn v4_key(addr: u32) -> u128 {
  */
 #[inline]
 pub fn v4_plen(plen: u8) -> u8 {
-    plen
+    // For IPv4-mapped addresses, the prefix length is offset by 96 bits in a 128-bit key.
+    plen.saturating_add(96)
 }
 /// On Windows, enables SeCreateGlobalPrivilege for the current process if possible.
 /// Call once early in main() if you want to allow cross-session shared memory creation.
@@ -118,9 +119,9 @@ const _: () = assert!(std::mem::align_of::<Node>() == CACHE_LINE);
 #[macro_export]
 macro_rules! trace {
     ($($t:tt)*) => {
-        // if cfg!(feature = "trace") {
+        if cfg!(feature = "trace") {
             println!($($t)*);
-        // }
+        }
     }
 }
 
@@ -176,6 +177,11 @@ fn mask(prefix_len: u8) -> u128 {
     } else {
         !(!0u128 >> prefix_len) // Create mask by shifting
     }
+}
+/// Canonicalise a key: zero host bits beyond `plen`.
+#[inline(always)]
+fn canonical(key: u128, plen: u8) -> u128 {
+    key & mask(plen)
 }
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
@@ -257,6 +263,26 @@ impl std::panic::RefUnwindSafe for PatriciaTree {}
 impl std::panic::UnwindSafe for PatriciaTree {}
 
 impl PatriciaTree {
+    /// Insert an IPv4 prefix (automatically maps the 32-bit address into the high 96 bits).
+    pub fn insert_v4(&self, addr: u32, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
+        let key = v4_key(addr);
+        let plen128 = v4_plen(prefix_len);
+        self.insert(key, plen128, ttl_secs)
+    }
+
+    /// Delete an IPv4 prefix.
+    pub fn delete_v4(&self, addr: u32, prefix_len: u8) -> Result<(), Error> {
+        let key = v4_key(addr);
+        let plen128 = v4_plen(prefix_len);
+        self.delete(key, plen128)
+    }
+
+    /// Lookup an IPv4 address against stored prefixes.
+    pub fn lookup_v4(&self, addr: u32) -> bool {
+        let key = v4_key(addr);
+        self.lookup(key)
+    }
+
     /// Returns the number of available slots (capacity - used + recycled).
     pub fn available_capacity(&self) -> usize {
         let hdr = unsafe { &*self.hdr.as_ptr() };
@@ -359,8 +385,8 @@ impl PatriciaTree {
             hdr.next_index.load(Ordering::Relaxed)
         );
 
-        // Store the full key – do *not* canonicalise
-        let stored_key = key;
+        // Store canonical key
+        let stored_key = canonical(key, prefix_len);
 
         let expires = if ttl_secs == 0 {
             0
@@ -518,10 +544,7 @@ impl PatriciaTree {
             // --- Subcase 2c: Split Required ---
             // Only split if keys truly differ
             // Split also when prefix lengths match exactly but keys differ
-            if (cpl < current_node.prefix_len && stored_key != current_node.key)
-                || (cpl == prefix_len
-                    && cpl == current_node.prefix_len
-                    && stored_key != current_node.key)
+            if cpl < current_node.prefix_len && stored_key != current_node.key
             {
                 // Find the first differing bit after the common prefix
                 // split at the *actual* first differing bit, not capped by current prefixes
@@ -906,7 +929,9 @@ impl PatriciaTree {
                 link = hdr.root_offset.load(Ordering::Acquire);
                 continue;
             }
-            let cpl = common_prefix_len(key, node.key, node.prefix_len);
+            // Work with the masked (canonical) value for CPL and equality
+            let canon = canonical(key, node.prefix_len);
+            let cpl   = common_prefix_len(canon, node.key, node.prefix_len);
             if cpl < node.prefix_len {
                 return false;
             }
@@ -916,7 +941,7 @@ impl PatriciaTree {
                 // Return if this node was explicitly stored (leaf or internal)
                 if node.is_terminal.load(Ordering::Acquire) == 1
                     && node.refcnt.load(Ordering::Acquire) > 0
-                    && key == node.key
+                    && canon == node.key
                 {
                     return exp >= now;
                 }
@@ -945,8 +970,8 @@ impl PatriciaTree {
         let _write_guard = hdr.lock.write_lock();
         trace!("[DELETE] Lock acquired.");
 
-        // Store the full key – do *not* canonicalise
-        let stored_key = key;
+        // Store canonical key
+        let stored_key = canonical(key, prefix_len);
 
         // Track parent links for pruning
         let mut links: Vec<(&AtomicU64, u8)> = Vec::with_capacity(128);

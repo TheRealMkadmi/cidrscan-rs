@@ -79,9 +79,9 @@ proptest! {
         let shm_name = format!("test_shm_prop_{}", rand::random::<u64>());
         let tree = PatriciaTree::open(&shm_name, pairs.len() * 2).unwrap();
 
-        // Insert all
+        // Insert all as IPv4 prefixes
         for &(k, p) in &pairs {
-            tree.insert(k, p, 60).unwrap();
+            tree.insert_v4(k as u32, p, 60).unwrap();
         }
 
         // Split vector deterministically
@@ -90,16 +90,16 @@ proptest! {
 
         // Delete first half
         for &(k, p) in to_delete {
-            tree.delete(k, p).unwrap();
+            tree.delete_v4(k as u32, p).unwrap();
         }
 
         // Deleted keys must be absent
         for &(k, _) in to_delete {
-            assert!(!tree.lookup(k), "Deleted key still present: {k:#x}");
+            assert!(!tree.lookup_v4(k as u32), "Deleted key still present: {k:#x}");
         }
         // Kept keys must be present
         for &(k, _) in to_keep {
-            assert!(tree.lookup(k), "Kept key missing: {k:#x}");
+            assert!(tree.lookup_v4(k as u32), "Kept key missing: {k:#x}");
         }
     }
 }
