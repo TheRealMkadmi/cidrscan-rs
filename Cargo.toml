@@ -3,7 +3,7 @@ name = "cidrscan"
 version = "0.1.0"
 authors = ["TheRealMkadmi <wahibmkadmi16@gmail.com>"]
 edition = "2021"
-description = "A high-performance memory-resident Patricia tree with TTL support for CIDR tagging and IP lookups."
+description = "A cross-process, memory-resident, lock-free-read LPM engine with per-prefix TTLs and a tiny, language-agnostic C ABI."
 license = "MIT"
 repository = "https://github.com/TheRealMkadmi/cidrscan-rs"
 
@@ -22,6 +22,7 @@ rand = "0.9.1"
 
 [features]
 trace = []
+enable_global_priv = []
 
 [target.x86_64-pc-windows-msvc]
 linker = "clang-cl"                        # or full path to clang-cl.exe
