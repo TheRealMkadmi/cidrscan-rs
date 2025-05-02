@@ -849,9 +849,13 @@ impl PatriciaTree {
             if cpl == node.prefix_len && node.key == key && node.prefix_len == prefix_len {
                 let is_leaf = node.left.load(Ordering::Acquire) == 0 && node.right.load(Ordering::Acquire) == 0;
                 if is_leaf {
-                    trace!("[DELETE] Found exact key+prefix match and is leaf. Expiring node at offset={}.", current_offset);
-                    let node_mut = unsafe { &mut *node_ptr };
-                    node_mut.expires.store(0, Ordering::Release); // Expire the node
+                    trace!("[DELETE] Found exact key+prefix match and is leaf. Removing node at offset={}.", current_offset);
+
+                    // 1. Detach from parent before recycling to avoid a dangling link
+                    if let Some(parent_link) = links.last() {
+                        parent_link.store(0, Ordering::Release);
+                    }
+
                     // Retire the offset using epoch-based reclamation
                     let off = current_offset;
                     // Workaround: store offset of free_slots field from base pointer, reconstruct in closure
@@ -865,10 +869,12 @@ impl PatriciaTree {
                         let free_slots_ptr = (base_addr + free_slots_offset) as *const AtomicU32;
                         unsafe { (*free_slots_ptr).fetch_add(1, Ordering::Release); }
                     });
-                    // After removal, prune up the chain
+
+                    // 2. Attempt to prune unary ancestors now that the link is gone
                     for parent in links.iter().rev() {
                         self.try_prune(parent);
                     }
+
                     trace!("[DELETE] Finished.");
                     return Ok(());
                 } else {

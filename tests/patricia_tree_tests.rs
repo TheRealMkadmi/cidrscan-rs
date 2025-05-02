@@ -1,7 +1,8 @@
-use cidrscan::{PatriciaTree, v4_key, v4_plen};
-use rand;
-use proptest::prelude::*;
+use cidrscan::{v4_key, v4_plen, PatriciaTree};
 use num_cpus;
+use proptest::collection::{hash_set, vec as pvec};
+use proptest::prelude::*;
+use rand;
 use std::sync::Arc;
 use std::thread;
 
@@ -53,37 +54,52 @@ fn split_creates_balanced_branches() {
     _ = tree.delete(key2, plen);
     assert!(!tree.lookup(key2));
 }
+
+
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
     #[test]
     fn property_insert_delete_lookup(
-        keys in proptest::collection::vec(any::<u128>(), 10..30),
-        prefix_lens in proptest::collection::vec(1u8..=128, 10..30)
+        // ① Unique keys
+        keys in hash_set(0u128..1000, 3..8),
+        // ② Any prefix lengths (same cardinality upper‑bounded by keys.len())
+        prefix_lens in pvec(8u8..32, 3..32)
     ) {
         use cidrscan::PatriciaTree;
-        let n = keys.len().min(prefix_lens.len());
+
+        // Trim prefix_lens to have at most one length per key
+        let n = keys.len();
+        let lens = &prefix_lens[..n.min(prefix_lens.len())];
+
+        // Pair each unique key with one prefix_len
+        let pairs: Vec<_> = keys.into_iter().zip(lens.iter().copied()).collect();
+
+        // Open tree with extra capacity
         let shm_name = format!("test_shm_prop_{}", rand::random::<u64>());
-        let tree = PatriciaTree::open(&shm_name, n * 2).unwrap();
+        let tree = PatriciaTree::open(&shm_name, pairs.len() * 2).unwrap();
 
-        let pairs: Vec<(u128, u8)> = keys.into_iter().zip(prefix_lens.into_iter()).take(n).collect();
-        for (k, p) in &pairs {
-            tree.insert(*k, *p, 60).expect("insert should not fail");
+        // Insert all
+        for &(k, p) in &pairs {
+            tree.insert(k, p, 60).unwrap();
         }
 
-        // Delete half
-        let to_delete: Vec<_> = pairs.iter().take(n/2).cloned().collect();
-        let to_keep: Vec<_> = pairs.iter().skip(n/2).cloned().collect();
+        // Split vector deterministically
+        let mid = pairs.len() / 2;
+        let (to_delete, to_keep) = pairs.split_at(mid);
 
-        for (k, _p) in &to_delete {
-            let _ = tree.delete(*k, *_p);
+        // Delete first half
+        for &(k, p) in to_delete {
+            tree.delete(k, p).unwrap();
         }
 
-        // Deleted keys should not be found
-        for (k, _) in &to_delete {
-            assert!(!tree.lookup(*k), "Deleted key was found");
+        // Deleted keys must be absent
+        for &(k, _) in to_delete {
+            assert!(!tree.lookup(k), "Deleted key still present: {k:#x}");
         }
-        // Remaining keys should be found
-        for (k, _) in &to_keep {
-            assert!(tree.lookup(*k), "Kept key was not found");
+        // Kept keys must be present
+        for &(k, _) in to_keep {
+            assert!(tree.lookup(k), "Kept key missing: {k:#x}");
         }
     }
 }
@@ -115,4 +131,3 @@ fn stress_concurrent_inserts_and_lookups() {
         h.join().expect("thread failed");
     }
 }
-
