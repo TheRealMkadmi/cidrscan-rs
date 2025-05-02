@@ -379,6 +379,7 @@ impl PatriciaTree {
                     // Someone else installed a node – recycle ours and restart
                     // Retire the offset using epoch-based reclamation
                     let off = leaf_offset as Offset;
+                    // No free_slots update needed here, as this is a failed allocation rollback
                     epoch::pin().defer(move || {
                         FREELIST.push(off);
                     });
@@ -539,6 +540,7 @@ impl PatriciaTree {
                                 if internal_index == (index as usize) - 1 {
                                     // Retire the internal_offset using epoch-based reclamation
                                     let off = internal_offset;
+                                    // No free_slots update needed here, as this is a failed allocation rollback
                                     epoch::pin().defer(move || {
                                         FREELIST.push(off);
                                     });
@@ -595,9 +597,15 @@ impl PatriciaTree {
                             // Retire both offsets using epoch-based reclamation
                             let int_off = internal_offset;
                             let leaf_off = leaf_offset;
+                            // Workaround: store offset of free_slots field from base pointer, reconstruct in closure
+                            let base_addr = self.hdr.as_ptr() as usize;
+                            let free_slots_offset = (&(*self.hdr.as_ptr()).free_slots as *const AtomicU32 as usize) - base_addr;
                             epoch::pin().defer(move || {
                                 FREELIST.push(int_off);
                                 FREELIST.push(leaf_off);
+                                // counter and queue stay consistent
+                                let free_slots_ptr = (base_addr + free_slots_offset) as *const AtomicU32;
+                                (*free_slots_ptr).fetch_add(2, Ordering::Release);
                             });
                             continue;
                         }
@@ -698,11 +706,27 @@ impl PatriciaTree {
             }
             hdr.next_index.fetch_sub(1, Ordering::SeqCst); // roll back
 
-            // ③ Arena full – block until another thread frees something
+            // ③ Arena full – try once to flush deferred frees
             if hdr.free_slots.load(Ordering::Acquire) == 0 {
                 return Err(Error::CapacityExceeded);
             }
-            std::thread::park_timeout(std::time::Duration::from_micros(30));
+            epoch::pin().flush();
+            if let Some(offset) = FREELIST.pop() {
+                hdr.free_slots.fetch_sub(1, Ordering::Release);
+                let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
+                let gen = unsafe {
+                    let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    core::ptr::write_volatile(&mut (*node_ptr).key, key);
+                    core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
+                    (*node_ptr).left.store(0, Ordering::Relaxed);
+                    (*node_ptr).right.store(0, Ordering::Relaxed);
+                    (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                    g
+                };
+                return Ok((offset, gen));
+            } else {
+                return Err(Error::CapacityExceeded); // caller will drop lock and retry
+            }
         }
     }
 
@@ -800,12 +824,17 @@ impl PatriciaTree {
                     node_mut.expires.store(0, Ordering::Release); // Expire the node
                     // Retire the offset using epoch-based reclamation
                     let off = current_offset;
+                    // Workaround: store offset of free_slots field from base pointer, reconstruct in closure
+                    let base_addr = self.hdr.as_ptr() as usize;
+                    let free_slots_offset = unsafe {
+                        (&(*self.hdr.as_ptr()).free_slots as *const AtomicU32 as usize) - base_addr
+                    };
                     epoch::pin().defer(move || {
                         FREELIST.push(off);
+                        // counter and queue stay consistent
+                        let free_slots_ptr = (base_addr + free_slots_offset) as *const AtomicU32;
+                        unsafe { (*free_slots_ptr).fetch_add(1, Ordering::Release); }
                     });
-                    // Increment free_slots for reclaimable capacity
-                    let hdr = unsafe { &*self.hdr.as_ptr() };
-                    hdr.free_slots.fetch_add(1, Ordering::Release);
                     trace!("[DELETE] Finished.");
                     return Ok(());
                 } else {
