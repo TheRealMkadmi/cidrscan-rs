@@ -1,7 +1,6 @@
 //! Error handling and C-ABI error codes for cidrscan
 
 use std::cell::RefCell;
-use std::ffi::CStr;
 use std::os::raw::c_char;
 
 #[repr(C)]
@@ -12,6 +11,8 @@ pub enum ErrorCode {
     ZeroCapacity = 2,
     InvalidPrefix = 3,
     BranchHasChildren = 4,
+    InvalidHandle = 5,
+    Utf8Error = 6,
     Unknown = 255,
 }
 
@@ -23,6 +24,8 @@ impl ErrorCode {
             ErrorCode::ZeroCapacity => "Zero capacity",
             ErrorCode::InvalidPrefix => "Invalid prefix",
             ErrorCode::BranchHasChildren => "Branch has children",
+            ErrorCode::InvalidHandle => "Invalid handle",
+            ErrorCode::Utf8Error => "UTF-8 conversion error",
             ErrorCode::Unknown => "Unknown error",
         }
     }
@@ -54,6 +57,8 @@ pub extern "C" fn patricia_strerror(code: ErrorCode) -> *const c_char {
         ErrorCode::ZeroCapacity => b"Zero capacity\0".as_ptr() as *const c_char,
         ErrorCode::InvalidPrefix => b"Invalid prefix\0".as_ptr() as *const c_char,
         ErrorCode::BranchHasChildren => b"Branch has children\0".as_ptr() as *const c_char,
+        ErrorCode::InvalidHandle => b"Invalid handle\0".as_ptr() as *const c_char,
+        ErrorCode::Utf8Error => b"UTF-8 conversion error\0".as_ptr() as *const c_char,
         ErrorCode::Unknown => b"Unknown error\0".as_ptr() as *const c_char,
     }
 }
@@ -66,6 +71,8 @@ pub fn map_error(e: &crate::types::Error) -> ErrorCode {
         ZeroCapacity => ErrorCode::ZeroCapacity,
         InvalidPrefix => ErrorCode::InvalidPrefix,
         BranchHasChildren => ErrorCode::BranchHasChildren,
-        //_ => ErrorCode::Unknown,
+        InvalidHandle => ErrorCode::InvalidHandle,
+        Utf8Error => ErrorCode::Utf8Error,
+        _ => ErrorCode::Unknown,
     }
 }

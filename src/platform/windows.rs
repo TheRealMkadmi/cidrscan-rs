@@ -42,6 +42,10 @@ pub fn enable_se_create_global_privilege() {
 
 // Windows-specific Drop logic for PatriciaTree
 #[cfg(target_os = "windows")]
+/// On Windows, explicit cleanup of shared memory or resources is not required here.
+/// The shared memory crate (such as `memmap2` or similar) handles cleanup automatically
+/// when all references are dropped. This function is intentionally a no-op to clarify
+/// that no manual resource management is needed for PatriciaTree on Windows.
 pub fn platform_drop(_os_id: &str) {
-    // No-op for Windows
+    // No-op for Windows: cleanup is handled by the shared memory crate.
 }

@@ -145,7 +145,7 @@ impl PatriciaTree {
         })
     }
 
-    /// Insert a key with a given prefix length and TTL - REVISED LOGIC
+    /// Insert a key with a given prefix length and TTL
     pub fn insert(&self, key: u128, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
         trace!(
             "[INSERT] key={:x}, prefix_len={}, ttl={}",
@@ -558,8 +558,6 @@ impl PatriciaTree {
             // cpl == current_node.prefix_len must hold.
             // cpl < prefix_len was handled by Insert Above.
             // So, this path should only be taken if cpl == current_node.prefix_len < prefix_len.
-            // Let's re-verify the conditions. If cpl == current_node.prefix_len, it means the current node's
-            // prefix matches the start of the key being inserted. We need to decide based on the next bit.
             trace!("[INSERT] Subcase 2d: Traverse Down needed.");
             let next_bit = get_bit(key, current_node.prefix_len); // Bit *after* current prefix
             trace!("[INSERT] Traverse direction bit={}", next_bit);
@@ -940,6 +938,13 @@ impl PatriciaTree {
         let hdr = unsafe { &*self.hdr.as_ptr() };
         hdr.free_slots.fetch_add(1, Ordering::Release);
         epoch::pin().defer(move || FREELIST.push(off));
+    }
+    /// Explicitly destroy the shared memory segment and unlink it.
+    /// After calling this, the handle must not be used again.
+    pub fn destroy(self) {
+        // Drop will run, which will call platform_drop and unmap the segment.
+        // This method exists for explicitness in FFI.
+        // No-op body: Drop does the work.
     }
 } // end impl PatriciaTree
 
