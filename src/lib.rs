@@ -19,7 +19,7 @@ use std::{
     mem::size_of,
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH, Duration},
 };
 use std::sync::Arc;
 
@@ -101,6 +101,15 @@ impl PatriciaTree {
         let hdr_ptr = base_ptr as *mut Header;
         let hdr = NonNull::new(hdr_ptr).unwrap();
         let hdr_mut = unsafe { &mut *hdr_ptr };
+
+        // === PATCH 1: Header parameter mismatch guard ===
+        if !is_creator {
+            if hdr_mut.version != HEADER_VERSION || hdr_mut.capacity != capacity {
+                // Return error if version or capacity mismatches
+                return Err(ShmemError::MapOpenFailed(69));
+            }
+        }
+
         // Initialise the RW-lock and header when the region is (re-)created
         if is_creator
             || hdr_mut.magic != HEADER_MAGIC
@@ -151,7 +160,7 @@ impl PatriciaTree {
             base,
             hdr,
             os_id: os_name.clone(),
-                            freelist: Arc::new(SegQueue::new()),
+            freelist: Arc::new(SegQueue::new()),
         })
     }
 
@@ -623,7 +632,17 @@ impl PatriciaTree {
                 }
                 return Ok((offset, 1));
             }
-            hdr.next_index.fetch_sub(1, Ordering::SeqCst); // roll back
+            // === PATCH 4: Race-free next_index rollback (CAS loop) ===
+            // Only the thread that over-allocated should decrement next_index
+            loop {
+                let cur = hdr.next_index.load(Ordering::SeqCst);
+                if cur == 0 {
+                    break;
+                }
+                if hdr.next_index.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                    break;
+                }
+            }
 
             // ③ Arena full – try once to flush deferred frees
             if hdr.free_slots.load(Ordering::Acquire) == 0 {
@@ -709,7 +728,11 @@ impl PatriciaTree {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        while let Some((node, gen)) = self.follow(link) {
+        loop {
+            let (node, gen) = match self.follow(link) {
+                Some((n, g)) => (n, g),
+                None => break,
+            };
             if gen != node.generation.load(Ordering::Acquire) {
                 // ABA detected: retry from root
                 link = hdr.root_offset.load(Ordering::Acquire);
@@ -729,7 +752,26 @@ impl PatriciaTree {
                     && node.refcnt.load(Ordering::Acquire) > 0
                     && canon == node.key
                 {
-                    return exp >= now;
+                    // === PATCH 3: Lazy sweep of expired nodes ===
+                    if exp < now {
+                        // Try to acquire write lock and delete the node in place
+                        if let Some(_guard) = hdr.lock.try_write_lock(Timeout::Val(Duration::from_secs(0))) {
+                            // Double-check expiration under lock
+                            let exp2 = node.expires.load(Ordering::Acquire);
+                            if exp2 < now && node.is_terminal.load(Ordering::Acquire) == 1 {
+                                node.is_terminal.store(0, Ordering::Release);
+                                node.refcnt.store(0, Ordering::Release);
+                                hdr.free_slots.fetch_add(1, Ordering::Release);
+                                // Retire node (deferred free)
+                                let off = (node as *const Node as usize - self.base.as_ptr() as usize) as Offset;
+                                self.retire_offset(off);
+                            }
+                        }
+                        // After sweep, restart from root
+                        link = hdr.root_offset.load(Ordering::Acquire);
+                        continue;
+                    }
+                    return true;
                 }
                 // else: internal node expired, but traversal continues
             }
@@ -739,11 +781,21 @@ impl PatriciaTree {
             }
 
             let next_bit = get_bit(key, node.prefix_len);
-            link = if next_bit == 0 {
+            let child_link = if next_bit == 0 {
                 node.left.load(Ordering::Acquire)
             } else {
                 node.right.load(Ordering::Acquire)
             };
+
+            // === PATCH 2: Extra ABA check on child pointer ===
+            if let Some((child_node, child_gen)) = self.follow(child_link) {
+                if child_gen != child_node.generation.load(Ordering::Acquire) {
+                    // ABA detected on child: restart from root
+                    link = hdr.root_offset.load(Ordering::Acquire);
+                    continue;
+                }
+            }
+            link = child_link;
         }
         false
     }
