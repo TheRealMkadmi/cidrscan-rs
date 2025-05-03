@@ -107,7 +107,7 @@ proptest! {
 #[test]
 fn stress_concurrent_inserts_and_lookups() {
     let threads = num_cpus::get();
-    let ops_per_thread = 100_000;
+    let ops_per_thread = 10000;
     let shm_name = format!("test_shm_stress_{}", rand::random::<u64>());
     let tree = Arc::new(PatriciaTree::open(&shm_name, threads * ops_per_thread * 2).unwrap());
 

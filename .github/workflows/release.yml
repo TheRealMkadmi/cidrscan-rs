@@ -15,6 +15,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install cross
         run: cargo install cross
+      - name: Install cbindgen
+        run: cargo install cbindgen
+
       - name: Install Rust stable toolchain
         run: rustup default stable
       - name: Add Rust targets
@@ -32,10 +35,12 @@ jobs:
               src_dir="target/release"
             else
               src_dir="target/$target/release"
-            fi            mkdir -p packages/$name
-            # Copy both header files
+            fi
+            # Generate C header with cbindgen
+            cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
+            mkdir -p packages/$name
+            # Copy header file
             cp $src_dir/cidrscan.h packages/$name/
-            cp $src_dir/cidrscan_ffi.h packages/$name/
             # Copy binary files based on target
             case "$target" in
               *windows-gnu)
@@ -84,7 +89,10 @@ jobs:
             else
               src_dir="target/$target/release"
             fi
+            # Generate C header with cbindgen
+            cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
             mkdir -p packages/$name
+            # Copy header file
             cp $src_dir/cidrscan.h packages/$name/
             cp $src_dir/libcidrscan.dylib packages/$name/ || true
             cd packages/$name

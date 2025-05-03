@@ -161,7 +161,7 @@ pub extern "C" fn patricia_destroy(handle: i32) -> ErrorCode {
         // Only destroy if this is the last Arc (strong_count == 1)
         if Arc::strong_count(&tree_arc) == 1 {
             // Safety: we have the only Arc, so we can get a mutable reference
-            let mut_tree = unsafe { Arc::try_unwrap(tree_arc).ok().unwrap() };
+            let mut_tree = Arc::try_unwrap(tree_arc).ok().unwrap();
             // Explicitly drop the mapping and unlink the segment
             mut_tree.destroy();
         }
