@@ -3,7 +3,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use cidrscan::PatriciaTree;
+
+use cidrscan::types::PatriciaTree;
 
 /// Helper to convert an IPv4 octets into our u128 key representation.
 fn ipv4_to_u128(a: u8, b: u8, c: u8, d: u8) -> u128 {

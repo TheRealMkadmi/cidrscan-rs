@@ -1,10 +1,11 @@
-use cidrscan::{v4_key, v4_plen, PatriciaTree};
 use num_cpus;
 use proptest::collection::{hash_set, vec as pvec};
 use proptest::prelude::*;
 use rand;
 use std::sync::Arc;
 use std::thread;
+use cidrscan::helpers::{v4_key, v4_plen};
+use cidrscan::types::PatriciaTree;
 
 #[test]
 fn basic_ops() {
@@ -66,7 +67,6 @@ proptest! {
         // ② Any prefix lengths (same cardinality upper‑bounded by keys.len())
         prefix_lens in pvec(8u8..32, 3..32)
     ) {
-        use cidrscan::PatriciaTree;
 
         // Trim prefix_lens to have at most one length per key
         let n = keys.len();
@@ -106,7 +106,6 @@ proptest! {
 
 #[test]
 fn stress_concurrent_inserts_and_lookups() {
-    use cidrscan::PatriciaTree;
     let threads = num_cpus::get();
     let ops_per_thread = 100_000;
     let shm_name = format!("test_shm_stress_{}", rand::random::<u64>());

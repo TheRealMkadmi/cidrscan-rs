@@ -1,11 +1,16 @@
-//! Monolithic, high‑performance, shared Patricia tree with TTL
-//! Monolithic to allow stealing the entire tree in one go.
+pub mod helpers;
+pub mod constants;
+pub mod types;
+
+use helpers::*;
+use constants::*;
+use types::*;
 
 use crate::shmem_rwlock::RawRwLock;
 use crossbeam_epoch as epoch;
 use crossbeam_queue::SegQueue;
 use raw_sync::Timeout; // needed by API
-use shared_memory::{Shmem, ShmemConf, ShmemError}; // Shared memory mapping :contentReference[oaicite:13]{index=13}
+use shared_memory::{ShmemConf, ShmemError};
 use std::{
     mem::size_of,
     ptr::NonNull,
@@ -13,27 +18,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-static FREELIST: SegQueue<Offset> = SegQueue::new();
+static FREELIST: SegQueue<types::Offset> = SegQueue::new();
 
 pub mod shmem_rwlock;
 
-/// Helper to encode an IPv4 address as a 128-bit key for IPv6-compatible Patricia tries.
-/// The IPv4 address is placed in the lowest 32 bits (as per IPv4-mapped IPv6 addresses).
-#[inline]
-pub fn v4_key(addr: u32) -> u128 {
-    (addr as u128) << 96
-}
-
-/**
- * Helper to encode an IPv4 prefix length as a 128-bit prefix length for IPv6-compatible Patricia tries.
- * The IPv4 bits occupy the high 32 bits, so the IPv4 prefix length is identical: /24 → 24, /32 → 32, etc.
- * See RFC 4291 §2.5.5.2.
- */
-#[inline]
-pub fn v4_plen(plen: u8) -> u8 {
-    // For IPv4-mapped addresses, the prefix length is offset by 96 bits in a 128-bit key.
-    plen.saturating_add(96)
-}
 /// On Windows, enables SeCreateGlobalPrivilege for the current process if possible.
 /// Call once early in main() if you want to allow cross-session shared memory creation.
 /// No-op if privilege is already enabled or cannot be granted.
@@ -78,43 +66,6 @@ pub fn enable_se_create_global_privilege() {
     }
 }
 
-// ===== Alignment helpers and constants =====
-
-#[cfg(target_os = "windows")]
-const PREFIX: &str = "cidrscan_"; // No Global\ here
-#[cfg(not(target_os = "windows"))]
-const PREFIX: &str = "cidrscan_";
-
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
-fn fnv1a_64(s: &str) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in s.as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
-
-/// Round `n` up to the next multiple of `align`  (align *must* be a power of two)
-#[inline(always)]
-const fn align_up(n: usize, align: usize) -> usize {
-    (n + align - 1) & !(align - 1)
-}
-
-/// Cache-line size used by `Node`
-const CACHE_LINE: usize = 64;
-
-/// Padded size of the header – ALWAYS a multiple of 64
-const HEADER_PADDED: usize = align_up(std::mem::size_of::<Header>(), CACHE_LINE);
-
-/// Static guarantee that the padded size is indeed aligned
-const _: () = assert!(HEADER_PADDED % CACHE_LINE == 0);
-
-/// Compile-time sanity – the arena pointer is 64-aligned
-const _: () = assert!(std::mem::align_of::<Header>() == CACHE_LINE);
-const _: () = assert!(std::mem::align_of::<Node>() == CACHE_LINE);
-
 /// Print only if the "trace" feature is enabled.
 #[macro_export]
 macro_rules! trace {
@@ -125,142 +76,13 @@ macro_rules! trace {
     }
 }
 
-/// Error type for PatriciaTree operations.
-#[derive(Debug)]
-pub enum Error {
-    CapacityExceeded,
-    ZeroCapacity,
-    InvalidPrefix,
-    BranchHasChildren,
-    // ... (extend as needed)
-}
+// ===== Compile-time assertions for alignment and size =====
+const HEADER_PADDED: usize = helpers::align_up(std::mem::size_of::<types::Header>(), constants::CACHE_LINE);
+const _: () = assert!(HEADER_PADDED % constants::CACHE_LINE == 0);
+const _: () = assert!(std::mem::align_of::<types::Header>() == constants::CACHE_LINE);
+const _: () = assert!(std::mem::align_of::<types::Node>() == constants::CACHE_LINE);
 
-// Helper function to calculate the length of the common prefix (up to max_len bits)
-fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
-    if max_len == 0 {
-        return 0;
-    } // Handle zero length prefix comparison
-      // Remove unused variable: let relevant_bits = 128 - max_len as u32;
-      // Mask to ignore bits beyond max_len
-    let mask = if max_len == 128 {
-        !0u128
-    } else {
-        !(!0u128 >> max_len)
-    };
-    let diff = (key1 & mask) ^ (key2 & mask);
-    if diff == 0 {
-        return max_len; // Keys are identical up to max_len
-    }
-    // Calculate leading zeros of the difference, capped by 128 bits
-    let lz = diff.leading_zeros().min(128) as u8;
-    // Common prefix length is the number of leading matching bits, capped by max_len
-    lz.min(max_len)
-}
 
-// Helper function to get the bit at a specific index (0 = MSB)
-#[inline]
-fn get_bit(key: u128, index: u8) -> u8 {
-    debug_assert!(index <= 127); // 128 is never queried
-    ((key >> (127 - index)) & 1) as u8
-}
-
-// Helper function to find the first differing bit between two keys, up to max_len bits.
-// Returns Some(bit_index) where 0 = MSB, or None if all bits up to max_len are the same.
-
-// Helper function to create a mask for a given prefix length
-#[inline]
-fn mask(prefix_len: u8) -> u128 {
-    if prefix_len == 0 {
-        0 // No bits set for zero length prefix
-    } else if prefix_len >= 128 {
-        !0u128 // All bits set for 128 or more
-    } else {
-        !(!0u128 >> prefix_len) // Create mask by shifting
-    }
-}
-/// Canonicalise a key: zero host bits beyond `plen`.
-#[inline(always)]
-fn canonical(key: u128, plen: u8) -> u128 {
-    key & mask(plen)
-}
-
-/// Offset type: always 32 bits, portable across 32/64-bit platforms
-type Offset = u32; // <= 4 294 967 295 bytes from base
-
-/// Packs an offset and generation into a single u64 for ABA-safe pointers.
-#[inline]
-fn pack(offset: u32, gen: u32) -> u64 {
-    ((gen as u64) << 32) | (offset as u64)
-}
-
-/// Unpacks a u64 pointer into (offset, generation).
-#[inline]
-fn unpack(ptr: u64) -> (u32, u32) {
-    (ptr as u32, (ptr >> 32) as u32)
-}
-
-/// Maximum nodes if not specified
-const DEFAULT_CAPACITY: usize = 1_048_576;
-
-/// Compile-time guarantee: arena fits in 32-bit offset
-const _: () = assert!((DEFAULT_CAPACITY as u64) * (size_of::<Node>() as u64) < (1u64 << 32));
-
-/// Magic and ABI version for header integrity checks
-const HEADER_MAGIC: u64 = 0x434944525343414E; // "CIDRSCAN"
-const HEADER_VERSION: u16 = 1;
-
-/// Shared‑memory header (aligned to cache line)
-#[repr(C, align(64))]
-struct Header {
-    magic: u64,             // identifies valid CIDRScan header
-    version: u16,           // ABI version
-    _reserved: [u8; 6],     // padding to 16 bytes total
-    lock_init: AtomicU8,    // 0 = uninit, 1 = init (atomic process-local lock init flag)
-    lock: RawRwLock,        // cross-process RW-lock (defined below)
-    next_index: AtomicU32,  // bump allocator index for new allocations
-    free_slots: AtomicU32,  // incremented on delete, decremented on alloc from freelist
-    root_offset: AtomicU64, // atomic root pointer for lock‑free reads (ABA-safe)
-    capacity: usize,        // max nodes in arena
-    ref_count: AtomicUsize, // live-handle counter
-    init_flag: AtomicU32,   // 0 = un-initialised, 1 = ready
-}
-
-/// Node in the Patricia tree, each aligned to cache line
-#[repr(C, align(64))]
-struct Node {
-    key: u128,      // IPv4 in upper 96 bits zero, or full IPv6
-    prefix_len: u8, // valid bits in key
-    _pad: [u8; 3],  // padding to align next atomics (adjusted for AtomicU32)
-    /// ABA generation counter to prevent reuse hazards (see moodycamel.com/blog/2014/solving-the-aba-problem-for-lock-free-free-lists)
-    generation: AtomicU32, // ABA generation counter
-    is_terminal: AtomicU8, // 0 = not stored; 1 = stored
-    _pad2: [u8; 4], // padding to align next atomics
-    left: AtomicU64, // packed (offset, generation) to left child
-    right: AtomicU64, // packed (offset, generation) to right child
-    expires: AtomicU64, // Unix epoch seconds: TTL expiration
-    refcnt: AtomicU32, // ← NEW: how many identical prefixes are stored
-}
-
-pub struct PatriciaTree {
-    shmem: Shmem,         // The shared memory mapping
-    hdr: NonNull<Header>, // Pointer to header in shared memory
-    base: NonNull<u8>,    // Base pointer for node offsets
-    os_id: String,        // Track the shared memory name for Drop
-}
-
-// SAFETY: Even though PatriciaTree contains raw pointers (NonNull<u8>),
-// it's safe to send between threads because:
-// 1. The data it points to is in shared memory (Shmem)
-// 2. Access is properly synchronized through Mutex locks
-unsafe impl Send for PatriciaTree {}
-unsafe impl Sync for PatriciaTree {}
-
-// SAFETY: Even though PatriciaTree contains pointers to types with interior mutability (Mutex),
-// we explicitly guarantee that panic unwinding is safe because:
-// 1. We ensure proper cleanup and never leave the shared memory in a corrupted state during panics
-// 2. The raw pointers themselves are stable and safe even across unwinding boundaries
-impl std::panic::RefUnwindSafe for PatriciaTree {}
-impl std::panic::UnwindSafe for PatriciaTree {}
 
 impl PatriciaTree {
     /// Insert an IPv4 prefix (automatically maps the 32-bit address into the high 96 bits).
