@@ -15,6 +15,12 @@ dashmap = "6.1.0"
 crossbeam-epoch = "0.9.18"
 crossbeam-queue = "0.3.12"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.52.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.151"
+
 [dev-dependencies]
 proptest = "1"
 num_cpus = "1"
