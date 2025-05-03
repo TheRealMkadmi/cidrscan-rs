@@ -590,6 +590,7 @@ impl PatriciaTree {
         loop {
             // ① Try to reuse a freed slot first (cheap fast-path)
             if let Some(offset) = self.freelist.pop() {
+                hdr.free_slots.fetch_sub(1, Ordering::Release);
                 let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
                 let gen = unsafe {
                     let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -695,6 +696,8 @@ impl PatriciaTree {
         parent_link.store(child, Ordering::Release);
         // retire the old node offset
         let off_u32 = off as Offset;
+        let hdr_ref = unsafe { &*self.hdr.as_ptr() };
+        hdr_ref.free_slots.fetch_add(1, Ordering::Release);
         self.retire_offset(off_u32);
     }
 
