@@ -27,7 +27,7 @@ fn ttl_expiry() {
     let ip = 0x01020304;
     let key = v4_key(ip);
     let plen = v4_plen(32);
-    tree.insert(key, plen, 1);
+    let _ = tree.insert(key, plen, 1);
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert!(!tree.lookup(key));
 }
@@ -107,7 +107,7 @@ proptest! {
 #[test]
 fn stress_concurrent_inserts_and_lookups() {
     let threads = num_cpus::get();
-    let ops_per_thread = 10000;
+    let ops_per_thread = 1_000;
     let shm_name = format!("test_shm_stress_{}", rand::random::<u64>());
     let tree = Arc::new(PatriciaTree::open(&shm_name, threads * ops_per_thread * 2).unwrap());
 

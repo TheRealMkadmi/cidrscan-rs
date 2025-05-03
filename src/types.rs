@@ -6,6 +6,8 @@ use std::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize},
 };
 use shared_memory::Shmem;
+use crossbeam_queue::SegQueue;
+use std::sync::Arc;
 
 /// Error type for PatriciaTree operations.
 #[derive(Debug)]
@@ -58,6 +60,8 @@ pub struct PatriciaTree {
     pub hdr: NonNull<Header>, // Pointer to header in shared memory
     pub base: NonNull<u8>,    // Base pointer for node offsets
     pub os_id: String,        // Track the shared memory name for Drop
+    /// locally-owned queue of freed offsets
+    pub freelist: Arc<SegQueue<Offset>>,
 }
 
 // SAFETY: Even though PatriciaTree contains raw pointers (NonNull<u8>),

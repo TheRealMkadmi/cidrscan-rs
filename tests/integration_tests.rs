@@ -18,10 +18,10 @@ fn basic_insert_lookup_delete() {
     // initially not found
     assert!(!tree.lookup(key));
     // insert & lookup
-    tree.insert(key, 32, 60);
+    let _ = tree.insert(key, 32, 60);
     assert!(tree.lookup(key));
     // delete & re-check
-    tree.delete(key, 32);
+    let _ = tree.delete(key, 32);
     assert!(!tree.lookup(key));
 }
 
@@ -30,11 +30,11 @@ fn ttl_expiry_various() {
     let tree = PatriciaTree::open("test_ttl", 128).unwrap();
     let key1 = ipv4_to_u128(10, 0, 0, 1);
     // zero TTL → immediate expiry
-    tree.insert(key1, 32, 0);
+    let _ = tree.insert(key1, 32, 0);
     assert!(!tree.lookup(key1));
 
     let key2 = ipv4_to_u128(10, 0, 0, 2);
-    tree.insert(key2, 32, 1);
+    let _ = tree.insert(key2, 32, 1);
     assert!(tree.lookup(key2));
     thread::sleep(Duration::from_secs(2));
     assert!(!tree.lookup(key2));
@@ -55,7 +55,7 @@ fn ipv6_prefix_behavior() {
         1u128,
     ];
     let key = segments.iter().fold(0u128, |acc, &part| acc | part);
-    tree.insert(key, 64, 60);
+    let _ = tree.insert(key, 64, 60);
     assert!(tree.lookup(key));
 }
 
@@ -63,14 +63,14 @@ fn ipv6_prefix_behavior() {
 fn shared_memory_visibility_between_handles() {
     let tree1 = PatriciaTree::open("test_shared", 128).unwrap();
     let key = ipv4_to_u128(172, 16, 0, 1);
-    tree1.insert(key, 32, 60);
+    let _ = tree1.insert(key, 32, 60);
 
     // open a second handle on the same OS‐ID
     let tree2 = PatriciaTree::open("test_shared", 128).unwrap();
     assert!(tree2.lookup(key));
 
     // ensure delete in one handle is visible in the other
-    tree2.delete(key, 32);
+    let _ = tree2.delete(key, 32);
     assert!(!tree1.lookup(key));
 }
 
@@ -93,11 +93,11 @@ fn concurrent_threaded_inserts_and_lookups() {
                 let key = (t as u128) << 32 | i as u128;
                 // Call insert inside catch_unwind to prevent panics
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tr.insert(key, 64, 10);
+                    let _ = tr.insert(key, 64, 10);
                 }));
                 // Lookup might fail if insert failed; that's ok for this test's goal (no panics)
                 let _ = tr.lookup(key);
-                tr.delete(key, 64); // Delete should still work
+                let _ = tr.delete(key, 64); // Delete should still work
                 assert!(!tr.lookup(key), "delete failed for {:x}", key);
             }
         }));
@@ -119,7 +119,7 @@ fn stress_test_timing() {
     // tree.bulk_insert(&keys.iter().map(|&k| (k, 64, 3600)).collect::<Vec<_>>());
     // Fallback to individual inserts if bulk_insert is not available or problematic
     for &k in &keys {
-        tree.insert(k, 64, 3600); // Using prefix 64 and TTL 3600 as in original
+        let _ = tree.insert(k, 64, 3600); // Using prefix 64 and TTL 3600 as in original
     }
 
     // measure average lookup latency - keep this part for correctness check

@@ -71,8 +71,5 @@ pub fn map_error(e: &crate::types::Error) -> ErrorCode {
         ZeroCapacity => ErrorCode::ZeroCapacity,
         InvalidPrefix => ErrorCode::InvalidPrefix,
         BranchHasChildren => ErrorCode::BranchHasChildren,
-        InvalidHandle => ErrorCode::InvalidHandle,
-        Utf8Error => ErrorCode::Utf8Error,
-        _ => ErrorCode::Unknown,
     }
 }

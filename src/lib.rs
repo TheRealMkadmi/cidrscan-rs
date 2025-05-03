@@ -8,10 +8,11 @@ pub mod errors;
 use helpers::*;
 use constants::*;
 use types::*;
+use crossbeam_queue::SegQueue;
+use types::Offset;
 
 use crate::shmem_rwlock::RawRwLock;
 use crossbeam_epoch as epoch;
-use crossbeam_queue::SegQueue;
 use raw_sync::Timeout; // needed by API
 use shared_memory::{ShmemConf, ShmemError};
 use std::{
@@ -20,8 +21,8 @@ use std::{
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+use std::sync::Arc;
 
-static FREELIST: SegQueue<types::Offset> = SegQueue::new();
 
 
 #[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
@@ -45,7 +46,15 @@ const _: () = assert!(std::mem::align_of::<types::Node>() == constants::CACHE_LI
 
 
 
+#[allow(dead_code)]
 impl PatriciaTree {
+    /// Helper to retire an offset safely for epoch-based reclamation.
+    pub fn retire_offset(&self, off: Offset) {
+        let fl = self.freelist.clone();
+        epoch::pin().defer(move || {
+            fl.push(off);
+        });
+    }
     /// Insert an IPv4 prefix (automatically maps the 32-bit address into the high 96 bits).
     pub fn insert_v4(&self, addr: u32, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
         let key = v4_key(addr);
@@ -70,7 +79,7 @@ impl PatriciaTree {
     pub fn available_capacity(&self) -> usize {
         let hdr = unsafe { &*self.hdr.as_ptr() };
         let used = hdr.next_index.load(Ordering::Acquire) as usize;
-        let recycled = hdr.free_slots.load(Ordering::Acquire) as usize;
+        let recycled = self.freelist.len();
         hdr.capacity - used + recycled
     }
 
@@ -142,6 +151,7 @@ impl PatriciaTree {
             base,
             hdr,
             os_id: os_name.clone(),
+                            freelist: Arc::new(SegQueue::new()),
         })
     }
 
@@ -227,9 +237,7 @@ impl PatriciaTree {
                     // Retire the offset using epoch-based reclamation
                     let off = leaf_offset as Offset;
                     // No free_slots update needed here, as this is a failed allocation rollback
-                    epoch::pin().defer(move || {
-                        FREELIST.push(off);
-                    });
+                    self.retire_offset(off);
                     continue; // tail of the while loop
                 }
                 trace!("[INSERT] Finished Case 1.");
@@ -353,7 +361,7 @@ impl PatriciaTree {
                             return Err(Error::CapacityExceeded);
                         }
                         // Allocate internal node
-                        if let Some(offset) = FREELIST.pop() {
+                        if let Some(offset) = self.freelist.pop() {
                             trace!(
                                 "[ALLOC] Reusing freed node for internal at offset={}",
                                 offset
@@ -403,7 +411,7 @@ impl PatriciaTree {
                             internal_gen = 1;
                         }
                         // Allocate leaf node
-                        if let Some(offset) = FREELIST.pop() {
+                        if let Some(offset) = self.freelist.pop() {
                             trace!("[ALLOC] Reusing freed node for leaf at offset={}", offset);
                             let node_ptr =
                                 unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
@@ -432,9 +440,7 @@ impl PatriciaTree {
                                     // Retire the internal_offset using epoch-based reclamation
                                     let off = internal_offset;
                                     // No free_slots update needed here, as this is a failed allocation rollback
-                                    epoch::pin().defer(move || {
-                                        FREELIST.push(off);
-                                    });
+                                    self.retire_offset(off);
                                 }
                                 return Err(Error::CapacityExceeded);
                             }
@@ -502,14 +508,12 @@ impl PatriciaTree {
                             let free_slots_offset =
                                 (&(*self.hdr.as_ptr()).free_slots as *const AtomicU32 as usize)
                                     - base_addr;
-                            epoch::pin().defer(move || {
-                                FREELIST.push(int_off);
-                                FREELIST.push(leaf_off);
-                                // counter and queue stay consistent
-                                let free_slots_ptr =
-                                    (base_addr + free_slots_offset) as *const AtomicU32;
-                                (*free_slots_ptr).fetch_add(2, Ordering::Release);
-                            });
+                            self.retire_offset(int_off);
+                            self.retire_offset(leaf_off);
+                            // counter and queue stay consistent
+                            let free_slots_ptr =
+                                (base_addr + free_slots_offset) as *const AtomicU32;
+                            (*free_slots_ptr).fetch_add(2, Ordering::Release);
                             continue;
                         }
                     }
@@ -585,7 +589,7 @@ impl PatriciaTree {
         let node_size = size_of::<Node>() as Offset;
         loop {
             // ① Try to reuse a freed slot first (cheap fast-path)
-            if let Some(offset) = FREELIST.pop() {
+            if let Some(offset) = self.freelist.pop() {
                 let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
                 let gen = unsafe {
                     let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -625,7 +629,7 @@ impl PatriciaTree {
                 return Err(Error::CapacityExceeded);
             }
             epoch::pin().flush();
-            if let Some(offset) = FREELIST.pop() {
+            if let Some(offset) = self.freelist.pop() {
                 hdr.free_slots.fetch_sub(1, Ordering::Release);
                 let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
                 let gen = unsafe {
@@ -691,9 +695,7 @@ impl PatriciaTree {
         parent_link.store(child, Ordering::Release);
         // retire the old node offset
         let off_u32 = off as Offset;
-        epoch::pin().defer(move || {
-            FREELIST.push(off_u32);
-        });
+        self.retire_offset(off_u32);
     }
 
     /// Lookup a key; true if found and not expired (Revised for Patricia structure)
@@ -811,7 +813,7 @@ impl PatriciaTree {
                         node.is_terminal.store(0, Ordering::Release);
                         let off = current_offset as Offset;
                         hdr.free_slots.fetch_add(1, Ordering::Release);
-                        epoch::pin().defer(move || FREELIST.push(off));
+                        self.retire_offset(off);
                     } else {
                         // still has children → keep node, just clear flag
                         node.is_terminal.store(0, Ordering::Release);
@@ -937,7 +939,7 @@ impl PatriciaTree {
         let off = offset as Offset;
         let hdr = unsafe { &*self.hdr.as_ptr() };
         hdr.free_slots.fetch_add(1, Ordering::Release);
-        epoch::pin().defer(move || FREELIST.push(off));
+        self.retire_offset(off);
     }
     /// Explicitly destroy the shared memory segment and unlink it.
     /// After calling this, the handle must not be used again.
