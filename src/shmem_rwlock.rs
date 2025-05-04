@@ -234,11 +234,11 @@ impl RawRwLock {
             let e_handle = RawEvent::from_existing(self.event_ptr()).unwrap().0;
             // Acquire OS mutex using cached handle
             let guard = self.mutex().lock().expect("mutex lock failed");
-            // 1. advertise writer first
-            let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
-            // 2. clear manual-reset event
+            // 1. clear any prior event signals _before_ announcing the writer
             e_handle.set(raw_sync::events::EventState::Clear).unwrap();
-            // 3. wait for readers to drain
+            // 2. advertise writer (blocks new readers)
+            let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+            // 3. if there are in-flight readers, wait until the last one signals
             if prev != 0 {
                 e_handle.wait(Timeout::Infinite).unwrap();
                 while self.readers.load(Ordering::Acquire) != WRITER_BIT {
