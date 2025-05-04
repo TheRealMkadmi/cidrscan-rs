@@ -22,21 +22,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH, Duration},
 };
 use std::sync::Arc;
+use log::{trace, debug, info, warn, error};
+use once_cell::sync::OnceCell;
 
 
 
 #[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
 pub use crate::platform::windows::enable_se_create_global_privilege;
 
-/// Print only if the "trace" feature is enabled.
-#[macro_export]
-macro_rules! trace {
-    ($($t:tt)*) => {
-        if cfg!(feature = "trace") {
-            println!($($t)*);
-        }
-    }
-}
 
 // ===== Compile-time assertions for alignment and size =====
 const HEADER_PADDED: usize = helpers::align_up(std::mem::size_of::<types::Header>(), constants::CACHE_LINE);
@@ -48,6 +41,18 @@ const _: () = assert!(std::mem::align_of::<types::Node>() == constants::CACHE_LI
 
 #[allow(dead_code)]
 impl PatriciaTree {
+    // ---- logging bootstraper -------------------------------------------------
+    fn ensure_logging() {
+        static INIT: OnceCell<()> = OnceCell::new();
+        INIT.get_or_init(|| {
+            // Fallback: simple env_logger with RFC‑3339 ts off.
+            let _ = env_logger::builder()
+                .format_timestamp(None)
+                .is_test(std::env::var("RUST_TEST_THREADS").is_ok())
+                .try_init();
+        });
+    }
+
     /// Helper to retire an offset safely for epoch-based reclamation.
     pub fn retire_offset(&self, off: Offset) {
         let fl = self.freelist.clone();
@@ -85,6 +90,7 @@ impl PatriciaTree {
 
     /// Create or open a shared‑memory tree
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
+        Self::ensure_logging();
         let hash = fnv1a_64(name);
         let os_name = format!("{PREFIX}{:016x}", hash);
         let region_size = HEADER_PADDED + capacity * size_of::<Node>();
@@ -723,7 +729,9 @@ impl PatriciaTree {
     /// Lookup a key; true if found and not expired (Revised for Patricia structure)
     pub fn lookup(&self, key: u128) -> bool {
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        let mut link = hdr.root_offset.load(Ordering::Acquire);
+        let mut link          = hdr.root_offset.load(Ordering::Acquire);
+        let mut parent_link   = &hdr.root_offset as *const AtomicU64; // track parent
+        let mut parent_plen   = 0u8;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -738,6 +746,10 @@ impl PatriciaTree {
                 link = hdr.root_offset.load(Ordering::Acquire);
                 continue;
             }
+            // -------- opportunistic prune on the *node we just left* ----------
+            // Parent plen is the prefix length we used to decide the branch.
+            self.try_prune(unsafe { &*parent_link }, parent_plen);
+
             // Work with the masked (canonical) value for CPL and equality
             let canon = canonical(key, node.prefix_len);
             let cpl   = common_prefix_len(canon, node.key, node.prefix_len);
@@ -795,6 +807,13 @@ impl PatriciaTree {
                     continue;
                 }
             }
+            parent_plen = node.prefix_len;
+            parent_link = if next_bit == 0 {
+                &node.left as *const AtomicU64
+            } else {
+                &node.right as *const AtomicU64
+            };
+
             link = child_link;
         }
         false
@@ -1002,6 +1021,57 @@ impl PatriciaTree {
         // Drop will run, which will call platform_drop and unmap the segment.
         // This method exists for explicitness in FFI.
         // No-op body: Drop does the work.
+    }
+    /// Atomically grow the arena.  Returns *new* tree – caller swaps Arc/Box.
+    /// Strategy: 1) open bigger mapping  2) DFS copy live prefixes
+    pub fn resize(&self, new_capacity: usize) -> Result<PatriciaTree, Error> {
+        if new_capacity <= unsafe { &*self.hdr.as_ptr() }.capacity {
+            return Err(Error::InvalidPrefix); // pigment‑reuse for “capacity too small”
+        }
+
+        // 1. create bigger tree with unique name (reuse original name + ".next")
+        let next_name = format!("{}_next{}", self.os_id, std::process::id());
+        let next = PatriciaTree::open(&next_name, new_capacity)
+            .map_err(|_| Error::CapacityExceeded)?; // reuse existing error enum
+
+        // 2. DFS copy – iterative to avoid recursion depth
+        let mut stack = Vec::with_capacity(64);
+        let root_packed = unsafe { &*self.hdr.as_ptr() }.root_offset.load(Ordering::Acquire);
+        if root_packed != 0 {
+            stack.push(root_packed);
+        }
+        let mut copied = 0;
+        while let Some(packed) = stack.pop() {
+            let (off, _) = unpack(packed);
+            let node = self.node(off as u64);
+            if node.is_terminal.load(Ordering::Acquire) == 1
+                && node.refcnt.load(Ordering::Acquire) > 0
+            {
+                let ttl = node
+                    .expires
+                    .load(Ordering::Acquire)
+                    .saturating_sub(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs(),
+                    );
+                // ttl==0 means “no expiry”
+                next.insert(node.key, node.prefix_len, ttl)?;
+                copied += 1;
+            }
+            // push children
+            let l = node.left.load(Ordering::Acquire);
+            let r = node.right.load(Ordering::Acquire);
+            if l != 0 {
+                stack.push(l);
+            }
+            if r != 0 {
+                stack.push(r);
+            }
+        }
+        info!("resize: copied {} live prefixes into new arena", copied);
+        Ok(next) // caller drops the old tree when convenient
     }
 } // end impl PatriciaTree
 

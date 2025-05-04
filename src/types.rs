@@ -60,8 +60,7 @@ pub struct PatriciaTree {
     pub hdr: NonNull<Header>, // Pointer to header in shared memory
     pub base: NonNull<u8>,    // Base pointer for node offsets
     pub os_id: String,        // Track the shared memory name for Drop
-    /// locally-owned queue of freed offsets
-    pub freelist: Arc<SegQueue<Offset>>,
+    pub freelist: Arc<SegQueue<Offset>>, // locally-owned queue of freed offsets
 }
 
 // SAFETY: Even though PatriciaTree contains raw pointers (NonNull<u8>),
