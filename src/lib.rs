@@ -146,15 +146,14 @@ impl PatriciaTree {
         if prev == 0 {
             // first opener in this process: initialise the bytes
             unsafe {
-                RawRwLock::init(&mut (*hdr_ptr).lock as *mut _ as *mut u8, Timeout::Infinite)
-                    .expect("RawRwLock::init failed");
+                RawRwLock::new_in_place((&mut hdr_mut.lock).as_mut_ptr())
+                    .expect("RawRwLock::new_in_place failed");
             }
         } else {
             // subsequent opens: attach to existing lock state
             unsafe {
-                RawRwLock::reopen_in_place(&mut (*hdr_mut).lock)
-                    .or_else(|_| RawRwLock::new_in_place(&mut (*hdr_mut).lock))
-                    .expect("RawRwLock reopen OR init failed");
+                RawRwLock::reopen_in_place((&mut hdr_mut.lock).as_mut_ptr())
+                    .expect("RawRwLock reopen failed");
             }
         }
         let hdr_ref = unsafe { &*hdr_ptr };
@@ -200,7 +199,7 @@ impl PatriciaTree {
             return Err(Error::ZeroCapacity);
         }
         // Acquire write lock using guard
-        let _write_guard = hdr.lock.write_lock();
+        let _write_guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
         trace!(
             "[INSERT] Lock acquired. Current next_index={}",
             hdr.next_index.load(Ordering::Relaxed)
@@ -777,8 +776,7 @@ impl PatriciaTree {
                 {
                     // ─── PATCH 3: opportunistic GC of dead leaves ───
                     if exp < now {
-                        if let Some(_g) =
-                              hdr.lock.try_write_lock(Timeout::Val(Duration::from_secs(0))) {
+                        if let Some(_g) = unsafe { hdr.lock.assume_init_ref().try_write_lock(Timeout::Val(Duration::from_secs(0))) } {
                             // double‑check under lock
                             if node.expires.load(Ordering::Acquire) < now {
                                 node.is_terminal.store(0, Ordering::Release);
@@ -833,7 +831,7 @@ impl PatriciaTree {
         trace!("[DELETE] key={:x}, prefix_len={}", key, prefix_len);
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
-        let _write_guard = hdr.lock.write_lock();
+        let _write_guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
         trace!("[DELETE] Lock acquired.");
 
         // Store canonical key
@@ -958,7 +956,7 @@ impl PatriciaTree {
         trace!("[CLEAR] Clearing tree.");
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
-        let _write_guard = hdr.lock.write_lock();
+        let _write_guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
         trace!("[CLEAR] Lock acquired.");
 
         // Reset root and allocator state
@@ -1041,7 +1039,7 @@ impl PatriciaTree {
         }
 
         // ---- exclusive lock: no mutators, look‑ups keep running ----------
-        let _guard = hdr.lock.write_lock();
+        let _guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
 
         // ---- build a bigger mapping next to the old one -------------------
         let next_name = format!("{}_next{}", self.os_id, std::process::id());

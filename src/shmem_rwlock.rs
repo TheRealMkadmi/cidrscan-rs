@@ -10,19 +10,16 @@ use raw_sync::Timeout;
 use core::marker::PhantomData;
 use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 
-const MUTEX_BUF_SIZE: usize = core::mem::size_of::<RawMutex>();
-const EVENT_BUF_SIZE: usize = core::mem::size_of::<RawEvent>();
 const _: () = {
     assert!(core::mem::size_of::<RawRwLock>() % core::mem::align_of::<RawRwLock>() == 0);
 };
 
+
 /// Our shared-memory lock layout: [mutex-bytes][event-bytes][reader_count]
-#[repr(C, align(8))]
+#[repr(C)]
 pub struct RawRwLock {
-    /// writer-gate storage buffer
-    mutex_buf: [u8; MUTEX_BUF_SIZE],
-    /// event storage buffer
-    event_buf: [u8; EVENT_BUF_SIZE],
+    mutex_buf: Box<[u8]>,
+    event_buf: Box<[u8]>,
     /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
     /// OS mutex handle (lives as long as RawRwLock)
@@ -38,6 +35,9 @@ pub struct RawRwLock {
 // where it's managed within a single process (e.g., via Arc).
 unsafe impl Send for RawRwLock {}
 unsafe impl Sync for RawRwLock {}
+
+const WRITER_BIT: u32 = 0x8000_0000;
+const READER_MASK: u32 = WRITER_BIT - 1; // 0x7FFF_FFFF
 
 impl RawRwLock {
     #[inline(always)]
@@ -55,62 +55,55 @@ impl RawRwLock {
             .expect("event_handle not initialized")
             .as_ref()
     }
-    /// Helper to get a mutable pointer to the mutex buffer.
-    #[inline(always)]
-    fn mutex_ptr(&self) -> *mut u8 {
-        ptr::addr_of!(self.mutex_buf) as *mut u8
+
+    /// Safe, cross-platform constructor.
+    /// Allocates the backing buffers and initializes the OS handles.
+    pub fn new() -> Box<Self> {
+        let msz = RawMutex::size_of(None);
+        let esz = RawEvent::size_of(None);
+
+        let mut lock = Box::new(Self {
+            mutex_buf: vec![0u8; msz].into_boxed_slice(),
+            event_buf: vec![0u8; esz].into_boxed_slice(),
+            readers: AtomicU32::new(0),
+            mutex_handle: None,
+            event_handle: None,
+            _marker: PhantomData,
+        });
+
+        // SAFETY: buffers are aligned + non-null
+        unsafe {
+            let (m, _) = RawMutex::new(lock.mutex_buf.as_mut_ptr(), ptr::null_mut()).unwrap();
+            let (e, _) = RawEvent::new(lock.event_buf.as_mut_ptr(), true).unwrap();
+            lock.mutex_handle = Some(m);
+            lock.event_handle = Some(e);
+        }
+        lock
     }
 
-    /// Helper to get a mutable pointer to the event buffer.
-    #[inline(always)]
-    fn event_ptr(&self) -> *mut u8 {
-        ptr::addr_of!(self.event_buf) as *mut u8
-    }
-
-    /// Initialize the lock structure in-place using field addresses.
-    /// Returns Ok(()) on success, or an Error if initialization fails.
-    ///
-    /// Safety: ptr must be valid for writes, properly aligned (align(8)),
-    /// and point to zeroed memory.
+    /// In-place initialization for shared memory usage.
+    /// # Safety
+    /// - `ptr` must be valid, properly aligned, and point to zeroed memory.
     pub unsafe fn new_in_place(ptr: *mut RawRwLock) -> Result<(), Box<dyn std::error::Error>> {
-        // Ensure the provided pointer is not null
-        if ptr.is_null() {
-            return Err("Null pointer passed to new_in_place".into());
-        }
-        // Ensure the pointer is properly aligned for RawRwLock
-        if (ptr as usize) % core::mem::align_of::<RawRwLock>() != 0 {
-            return Err("RawRwLock pointer is not properly aligned".into());
-        }
-
-        let readers_ptr = ptr::addr_of_mut!((*ptr).readers);
-
-        // Initialize mutex and event handles in their buffers
         let this = &mut *ptr;
-        let (mutex, _) = RawMutex::new(this.mutex_ptr(), ptr::null_mut())?;
-        let (event, _) = RawEvent::new(this.event_ptr(), true)?;
-        this.mutex_handle = Some(mutex);
-        this.event_handle = Some(event);
+        let msz = RawMutex::size_of(None);
+        let esz = RawEvent::size_of(None);
 
-        // Initialize readers field directly
-        readers_ptr.write(AtomicU32::new(0));
+        // Allocate backing storage for mutex and event buffers in place
+        // (Assume the struct's fields are already zeroed, but we must replace the Box<[u8]> fields)
+        this.mutex_buf = vec![0u8; msz].into_boxed_slice();
+        this.event_buf = vec![0u8; esz].into_boxed_slice();
+        this.readers = AtomicU32::new(0);
+        this.mutex_handle = None;
+        this.event_handle = None;
 
-        Ok(()) // Indicate success
-    }
+        // SAFETY: buffers are aligned + non-null
+        let (m, _) = RawMutex::new(this.mutex_buf.as_mut_ptr(), ptr::null_mut())?;
+        let (e, _) = RawEvent::new(this.event_buf.as_mut_ptr(), true)?;
+        this.mutex_handle = Some(m);
+        this.event_handle = Some(e);
 
-    /// Initialize the lock structure from a raw byte pointer.
-    /// This is intended for initialization within a larger struct like Header.
-    ///
-    /// Safety: ptr must point to the beginning of a memory region
-    /// suitable for a RawRwLock, be valid for writes, properly aligned (align(8)),
-    /// and point to zeroed memory. The timeout parameter is currently ignored
-    /// but kept for potential future compatibility or API consistency.
-    pub unsafe fn init(ptr: *mut u8, _timeout: Timeout) -> Result<(), Box<dyn std::error::Error>> {
-        // Cast the byte pointer to the specific lock type pointer.
-        // This assumes the caller provides the correct starting address.
-        let lock_ptr = ptr as *mut RawRwLock;
-        // Call the in-place initializer.
-        // Assuming the caller zeroed the memory.
-        Self::new_in_place(lock_ptr)
+        Ok(())
     }
 
     /// Re-open an existing lock in shared memory using field addresses.
@@ -125,69 +118,19 @@ impl RawRwLock {
 
         // Reopen mutex and event handles in their buffers
         let this = &mut *ptr;
-        let (mutex, _) = RawMutex::from_existing(this.mutex_ptr(), ptr::null_mut())
+        let mptr = this.mutex_buf.as_mut_ptr() as *mut u8;
+        let eptr = this.event_buf.as_mut_ptr() as *mut u8;
+        let (mutex, _) = RawMutex::from_existing(mptr, ptr::null_mut())
             .map_err(|e| format!("re-open mutex failed: {e}"))?;
-        let (event, _) = RawEvent::from_existing(this.event_ptr())
-            .map_err(|e| format!("re-open event failed: {e}"))?;
+        let (event, _) =
+            RawEvent::from_existing(eptr).map_err(|e| format!("re-open event failed: {e}"))?;
         this.mutex_handle = Some(mutex);
         this.event_handle = Some(event);
 
         Ok(()) // Indicate success
     }
     // Readers field state is preserved.
-    /// Allocate and initialize a RawRwLock on the heap with correct alignment.
-    /// Returns a boxed, zero-initialized, and fully constructed RawRwLock.
-    pub fn boxed() -> Box<RawRwLock> {
-        let layout = Layout::new::<RawRwLock>();
-        unsafe {
-            let ptr = alloc_zeroed(layout) as *mut RawRwLock;
-            if ptr.is_null() {
-                handle_alloc_error(layout);
-            }
-            RawRwLock::new_in_place(ptr).unwrap();
-            Box::from_raw(ptr)
-        }
-    }
-}
-/// Represents an acquired exclusive (write) lock.
-/// The lock is released when this guard is dropped.
-#[must_use = "if unused the lock will immediately unlock"]
-pub struct WriteGuard<'a> {
-    lock: &'a RawRwLock,
-    _guard: raw_sync::locks::LockGuard<'a>,
-}
 
-impl<'a> Drop for WriteGuard<'a> {
-    fn drop(&mut self) {
-        // allow readers again (writer flag → 0, counter already 0)
-        self.lock.readers.store(0, Ordering::Release);
-        // wake up any blocked readers
-        self.lock
-            .event()
-            .set(raw_sync::events::EventState::Signaled)
-            .unwrap();
-        // _guard drop here → OS mutex unlocked by LockGuard drop
-        // handle is dropped here, keeping trait object alive for guard's lifetime
-    }
-}
-
-/// Represents an acquired shared (read) lock.
-/// The lock is released when this guard is dropped.
-#[must_use = "if unused the lock will immediately unlock"]
-pub struct ReadGuard<'a> {
-    lock: &'a RawRwLock,
-}
-
-impl<'a> Drop for ReadGuard<'a> {
-    fn drop(&mut self) {
-        self.lock.read_unlock();
-    }
-}
-
-const WRITER_BIT: u32 = 0x8000_0000;
-const READER_MASK: u32 = WRITER_BIT - 1; // 0x7FFF_FFFF
-
-impl RawRwLock {
     /// Acquire a **shared** (read) lock.
     /// Spins only if a writer holds the lock or is waiting.
     /// Returns a guard that releases the lock when dropped.
@@ -229,26 +172,23 @@ impl RawRwLock {
     /// Blocks new readers and waits for in-flight readers to drain.
     /// Returns a guard that releases the lock when dropped.
     pub fn write_lock(&self) -> WriteGuard<'_> {
-        unsafe {
-            // Use cached handles for this lock
-            let e_handle = RawEvent::from_existing(self.event_ptr()).unwrap().0;
-            // Acquire OS mutex using cached handle
-            let guard = self.mutex().lock().expect("mutex lock failed");
-            // 1. clear any prior event signals _before_ announcing the writer
-            e_handle.set(raw_sync::events::EventState::Clear).unwrap();
-            // 2. advertise writer (blocks new readers)
-            let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
-            // 3. if there are in-flight readers, wait until the last one signals
-            if prev != 0 {
-                e_handle.wait(Timeout::Infinite).unwrap();
-                while self.readers.load(Ordering::Acquire) != WRITER_BIT {
-                    core::hint::spin_loop();
-                }
+        // Acquire OS mutex using cached handle
+        let guard = self.mutex().lock().expect("mutex lock failed");
+        // 1. clear any prior event signals _before_ announcing the writer
+        let evt = self.event();
+        evt.set(raw_sync::events::EventState::Clear).unwrap();
+        // 2. advertise writer (blocks new readers)
+        let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+        // 3. if there are in-flight readers, wait until the last one signals
+        if prev != 0 {
+            evt.wait(Timeout::Infinite).unwrap();
+            while self.readers.load(Ordering::Acquire) != WRITER_BIT {
+                core::hint::spin_loop();
             }
-            WriteGuard {
-                lock: self,
-                _guard: guard,
-            }
+        }
+        WriteGuard {
+            lock: self,
+            _guard: guard,
         }
     }
 
@@ -269,5 +209,39 @@ impl RawRwLock {
             lock: self,
             _guard: guard,
         })
+    }
+}
+/// Represents an acquired exclusive (write) lock.
+/// The lock is released when this guard is dropped.
+#[must_use = "if unused the lock will immediately unlock"]
+pub struct WriteGuard<'a> {
+    lock: &'a RawRwLock,
+    _guard: raw_sync::locks::LockGuard<'a>,
+}
+
+impl<'a> Drop for WriteGuard<'a> {
+    fn drop(&mut self) {
+        // allow readers again (writer flag → 0, counter already 0)
+        self.lock.readers.store(0, Ordering::Release);
+        // wake up any blocked readers
+        self.lock
+            .event()
+            .set(raw_sync::events::EventState::Signaled)
+            .unwrap();
+        // _guard drop here → OS mutex unlocked by LockGuard drop
+        // handle is dropped here, keeping trait object alive for guard's lifetime
+    }
+}
+
+/// Represents an acquired shared (read) lock.
+/// The lock is released when this guard is dropped.
+#[must_use = "if unused the lock will immediately unlock"]
+pub struct ReadGuard<'a> {
+    lock: &'a RawRwLock,
+}
+
+impl<'a> Drop for ReadGuard<'a> {
+    fn drop(&mut self) {
+        self.lock.read_unlock();
     }
 }

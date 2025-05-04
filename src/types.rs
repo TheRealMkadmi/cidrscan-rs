@@ -1,10 +1,13 @@
 //! Data structures for Patricia tree
 
 use crate::shmem_rwlock::RawRwLock;
+use std::mem::MaybeUninit;
+
 use std::{
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize},
 };
+
 use shared_memory::Shmem;
 use crossbeam_queue::SegQueue;
 use std::sync::Arc;
@@ -29,7 +32,7 @@ pub struct Header {
     pub version: u16,           // ABI version
     pub _reserved: [u8; 6],     // padding to 16 bytes total
     pub lock_init: AtomicU8,    // 0 = uninit, 1 = init (atomic process-local lock init flag)
-    pub lock: RawRwLock,        // cross-process RW-lock (defined below)
+    pub lock: MaybeUninit<RawRwLock>, // cross-process RW-lock (initialized in place)
     pub next_index: AtomicU32,  // bump allocator index for new allocations
     pub free_slots: AtomicU32,  // incremented on delete, decremented on alloc from freelist
     pub root_offset: AtomicU64, // atomic root pointer for lock‑free reads (ABA-safe)
