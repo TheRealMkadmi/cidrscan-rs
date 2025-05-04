@@ -22,6 +22,40 @@ A high-performance, cross-process, lock-free-read, memory-resident Patricia (rad
 11. [Testing & Extensibility](#testing--extensibility)
 
 ---
+## Recent Enhancements (May 2025)
+
+### Opportunistic Pruning on Lookup
+- The Patricia tree now performs opportunistic pruning during every lookup. As the tree is traversed, any non-terminal node with only one live child is pruned inline, keeping the tree compact with minimal overhead.
+
+### Structured Logging
+- The library now uses the standard [`log`](https://docs.rs/log) facade for all internal logging. By default, `env_logger` is auto-initialized (unless another logger is already set), so log messages go to stdout. You can override this by initializing your own logger (e.g., with `tracing_subscriber`) before calling `PatriciaTree::open`.
+
+### Atomic Resize
+- A new method, `PatriciaTree::resize(new_capacity)`, allows atomic resizing of the tree. This creates a new, larger mapping, bulk-copies all live prefixes, and returns a new `PatriciaTree`. The caller can atomically swap the handle (e.g., with `ArcSwap`), and the old tree is dropped asynchronously.
+
+### Dependency Updates
+- Added dependencies: `log`, `env_logger`, and `once_cell` for logging and initialization.
+
+#### Example Usage
+
+```rust
+// 0) existing tree
+let tree = PatriciaTree::open("cidr_prod",  1_000_000)?;
+
+// 1) opportunistic prune now happens automatically on every lookup()
+
+// 2) logging – if you want Laravel’s stack:
+tracing_subscriber::registry()
+    .with(tracing_subscriber::fmt::layer())
+    .init();     // do this *before* first PatriciaTree::open
+
+// 3) atomic resize
+let bigger = tree.resize(2_000_000)?;
+LET_ARC_SWAP.store(Arc::new(bigger));   // one pointer write → all threads see the new map
+```
+
+---
+---
 
 ## Introduction & Motivation
 
