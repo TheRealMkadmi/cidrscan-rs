@@ -161,6 +161,10 @@ impl PatriciaTree {
         hdr_ref
             .ref_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        // -------- ❶  startup epoch flush – reclaims slots of dead processes --
+        epoch::pin().flush();
+
         Ok(Self {
             shmem,
             base,
@@ -168,6 +172,15 @@ impl PatriciaTree {
             os_id: os_name.clone(),
             freelist: Arc::new(SegQueue::new()),
         })
+    }
+
+    // ------------------------------------------------------------------- //
+    // ❷  Manual flush for ops – call from a cron job or admin endpoint
+    // ------------------------------------------------------------------- //
+    /// Execute pending epoch callbacks *now* and push recycled offsets
+    /// into the freelist.  Cheap (< 1 µs) and wait‑free for other threads.
+    pub fn flush(&self) {
+        epoch::pin().flush();
     }
 
     /// Insert a key with a given prefix length and TTL
@@ -639,15 +652,13 @@ impl PatriciaTree {
                 return Ok((offset, 1));
             }
             // === PATCH 4: Race-free next_index rollback (CAS loop) ===
-            // Only the thread that over-allocated should decrement next_index
+            // ─── PATCH 4: only the thread that over‑allocated rolls back ───
             loop {
                 let cur = hdr.next_index.load(Ordering::SeqCst);
-                if cur == 0 {
-                    break;
-                }
-                if hdr.next_index.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                    break;
-                }
+                if cur == 0 { break; }
+                if hdr.next_index
+                      .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                      .is_ok() { break; }
             }
 
             // ③ Arena full – try once to flush deferred frees
@@ -764,22 +775,20 @@ impl PatriciaTree {
                     && node.refcnt.load(Ordering::Acquire) > 0
                     && canon == node.key
                 {
-                    // === PATCH 3: Lazy sweep of expired nodes ===
+                    // ─── PATCH 3: opportunistic GC of dead leaves ───
                     if exp < now {
-                        // Try to acquire write lock and delete the node in place
-                        if let Some(_guard) = hdr.lock.try_write_lock(Timeout::Val(Duration::from_secs(0))) {
-                            // Double-check expiration under lock
-                            let exp2 = node.expires.load(Ordering::Acquire);
-                            if exp2 < now && node.is_terminal.load(Ordering::Acquire) == 1 {
+                        if let Some(_g) =
+                              hdr.lock.try_write_lock(Timeout::Val(Duration::from_secs(0))) {
+                            // double‑check under lock
+                            if node.expires.load(Ordering::Acquire) < now {
                                 node.is_terminal.store(0, Ordering::Release);
                                 node.refcnt.store(0, Ordering::Release);
                                 hdr.free_slots.fetch_add(1, Ordering::Release);
-                                // Retire node (deferred free)
-                                let off = (node as *const Node as usize - self.base.as_ptr() as usize) as Offset;
+                                let off = (node as *const _ as usize
+                                              - self.base.as_ptr() as usize) as Offset;
                                 self.retire_offset(off);
                             }
                         }
-                        // After sweep, restart from root
                         link = hdr.root_offset.load(Ordering::Acquire);
                         continue;
                     }
@@ -799,10 +808,10 @@ impl PatriciaTree {
                 node.right.load(Ordering::Acquire)
             };
 
-            // === PATCH 2: Extra ABA check on child pointer ===
+            // ─── PATCH 2: detect ABA on the child itself ───
             if let Some((child_node, child_gen)) = self.follow(child_link) {
                 if child_gen != child_node.generation.load(Ordering::Acquire) {
-                    // ABA detected on child: restart from root
+                    // Stale pointer – restart from root
                     link = hdr.root_offset.load(Ordering::Acquire);
                     continue;
                 }
@@ -1022,25 +1031,29 @@ impl PatriciaTree {
         // This method exists for explicitness in FFI.
         // No-op body: Drop does the work.
     }
-    /// Atomically grow the arena.  Returns *new* tree – caller swaps Arc/Box.
-    /// Strategy: 1) open bigger mapping  2) DFS copy live prefixes
-    pub fn resize(&self, new_capacity: usize) -> Result<PatriciaTree, Error> {
-        if new_capacity <= unsafe { &*self.hdr.as_ptr() }.capacity {
-            return Err(Error::InvalidPrefix); // pigment‑reuse for “capacity too small”
+    /// Grow the arena *in place*.  All threads in this process keep using the
+    /// same `PatriciaTree` handle; other processes reopen when convenient.
+    /// Blocks writers via the global RW‑lock while copying.
+    pub fn resize(&mut self, new_capacity: usize) -> Result<(), Error> {
+        let hdr = unsafe { &*self.hdr.as_ptr() };
+        if new_capacity <= hdr.capacity {
+            return Err(Error::InvalidPrefix); // “too small”
         }
 
-        // 1. create bigger tree with unique name (reuse original name + ".next")
+        // ---- exclusive lock: no mutators, look‑ups keep running ----------
+        let _guard = hdr.lock.write_lock();
+
+        // ---- build a bigger mapping next to the old one -------------------
         let next_name = format!("{}_next{}", self.os_id, std::process::id());
-        let next = PatriciaTree::open(&next_name, new_capacity)
-            .map_err(|_| Error::CapacityExceeded)?; // reuse existing error enum
+        let mut next = PatriciaTree::open(&next_name, new_capacity)
+            .map_err(|_| Error::CapacityExceeded)?;
 
-        // 2. DFS copy – iterative to avoid recursion depth
+        // ---- DFS copy live prefixes --------------------------------------
         let mut stack = Vec::with_capacity(64);
-        let root_packed = unsafe { &*self.hdr.as_ptr() }.root_offset.load(Ordering::Acquire);
-        if root_packed != 0 {
-            stack.push(root_packed);
+        let root = hdr.root_offset.load(Ordering::Acquire);
+        if root != 0 {
+            stack.push(root);
         }
-        let mut copied = 0;
         while let Some(packed) = stack.pop() {
             let (off, _) = unpack(packed);
             let node = self.node(off as u64);
@@ -1056,11 +1069,8 @@ impl PatriciaTree {
                             .unwrap()
                             .as_secs(),
                     );
-                // ttl==0 means “no expiry”
                 next.insert(node.key, node.prefix_len, ttl)?;
-                copied += 1;
             }
-            // push children
             let l = node.left.load(Ordering::Acquire);
             let r = node.right.load(Ordering::Acquire);
             if l != 0 {
@@ -1070,8 +1080,18 @@ impl PatriciaTree {
                 stack.push(r);
             }
         }
-        info!("resize: copied {} live prefixes into new arena", copied);
-        Ok(next) // caller drops the old tree when convenient
+
+        // ---- swap internal handles ---------------------------------------
+        // SAFETY: we hold the write‑lock, so no other thread can access
+        // `self` mutably while the swap happens.
+        unsafe {
+            std::ptr::swap(&mut self.shmem, &mut next.shmem);
+            std::ptr::swap(&mut self.base,  &mut next.base);
+            std::ptr::swap(&mut self.hdr,   &mut next.hdr);
+            std::ptr::swap(&mut self.os_id, &mut next.os_id);
+        }
+        // `next` now owns the *old* mapping and will unmap it on drop.
+        Ok(())
     }
 } // end impl PatriciaTree
 
