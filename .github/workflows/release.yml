@@ -3,6 +3,8 @@ name: Build and Release Libraries
 on:
   push:
     branches: [main]
+    tags:
+      - 'v*'
   pull_request:
     branches: [main]
     paths-ignore: [.github/workflows/release.yml]
