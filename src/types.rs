@@ -19,6 +19,8 @@ pub enum Error {
     ZeroCapacity,
     InvalidPrefix,
     BranchHasChildren,
+    /// Failed to open or initialise the in‑place RW‑lock.
+    LockInitFailed,
     // ... (extend as needed)
 }
 

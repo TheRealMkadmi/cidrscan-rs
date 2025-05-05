@@ -4,6 +4,18 @@ pub mod types;
 pub mod shmem_rwlock;
 pub mod platform;
 pub mod errors;
+pub mod telemetry;
+
+// Install metrics recorder when the crate is loaded
+#[doc(hidden)]
+#[inline(always)]
+fn _telemetry_bootstrap() {
+    telemetry::init();
+}
+
+// NB: reference forces the function to run during `.so` load
+#[used]
+static _BOOTSTRAP: fn() = _telemetry_bootstrap;
 
 use helpers::*;
 use constants::*;
@@ -24,6 +36,7 @@ use std::{
 use std::sync::Arc;
 use log::{trace, debug, info, warn, error};
 use once_cell::sync::OnceCell;
+use metrics::{counter, gauge};
 
 
 
@@ -55,6 +68,7 @@ impl PatriciaTree {
 
     /// Helper to retire an offset safely for epoch-based reclamation.
     pub fn retire_offset(&self, off: Offset) {
+        counter!("cidrscan_gc_nodes_total").increment(1);
         let fl = self.freelist.clone();
         epoch::pin().defer(move || {
             fl.push(off);
@@ -88,6 +102,12 @@ impl PatriciaTree {
         hdr.capacity - used + recycled
     }
 
+    /// Emit gauges periodically (caller decides cadence).
+    pub fn report_capacity_metrics(&self) {
+        let free = self.available_capacity() as f64;
+        gauge!("cidrscan_free_slots").set(free);
+    }
+
     /// Create or open a shared‑memory tree
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
         Self::ensure_logging();
@@ -103,9 +123,9 @@ impl PatriciaTree {
         };
 
         let base_ptr = shmem.as_ptr() as *mut u8;
-        let base = NonNull::new(base_ptr).unwrap();
+        let base = NonNull::new(base_ptr).ok_or_else(|| ShmemError::MapOpenFailed(70))?;
         let hdr_ptr = base_ptr as *mut Header;
-        let hdr = NonNull::new(hdr_ptr).unwrap();
+        let hdr = NonNull::new(hdr_ptr).ok_or_else(|| ShmemError::MapOpenFailed(71))?;
         let hdr_mut = unsafe { &mut *hdr_ptr };
 
         // === PATCH 1: Header parameter mismatch guard ===
@@ -146,14 +166,14 @@ impl PatriciaTree {
         if prev == 0 {
             // first opener in this process: initialise the bytes
             unsafe {
-                RawRwLock::new_in_place((&mut hdr_mut.lock).as_mut_ptr())
-                    .expect("RawRwLock::new_in_place failed");
+                let _ = RawRwLock::new_in_place((&mut hdr_mut.lock).as_mut_ptr())
+                    .map_err(|_| Error::LockInitFailed);
             }
         } else {
             // subsequent opens: attach to existing lock state
             unsafe {
-                RawRwLock::reopen_in_place((&mut hdr_mut.lock).as_mut_ptr())
-                    .expect("RawRwLock reopen failed");
+                let _ = RawRwLock::reopen_in_place((&mut hdr_mut.lock).as_mut_ptr())
+                    .map_err(|_| Error::LockInitFailed);
             }
         }
         let hdr_ref = unsafe { &*hdr_ptr };
@@ -184,6 +204,7 @@ impl PatriciaTree {
 
     /// Insert a key with a given prefix length and TTL
     pub fn insert(&self, key: u128, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
+        counter!("cidrscan_inserts_total").increment(1);
         info!(
             "[INSERT] key={:x}, prefix_len={}, ttl={}",
             key,

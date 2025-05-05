@@ -33,8 +33,8 @@ pub extern "C" fn patricia_open(name: *const u8, name_len: usize, capacity: usiz
         }
         Err(_e) => {
             // e is a ShmemError, not a types::Error
-            set_last_error(ErrorCode::Unknown);
-            ErrorCode::Unknown
+            set_last_error(ErrorCode::ShmemOpenFailed);
+            ErrorCode::ShmemOpenFailed
         }
     }
 }
@@ -121,6 +121,13 @@ pub extern "C" fn patricia_delete(
     }
 }
 
+/// Bulk insert multiple prefixes into the Patricia tree.
+///
+/// # Safety
+/// - `items` must point to an array of (u64, u64, u8, u64) tuples of length `count`.
+/// - Each tuple is (key_high, key_low, prefix_len, ttl).
+///
+/// Returns `ErrorCode::Success` on success, or an error code on failure.
 #[no_mangle]
 pub extern "C" fn patricia_bulk_insert(
     handle: i32,
@@ -166,7 +173,208 @@ pub extern "C" fn patricia_destroy(handle: i32) -> ErrorCode {
             mut_tree.destroy();
         }
         set_last_error(ErrorCode::Success);
-        ErrorCode::Success
+        return ErrorCode::Success
+    } else {
+        set_last_error(ErrorCode::InvalidHandle);
+        return ErrorCode::InvalidHandle
+    }
+#[no_mangle]
+pub extern "C" fn patricia_available_capacity(handle: i32) -> u64 {
+    match get_tree(handle) {
+        Ok(tree) => tree.available_capacity() as u64,
+        Err(_) => 0,
+    }
+}
+}
+
+/// Insert an IPv4 prefix into the Patricia tree.
+/// 
+/// # Safety
+/// - The handle must be valid.
+/// - `addr` is a 32-bit IPv4 address in host byte order.
+/// - `prefix_len` is the prefix length (0-32).
+/// - `ttl` is the time-to-live in seconds.
+/// 
+/// Returns `ErrorCode::Success` on success, or an error code on failure.
+#[no_mangle]
+pub extern "C" fn patricia_insert_v4(
+    handle: i32,
+    addr: u32,
+    prefix_len: u8,
+    ttl: u64,
+) -> ErrorCode {
+    let tree = match get_tree(handle) {
+        Ok(tree) => tree,
+        Err(code) => {
+            set_last_error(code);
+            return code;
+        }
+    };
+    match tree.insert_v4(addr, prefix_len, ttl) {
+        Ok(_) => {
+            set_last_error(ErrorCode::Success);
+            ErrorCode::Success
+        }
+        Err(e) => {
+            let code = map_error(&e);
+            set_last_error(code);
+            code
+        }
+    }
+}
+
+/// Lookup an IPv4 address in the Patricia tree.
+/// 
+/// # Safety
+/// - The handle must be valid.
+/// - `addr` is a 32-bit IPv4 address in host byte order.
+/// 
+/// Returns `true` if found, `false` otherwise.
+#[no_mangle]
+pub extern "C" fn patricia_lookup_v4(
+    handle: i32,
+    addr: u32,
+) -> bool {
+    let tree = match get_tree(handle) {
+        Ok(tree) => tree,
+        Err(code) => {
+            set_last_error(code);
+            return false;
+        }
+    };
+    let found = tree.lookup_v4(addr);
+    set_last_error(ErrorCode::Success);
+    found
+}
+
+/// Delete an IPv4 prefix from the Patricia tree.
+/// 
+/// # Safety
+/// - The handle must be valid.
+/// - `addr` is a 32-bit IPv4 address in host byte order.
+/// - `prefix_len` is the prefix length (0-32).
+/// 
+/// Returns `ErrorCode::Success` on success, or an error code on failure.
+#[no_mangle]
+pub extern "C" fn patricia_delete_v4(
+    handle: i32,
+    addr: u32,
+    prefix_len: u8,
+) -> ErrorCode {
+    let tree = match get_tree(handle) {
+        Ok(tree) => tree,
+        Err(code) => {
+            set_last_error(code);
+            return code;
+        }
+    };
+    match tree.delete_v4(addr, prefix_len) {
+        Ok(_) => {
+            set_last_error(ErrorCode::Success);
+            ErrorCode::Success
+        }
+        Err(e) => {
+            let code = map_error(&e);
+            set_last_error(code);
+            code
+        }
+    }
+}
+
+/// Flushes pending epoch callbacks for the Patricia tree.
+/// 
+/// # Safety
+/// - The handle must be valid.
+/// 
+/// Returns `ErrorCode::Success` on success, or an error code on failure.
+#[no_mangle]
+pub extern "C" fn patricia_flush(handle: i32) -> ErrorCode {
+    let tree = match get_tree(handle) {
+        Ok(tree) => tree,
+        Err(code) => {
+            set_last_error(code);
+            return code;
+        }
+    };
+    tree.flush();
+    set_last_error(ErrorCode::Success);
+    ErrorCode::Success
+}
+
+/// Clears all prefixes from the Patricia tree.
+/// 
+/// # Safety
+/// - The handle must be valid.
+/// 
+/// Returns `ErrorCode::Success` on success, or an error code on failure.
+#[no_mangle]
+pub extern "C" fn patricia_clear(handle: i32) -> ErrorCode {
+    let tree = match get_tree(handle) {
+        Ok(tree) => tree,
+        Err(code) => {
+            set_last_error(code);
+            return code;
+        }
+    };
+    tree.clear();
+    set_last_error(ErrorCode::Success);
+    ErrorCode::Success
+}
+
+/// Resizes the Patricia tree arena to a new capacity.
+/// 
+/// # Safety
+/// - The handle must be valid.
+/// - `new_capacity` must be greater than the current capacity.
+/// 
+/// Returns `ErrorCode::Success` on success, or an error code on failure.
+/// Resizes the Patricia tree arena to a new capacity.
+///
+/// # Safety
+/// - The handle must be valid.
+/// - `new_capacity` must be greater than the current capacity.
+///
+/// Returns `ErrorCode::Success` on success, `ErrorCode::InvalidHandle` if handle is invalid,
+/// `ErrorCode::ResizeFailed` if the tree is in use by multiple handles, or other mapped errors on failure.
+#[no_mangle]
+pub extern "C" fn patricia_resize(handle: i32, new_capacity: usize) -> ErrorCode {
+    // Remove the existing PatriciaTree from the registry to obtain ownership.
+    if let Some((_, tree_arc)) = REGISTRY.remove(&handle) {
+        // Must be the only strong reference.
+        if Arc::strong_count(&tree_arc) != 1 {
+            // Reinsert the original Arc back into the registry.
+            REGISTRY.insert(handle, tree_arc);
+            set_last_error(ErrorCode::ResizeFailed);
+            return ErrorCode::ResizeFailed;
+        }
+        // Unwrap the Arc to get owned PatriciaTree.
+        let mut tree = match Arc::try_unwrap(tree_arc) {
+            Ok(t) => t,
+            Err(original_arc) => {
+                // Unexpected, reinsert and error.
+                REGISTRY.insert(handle, original_arc);
+                set_last_error(ErrorCode::ResizeFailed);
+                return ErrorCode::ResizeFailed;
+            }
+        };
+        // Perform resize.
+        match tree.resize(new_capacity) {
+            Ok(_) => {
+                // Reinsert resized tree.
+                REGISTRY.insert(handle, Arc::new(tree));
+                set_last_error(ErrorCode::Success);
+                ErrorCode::Success
+            }
+            Err(e) => {
+                // On error, reinsert original tree.
+                // original tree is mutated or not? We mutated tree in place which may have failed,
+                // but leave original mapping intact.
+                REGISTRY.insert(handle, Arc::new(tree));
+                let code = map_error(&e);
+                set_last_error(code);
+                code
+            }
+        }
     } else {
         set_last_error(ErrorCode::InvalidHandle);
         ErrorCode::InvalidHandle

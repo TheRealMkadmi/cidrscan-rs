@@ -13,6 +13,10 @@ pub enum ErrorCode {
     BranchHasChildren = 4,
     InvalidHandle = 5,
     Utf8Error = 6,
+    LockInitFailed = 7,
+    ShmemOpenFailed = 8,
+    ResizeFailed = 9,
+    FlushFailed = 10,
     Unknown = 255,
 }
 
@@ -26,6 +30,10 @@ impl ErrorCode {
             ErrorCode::BranchHasChildren => "Branch has children",
             ErrorCode::InvalidHandle => "Invalid handle",
             ErrorCode::Utf8Error => "UTF-8 conversion error",
+            ErrorCode::LockInitFailed => "Lock initialization failed",
+            ErrorCode::ShmemOpenFailed => "Shared memory open failed",
+            ErrorCode::ResizeFailed => "Resize operation failed",
+            ErrorCode::FlushFailed => "Flush operation failed",
             ErrorCode::Unknown => "Unknown error",
         }
     }
@@ -59,6 +67,10 @@ pub extern "C" fn patricia_strerror(code: ErrorCode) -> *const c_char {
         ErrorCode::BranchHasChildren => b"Branch has children\0".as_ptr() as *const c_char,
         ErrorCode::InvalidHandle => b"Invalid handle\0".as_ptr() as *const c_char,
         ErrorCode::Utf8Error => b"UTF-8 conversion error\0".as_ptr() as *const c_char,
+        ErrorCode::LockInitFailed => b"Lock initialization failed\0".as_ptr() as *const c_char,
+        ErrorCode::ShmemOpenFailed => b"Shared memory open failed\0".as_ptr() as *const c_char,
+        ErrorCode::ResizeFailed => b"Resize operation failed\0".as_ptr() as *const c_char,
+        ErrorCode::FlushFailed => b"Flush operation failed\0".as_ptr() as *const c_char,
         ErrorCode::Unknown => b"Unknown error\0".as_ptr() as *const c_char,
     }
 }
@@ -71,5 +83,7 @@ pub fn map_error(e: &crate::types::Error) -> ErrorCode {
         ZeroCapacity => ErrorCode::ZeroCapacity,
         InvalidPrefix => ErrorCode::InvalidPrefix,
         BranchHasChildren => ErrorCode::BranchHasChildren,
+        LockInitFailed => ErrorCode::LockInitFailed,
+        // Add more mappings as needed
     }
 }
