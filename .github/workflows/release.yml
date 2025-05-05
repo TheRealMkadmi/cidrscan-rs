@@ -51,12 +51,14 @@ jobs:
             # Copy header file
             cp $src_dir/cidrscan.h packages/$name/
             
-            # Copy binary files based on target
-            case "$target" in
-              *windows-gnu)
+            # Copy binary files based on target           
+             case "$target" in *windows-gnu)
                 # For MinGW builds
                 cp $src_dir/cidrscan.dll packages/$name/ || echo "No .dll file found"
                 cp $src_dir/libcidrscan.a packages/$name/ || echo "No static .a file found"
+                # Also copy lib files for MSVC compatibility
+                cp $src_dir/cidrscan.lib packages/$name/ || echo "No .lib file found"
+                cp $src_dir/cidrscan.dll.lib packages/$name/ || echo "No .dll.lib file found"
                 ;;
               *)
                 # For Linux builds
