@@ -42,10 +42,9 @@ jobs:
             else
               src_dir="target/$target/release"
             fi
-            
-            # Check what files were built
+              # Check what files were built
             echo "Files built in $src_dir:"
-            ls -la $src_dir | grep -E 'libcidrscan|cidrscan.dll'
+            ls -la $src_dir | grep -E 'libcidrscan|cidrscan.dll' || true
             
             # Generate C header with cbindgen
             cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
@@ -105,10 +104,9 @@ jobs:
             else
               src_dir="target/$target/release"
             fi
-            
             # Check what library files were built
             echo "Library files built in $src_dir:"
-            ls -la $src_dir | grep libcidrscan
+            ls -la $src_dir | grep libcidrscan || true
             
             echo "Source directory: $src_dir"
             echo "Available files in $src_dir:"
