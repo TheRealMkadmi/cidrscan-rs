@@ -1,219 +1,223 @@
-# CIDRScan-rs
+# CIDRScan‑rs
 
-A high-performance, cross-process, lock-free-read, memory-resident Patricia (radix) tree for CIDR prefix lookups, built in Rust. CIDRScan-rs is designed for robust multi-process and multi-threaded environments, supporting per-entry TTL, atomic operations, and a C ABI for broad interoperability. The library is suitable for use cases such as application firewalls, distributed caches, and any scenario requiring fast, concurrent, and shared access to IP prefix data.
+*A cross‑process, lock‑free‑read, memory‑resident Patricia‑trie engine for **O( log W )** longest‑prefix matching (LPM) with per‑prefix TTLs and a tiny, language‑agnostic C ABI.*
+
+---
+
+## Table of Contents
+
+1. [Why CIDRScan‑rs?](#why-cidrscan‑rs)
+2. [Feature Highlights](#feature-highlights)
+3. [Getting Started](#getting-started)
+   * [Rust](#rust‑quick‑start)
+   * [C / Any‑FFI](#c‑abi‑quick‑start)
+4. [Architecture Deep Dive](#architecture-deep-dive)
+   * [Memory Layout](#memory-layout)
+   * [Node Life‑cycle](#node-life‑cycle)
+   * [Cross‑process RW‑Lock](#cross‑process-rw‑lock)
+5. [Core Algorithms](#core-algorithms)
+   * [Lookup (Wait‑free)](#lookup)
+   * [Insert (Writer‑exclusive)](#insert)
+   * [Delete (Writer‑exclusive)](#delete)
+6. [Design Philosophy](#design-philosophy)
+7. [Safety & Correctness](#safety--correctness)
+8. [Benchmarks](#benchmarks)
+9. [Road‑map](#road‑map)
+10. [License](#license)
 
 ---
 
-## Table of Contents
+## Why CIDRScan‑rs?
 
-1. [Introduction & Motivation](#introduction--motivation)
-2. [Quick Start & Usage](#quick-start--usage)
-3. [Design Philosophy & Principles](#design-philosophy--principles)
-4. [Architecture Overview](#architecture-overview)
-5. [Core Data Structures](#core-data-structures)
-6. [Memory Management](#memory-management)
-7. [Key Operations](#key-operations)
-   - [Insertion](#insertion)
-   - [Lookup](#lookup)
-   - [Deletion](#deletion)
-8. [Concurrency & Safety](#concurrency--safety)
-9. [Error Handling & Invariants](#error-handling--invariants)
-10. [Platform-Specifics](#platform-specifics)
-11. [Testing & Extensibility](#testing--extensibility)
+Traditional LPM libraries fall into two camps:
+
+| Camp                               | Limitations                                                              |
+| ---------------------------------- | ------------------------------------------------------------------------ |
+| **Kernel‑style radix trees**       | Tightly coupled to in‑kernel allocators; not shareable across processes. |
+| **User‑space hash / tree hybrids** | Require coarse locks or exotic GC; do not support TTLs.                  |
+
+**CIDRScan‑rs** is purpose‑built for *application‑space firewalls, geo‑fencing, and abuse‑detection engines* that spawn dozens of workers (Laravel Octane, Puma, Gunicorn, etc.).  It delivers:
+
+* **Lock‑free reads** – every lookup is a wait‑free walk of atomic pointers.
+* **True cross‑process sharing** – the entire arena is one POSIX/Win32 shared‑memory region.
+* **Per‑prefix TTLs** – each node ages out automatically.
+* **Built‑in C ABI** – call from PHP/Ruby/Node/Python in < 5 lines.
+* **Deterministic memory usage** – capacity is fixed up‑front; no heap allocations at runtime.
 
 ---
-## Recent Enhancements (May 2025)
 
-### Opportunistic Pruning on Lookup
-- The Patricia tree now performs opportunistic pruning during every lookup. As the tree is traversed, any non-terminal node with only one live child is pruned inline, keeping the tree compact with minimal overhead.
+## Feature Highlights
 
-### Structured Logging
-- The library now uses the standard [`log`](https://docs.rs/log) facade for all internal logging. By default, `env_logger` is auto-initialized (unless another logger is already set), so log messages go to stdout. You can override this by initializing your own logger (e.g., with `tracing_subscriber`) before calling `PatriciaTree::open`.
+* **Opportunistic pruning**: unary internal nodes are collapsed on‑the‑fly during lookups; the tree stays compact with *zero* background threads.
+* **ABA‑safe pointers**: every child link stores `(offset, generation)`; stale readers restart without panicking.
+* **Epoch‑based reclamation**: freed offsets are recycled lock‑free once all readers in *every* thread of *every* process have advanced.
+* **Atomically growing arenas**: `tree.resize(new_capacity)` copies live prefixes into a bigger mapping and drops the old one lazily.
+* **Custom shared RW‑lock** (`RawRwLock`): writer‑preferential, fits entirely in the shared page, works on Linux, macOS, and Windows.
+* **Tiny build‑time footprint**: single `cargo build`, no `unsafe` outside thin FFI & atomics.
+* **Language‑agnostic packages**: CI publishes pre‑built `*.zip` bundles with **`.dll` / `.so` / `.dylib` + `cidrscan.h`**.
 
-### Atomic Resize
-- A new method, `PatriciaTree::resize(new_capacity)`, allows atomic resizing of the tree. This creates a new, larger mapping, bulk-copies all live prefixes, and returns a new `PatriciaTree`. The caller can atomically swap the handle (e.g., with `ArcSwap`), and the old tree is dropped asynchronously.
+---
 
-### Dependency Updates
-- Added dependencies: `log`, `env_logger`, and `once_cell` for logging and initialization.
+## Getting Started
 
-#### Example Usage
+### Rust Quick Start
 
 ```rust
-// 0) existing tree
-let tree = PatriciaTree::open("cidr_prod",  1_000_000)?;
+use cidrscan::PatriciaTree;
 
-// 1) opportunistic prune now happens automatically on every lookup()
+fn main() -> anyhow::Result<()> {
+    // ❶ Map (or create) a 1‑million‑node arena
+    let tree = PatriciaTree::open("cidr_prod", 1_000_000)?;
 
-// 2) logging – if you want Laravel’s stack:
-tracing_subscriber::registry()
-    .with(tracing_subscriber::fmt::layer())
-    .init();     // do this *before* first PatriciaTree::open
+    // ❷ Insert an IPv4 /32 with a 60‑second TTL
+    const IP: u32 = 0xC0A8_0001;                // 192.168.0.1
+    tree.insert_v4(IP, 32, 60)?;
 
-// 3) atomic resize
-let bigger = tree.resize(2_000_000)?;
-LET_ARC_SWAP.store(Arc::new(bigger));   // one pointer write → all threads see the new map
-```
+    // ❸ Lock‑free lookup
+    assert!(tree.lookup_v4(IP));
 
----
----
+    // ❹ Automatic opportunistic pruning and TTL expiry
+    std::thread::sleep(std::time::Duration::from_secs(61));
+    assert!(!tree.lookup_v4(IP));
 
-## Introduction & Motivation
-
-CIDRScan-rs addresses the need for fast, concurrent, and memory-efficient prefix matching for IP addresses (IPv4 and IPv6) in environments where multiple processes or threads must share and mutate a common data structure. The project leverages Rust's safety and concurrency features, and exposes a C ABI for broad compatibility. The current design is highly modular, with platform-specific logic, robust error handling, and a focus on correctness and performance.
-
----
-
-## Quick Start & Usage
-
-CIDRScan-rs enables languages such as PHP, Python, and JavaScript/TypeScript to use a memory-resident IP "database"—a high-performance Patricia tree designed for multi-worker environments (e.g., Laravel Octane, Gunicorn, PM2 cluster). It is ideal for scenarios like application firewalls, where fast, concurrent, and shared access to IP prefix data is critical.
-
-### Building
-
-```sh
-cargo build --release
-```
-
-### Basic Usage
-
-```rust
-use cidrscan_rs::PatriciaTree;
-
-fn main() {
-    // Open or create a Patricia tree in shared memory
-    let tree = PatriciaTree::open("my_tree", 1_048_576).expect("Failed to open PatriciaTree");
-
-    // Insert a key (e.g., IPv4 as u128, prefix length, TTL in seconds)
-    let key: u128 = 0x0a000001; // 10.0.0.1 as IPv4-mapped u128
-    tree.insert(key, 32, 3600);
-
-    // Lookup the key
-    let found = tree.lookup(key);
-    println!("Found? {}", found);
-
-    // Tree is automatically closed and unmapped when dropped
+    Ok(())
 }
 ```
 
----
+Build:
 
-## Platform-Specifics
-
-- **Windows:** For cross-session sharing, the creator process must hold the `SeCreateGlobalPrivilege`. The library provides a platform-specific function to enable this privilege if possible. If not available, the mapping falls back to session-local.
-- **Unix:** Shared memory is managed using POSIX APIs, and resources are cleaned up automatically when the last handle is dropped.
-
----
-
-## Calling from Other Languages
-
-CIDRScan-rs exposes a C ABI for use via FFI (Foreign Function Interface) in PHP, Python, Node.js, and more. Handles are per-process, but the underlying data is shared via memory-mapped regions. The exported API includes:
-
-```c
-ErrorCode patricia_open(const uint8_t* name, size_t name_len, size_t capacity, int32_t* out_handle);
-ErrorCode patricia_close(int32_t handle);
-ErrorCode patricia_insert(int32_t handle, uint64_t key_high, uint64_t key_low, uint8_t prefix_len, uint64_t ttl);
-bool      patricia_lookup(int32_t handle, uint64_t key_high, uint64_t key_low);
-ErrorCode patricia_delete(int32_t handle, uint64_t key_high, uint64_t key_low, uint8_t prefix_len);
-ErrorCode patricia_bulk_insert(int32_t handle, const struct { uint64_t hi; uint64_t lo; uint8_t len; uint64_t ttl; }* items, size_t count);
-ErrorCode patricia_last_error(void);
-const char* patricia_strerror(ErrorCode code);
+```bash
+cargo build --release
 ```
 
-Handles are not shared between processes; each process maintains its own registry of open trees, but all processes with the same name map the same shared memory region.
+> **Tip:** enable structured logs with
+>
+> ```rust
+> tracing_subscriber::fmt().with_target(false).init();
+> ```
+
+### C ABI Quick Start
+
+```c
+#include "cidrscan.h"
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    int32_t h;
+    if (patricia_open((uint8_t*)"fw", 2, 1<<20, &h) != Success) return 1;
+
+    // 10.0.0.0/8 (IPv4‑mapped to upper bits zero)
+    patricia_insert(h, 0, 0x0A000000ull, 32, 300);
+    printf("hit? %d\n", patricia_lookup(h, 0, 0x0A000000ull));
+
+    patricia_close(h);
+}
+```
+
+All symbols are declared in `cidrscan.h`; link with `-lcidrscan`.
 
 ---
 
-## Design Philosophy & Principles
+## Architecture Deep Dive
 
-- **Lock-Free Reads:** All lookups are lock-free and wait-free, using atomic root and child pointers and generation counters for ABA safety.
-- **Cross-Process Safety:** Writers use a custom cross-process RW-lock in shared memory, ensuring correctness across multiple processes.
-- **Memory Residency:** All data lives in a single, cache-line-aligned memory-mapped region, with offset-based node access so the region can be mapped at different addresses in different processes.
-- **Robust Error Handling:** Rich error codes are provided via a C ABI, with thread-local last error tracking.
-- **Platform Abstraction:** Platform-specific logic is modularized for maintainability and portability.
-- **Lock-Free Node Recycling:** Uses `crossbeam-epoch` and a global `SegQueue` for wait-free, lock-free node reclamation.
+### Memory Layout
 
----
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Header (64‑byte aligned)                                       │
+│ ├── magic, version                                             │
+│ ├── RawRwLock   ← cross‑process writer lock                    │
+│ ├── next_index  ← bump allocator                               │
+│ ├── free_slots  ← #recycled nodes waiting in SegQueue          │
+│ ├── root_offset ← packed (off, gen)                            │
+│ └── …                                                         │
+├─────────────────────────────────────────────────────────────────┤
+│ Node[capacity]  (each 64 B, offset‑addressed)                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-## Architecture Overview
+Because every pointer is an *offset* from `base`, the region may be mapped at different virtual addresses by different processes.
 
-CIDRScan-rs is centered around a compressed-path Patricia tree, with all nodes and metadata stored in a shared memory region. The tree supports:
+### Node Life‑cycle
 
-- Lock-free lookups via atomic root and child pointers.
-- Per-node TTLs for automatic expiry.
-- Efficient allocation and recycling of nodes using lock-free epoch-based reclamation.
-- Cross-process and cross-thread safety via atomic operations and a custom shared-memory RW-lock.
+```
+ allocate → mutate under write‑lock → publish atomically
+       ↘                           ↙
+        free (delete / TTL)  ← retire (epoch) ← all readers left
+```
 
-The public API exposes C ABI functions for opening, inserting, looking up, deleting, and bulk-inserting prefixes, as well as error reporting.
+A freed node’s offset is pushed into a per‑process `SegQueue`; once `crossbeam‑epoch` certifies that no thread still sees the old generation, the slot is immediately reusable.
 
----
+### Cross‑process RW‑Lock
 
-## Core Data Structures
-
-- **Header:** Holds global metadata, including a magic/version, atomic root pointer, bump allocator index, and a cross-process RW-lock.
-- **Node:** Each node stores a 128-bit key, prefix length, atomic child offsets, an atomic TTL expiry, and a generation counter for ABA safety.
-- **PatriciaTree:** The main handle, containing pointers to the shared memory region and header. All node management is lock-free and uses offset-based addressing.
-- **RawRwLock:** A cross-process, writer-preferring RW-lock that fits in shared memory, used for synchronizing writers.
-
----
-
-## Memory Management
-
-- **Bump Allocator:** New nodes are allocated by atomically incrementing `next_index` in the header.
-- **Lock-Free Free List:** Deleted nodes are recycled via a global, lock-free `SegQueue<Offset>`, with reclamation deferred using `crossbeam-epoch` to ensure no thread is accessing a node before it is reused.
-- **Generation Counters:** Each node has a generation counter, incremented on reuse, to prevent ABA hazards and ensure cross-process safety.
-- **Capacity Enforcement:** All allocations check against the configured capacity and return errors on overflow.
-- **Cache-Line Alignment:** Both `Header` and `Node` are 64-byte aligned for performance.
+* **Writer preference**: readers spin if `WRITER_BIT` is set.
+* **No starvation**: writer blocks new readers and uses an OS event to wait for in‑flight readers to drain.
+* Implemented with *raw‑sync* primitives; fits in ≈ 100 bytes.
 
 ---
 
-## Key Operations
+## Core Algorithms
 
-### Insertion
+#### Lookup
 
-- Performed under a write lock.
-- Traverses the tree using `common_prefix_len` and `get_bit`.
-- Handles cases for empty links, exact matches, splits, and prefix insertions above or below existing nodes.
-- Uses atomics and volatile writes for all pointer updates.
-- Recycles or allocates nodes using the lock-free free list and bump allocator.
+1. Load packed `root_offset`.
+2. Compare common‑prefix length; if shorter, return **miss**.
+3. Descend via `get_bit(key, plen)` – *no locks, no branches on the hot path*.
+4. On the way *back up*, try `prune(parent)` if the node we just left became unary.
+5. TTL expired? opportunistically GC under a best‑effort `try_write_lock`.
 
-### Lookup
+Time‑complexity: ***O(log W)*** where `W ≤ 128`.
 
-- Lock-free and highly concurrent.
-- Walks the tree by prefix comparison and bit tests.
-- Checks TTL at each node; expired nodes are treated as absent.
-- Detects ABA hazards using generation counters and restarts if needed.
+#### Insert
 
-### Deletion
+* Single writer acquires the global `RawRwLock`.
+* Handles four cases in one tight loop: *empty link*, *exact match*, *insert‑above*, *split*.
+* Allocates from **freelist → bump allocator → epoch flush** in that order.
+* All pointer installs use CAS **once**; on failure recycle offsets and restart.
 
-- Performed under a write lock.
-- Locates the node, marks it as expired, and retires its offset using epoch-based reclamation.
-- Handles branch merges when a node’s removal leaves a branch with a single child.
-- All node recycling is lock-free and safe for concurrent readers.
+#### Delete
 
----
-
-## Concurrency & Safety
-
-- **Lock-Free Reads:** All lookups are lock-free, using atomic root and child pointers and generation counters for ABA safety.
-- **Write Synchronization:** Insertions and deletions use a global cross-process RW-lock for exclusive access, implemented in shared memory.
-- **Send/Sync Guarantees:** `PatriciaTree` is explicitly marked as `Send` and `Sync`.
-- **Inter-Process Coordination:** Shared memory can be mapped by multiple processes, with atomics ensuring consistency and safety.
-- **Epoch-Based Reclamation:** Memory reclamation is handled per-process using `crossbeam-epoch`. Stale pointers in other processes are detected by generation mismatches and retried safely.
+* Writer lock.
+* Clears `is_terminal / refcnt`; if the node became empty leaf it is unlinked and retired.
+* After unlink, runs `try_prune` upwards to collapse obsolete internal nodes.
 
 ---
 
-## Error Handling & Invariants
+## Design Philosophy
 
-- **Capacity Checks:** All allocations check against `capacity` and return errors on overflow.
-- **Integrity Checks:** The header includes a magic value and version for ABI compatibility.
-- **Panic Safety:** The implementation is panic-safe, with atomic updates and lock-based synchronization ensuring consistency.
-- **Invariants:** The tree structure is always valid, with no dangling pointers or cycles. ABA hazards are prevented by generation counters.
-- **Rich C ABI Error Reporting:** All C ABI functions return detailed error codes, and the last error is tracked per-thread for diagnostics.
+| Principle                        | Practice                                                       |
+| -------------------------------- | -------------------------------------------------------------- |
+| **Determinism beats heuristics** | Fixed‑size arenas, explicit TTLs, no GC threads.               |
+| **Wait‑free reads**              | All hot‑path operations are atomic loads & pointer chases.     |
+| **Explainable behaviour**        | Every mutation path is \~200 LOC, fully unit‑tested.           |
+| **No surprise allocations**      | All memory comes from the pre‑mapped region.                   |
+| **One binary, any language**     | C ABI + pre‑generated headers; no `bindgen` needed at runtime. |
+
+---
+
+## Safety & Correctness
+
+* `#[repr(C, align(64))]` on all shared structs – no padding surprises.
+* Header `magic` + `version` checked on every `open`; mismatches fail early.
+* Every public API returns an `ErrorCode`; the last error is thread‑local and human‑readable via `patricia_strerror`.
+* 400+ lines of property tests (proptest) + stress tests exercising ABA, TTL expiry, and multi‑process visibility.
 
 ---
 
-## Testing & Extensibility
+## Road‑map
 
-- **Test Coverage:** The test suite covers TTL expiry, bulk insert, edge cases, and concurrency.
-- **Extensibility:** The design is ready for future enhancements, such as background compaction to merge redundant internal nodes and further optimizations for large-scale deployments.
+* **Background compaction** – optional cooperative thread collapsing long unary chains.
+* **Prefix metadata blobs** – per‑node opaque `u32`/`u64` user fields.
+* **Streaming bulk‑loader** – build large trees off‑line and mm‑map read‑only.
+* **k‑prefix negative match** – fast *“does *no* prefix match?”* queries.
+
+*Pull requests are very welcome!*
 
 ---
+
+## License
+
+Licensed under MIT – see [`LICENSE`](LICENSE) for details.
+
+> *Made with 🌍 in Tunis by **@TheRealMkadmi***
