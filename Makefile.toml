@@ -1,16 +1,21 @@
-# Makefile.toml
+[env]
+# relative paths; Makefile.toml lives at project root
+ASAN_OPTIONS  = "suppressions=sanitizers/asan.supp:detect_leaks=1"
+TSAN_OPTIONS  = "suppressions=sanitizers/tsan.supp"
+MSAN_OPTIONS  = "suppressions=sanitizers/msan.supp"
+
 
 [tasks.asan]
 command = "cargo"
 args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
-env = { RUSTFLAGS = "-Zsanitizer=address", ASAN_OPTIONS = "suppressions=$(pwd)/asan.supp:detect_leaks=1" }
+env     = { RUSTFLAGS = "-Zsanitizer=address" }
 
 [tasks.tsan]
 command = "cargo"
 args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
-env = { RUSTFLAGS = "-Zsanitizer=thread", TSAN_OPTIONS = "suppressions=$(pwd)/tsan.supp" }
+env     = { RUSTFLAGS = "-Zsanitizer=thread" }
 
 [tasks.msan]
 command = "cargo"
 args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
-env = { RUSTFLAGS = "-Zsanitizer=memory -Zsanitizer-memory-track-origins", MSAN_OPTIONS = "suppressions=$(pwd)/msan.supp" }
+env     = { RUSTFLAGS = "-Zsanitizer=memory -Zsanitizer-memory-track-origins" }
