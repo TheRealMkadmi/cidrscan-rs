@@ -8,7 +8,6 @@ use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
 // Stable allocation imports for boxed helper
 use core::marker::PhantomData;
-use std::alloc::{alloc_zeroed, handle_alloc_error, Layout};
 
 const _: () = {
     assert!(core::mem::size_of::<RawRwLock>() % core::mem::align_of::<RawRwLock>() == 0);
