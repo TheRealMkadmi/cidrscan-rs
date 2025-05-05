@@ -1,0 +1,5 @@
+interceptor_name:malloc
+interceptor_name:free
+interceptor_name:calloc
+interceptor_name:realloc
+alloc_dealloc_mismatch

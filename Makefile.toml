@@ -1,0 +1,16 @@
+# Makefile.toml
+
+[tasks.asan]
+command = "cargo"
+args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
+env = { RUSTFLAGS = "-Zsanitizer=address", ASAN_OPTIONS = "suppressions=$(pwd)/asan.supp:detect_leaks=1" }
+
+[tasks.tsan]
+command = "cargo"
+args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
+env = { RUSTFLAGS = "-Zsanitizer=thread", TSAN_OPTIONS = "suppressions=$(pwd)/tsan.supp" }
+
+[tasks.msan]
+command = "cargo"
+args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
+env = { RUSTFLAGS = "-Zsanitizer=memory -Zsanitizer-memory-track-origins", MSAN_OPTIONS = "suppressions=$(pwd)/msan.supp" }

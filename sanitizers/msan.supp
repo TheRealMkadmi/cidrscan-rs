@@ -1,0 +1,15 @@
+asan_interceptor:malloc
+asan_interceptor:free
+asan_interceptor:calloc
+asan_interceptor:realloc
+asan_interceptor:memcpy
+asan_interceptor:memmove
+asan_interceptor:posix_memalign
+asan_library:libc
+asan_library:*rustc*
+asan_library:*crossbeam*
+asan_library:*parking_lot*
+asan_library:*lock_api*
+asan_library:*memoffset*
+asan_library:*zerocopy*
+asan_library:*getrandom*

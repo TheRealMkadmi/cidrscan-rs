@@ -10,7 +10,6 @@ repository = "https://github.com/TheRealMkadmi/cidrscan-rs"
 [dependencies]
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }
-
 raw_sync = "0.1.5"
 shared_memory = "0.12"
 once_cell   = "1.21"     # per-process handle cache
@@ -19,7 +18,7 @@ crossbeam-epoch = "0.9.18"
 crossbeam-queue = "0.3.12"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = "0.52.0"
+windows-sys = "0.59.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.151"
@@ -28,6 +27,7 @@ libc = "0.2.151"
 proptest = "1"
 num_cpus = "1"
 rand = "0.9.1"
+cargo-make = "0.37"
 
 [features]
 trace = []

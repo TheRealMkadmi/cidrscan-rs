@@ -1,0 +1,7 @@
+[alias]
+# Runs AddressSanitizer on your tests
+asan = "test --target x86_64-unknown-linux-gnu -Zbuild-std"
+# Runs ThreadSanitizer
+tsan = "test --target x86_64-unknown-linux-gnu -Zbuild-std"
+# Runs MemorySanitizer (origin tracking on)
+msan = "test --target x86_64-unknown-linux-gnu -Zbuild-std"
