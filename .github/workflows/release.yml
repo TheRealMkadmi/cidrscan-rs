@@ -32,7 +32,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
       - name: Build and package cross targets
         run: |
-          mkdir packages
+          mkdir -p packages
           for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-gnu:windows-x86_64"; do
             IFS=":" read -r target name <<< "$pair"            
             cross build --release --target $target
@@ -46,11 +46,17 @@ jobs:
             # Check what files were built
             echo "Files built in $src_dir:"
             ls -la $src_dir | grep -E 'libcidrscan|cidrscan.dll'
+            
             # Generate C header with cbindgen
             cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
+            
+            # Create package directory
             mkdir -p packages/$name
+            
             # Copy header file
-            cp $src_dir/cidrscan.h packages/$name/            # Copy binary files based on target
+            cp $src_dir/cidrscan.h packages/$name/
+            
+            # Copy binary files based on target
             case "$target" in
               *windows-gnu)
                 # For MinGW builds
@@ -63,9 +69,9 @@ jobs:
                 cp $src_dir/libcidrscan.a packages/$name/ || echo "No static .a file found"
                 ;;
             esac
-            cd packages/$name
-            zip -r ../../$name.zip *
-            cd ../../
+            
+            # Create zip from current directory
+            (cd packages/$name && zip -r ../../$name.zip *)
           done
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -85,11 +91,10 @@ jobs:
       - name: Add Rust targets
         run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
       - name: Install cbindgen
-        run: brew install cbindgen
+        run: brew install cbindgen      
       - name: Build and package macOS targets
         run: |
-          rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          mkdir packages
+          mkdir -p packages
           host_triple=$(rustc -vV | sed -n 's/host: //p') # Get the host triple
           for pair in "x86_64-apple-darwin:macos-x86_64" "aarch64-apple-darwin:macos-aarch64"; do
             IFS=":" read -r target name <<< "$pair"            
@@ -113,9 +118,9 @@ jobs:
             cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
             mkdir -p packages/$name
             
-            # Copy header file
+            # Copy header file            
             cp $src_dir/cidrscan.h packages/$name/
-              # Copy all library files that might exist with different extensions
+            # Copy all library files that might exist with different extensions
             # macOS primarily uses .dylib for dynamic libraries
             cp $src_dir/libcidrscan.dylib packages/$name/ || echo "No .dylib file found"
             # Also include static library
@@ -125,9 +130,8 @@ jobs:
             echo "Files in packages/$name directory:"
             ls -la packages/$name
             
-            cd packages/$name
-            zip -r ../../$name.zip *
-            cd ../../
+            # Create zip from current directory
+            (cd packages/$name && zip -r ../../$name.zip *)
           done
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
