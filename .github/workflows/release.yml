@@ -32,16 +32,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
       - name: Build and package cross targets
         run: |
-          mkdir -p packages
+          mkdir -p packages          
           for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-gnu:windows-x86_64"; do
             IFS=":" read -r target name <<< "$pair"            
             cross build --release --target $target
-            # Determine source directory: Use target/release for native Linux build, target/$target/release otherwise
-            if [ "$target" = "x86_64-unknown-linux-gnu" ]; then
-              src_dir="target/release"
-            else
-              src_dir="target/$target/release"
-            fi
+            # Always use target/$target/release for cross builds with cross tool
+            src_dir="target/$target/release"
               # Check what files were built
             echo "Files built in $src_dir:"
             ls -la $src_dir | grep -E 'libcidrscan|cidrscan.dll' || true
@@ -94,16 +90,12 @@ jobs:
       - name: Build and package macOS targets
         run: |
           mkdir -p packages
-          host_triple=$(rustc -vV | sed -n 's/host: //p') # Get the host triple
+          host_triple=$(rustc -vV | sed -n 's/host: //p')
           for pair in "x86_64-apple-darwin:macos-x86_64" "aarch64-apple-darwin:macos-aarch64"; do
             IFS=":" read -r target name <<< "$pair"            
-            cargo build --release --target $target
-            # Determine source directory: Use target/release if target matches host, target/$target/release otherwise
-            if [ "$target" = "$host_triple" ]; then
-              src_dir="target/release"
-            else
-              src_dir="target/$target/release"
-            fi
+            cargo build --release --target $target            
+            # On macOS, artifacts are always in target/$target/release regardless of whether it's the host architecture
+            src_dir="target/$target/release"
             # Check what library files were built
             echo "Library files built in $src_dir:"
             ls -la $src_dir | grep libcidrscan || true
