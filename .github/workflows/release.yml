@@ -34,7 +34,8 @@ jobs:
         run: |
           mkdir packages
           for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-gnu:windows-x86_64"; do
-            IFS=":" read -r target name <<< "$pair"            cross build --release --target $target
+            IFS=":" read -r target name <<< "$pair"            
+            cross build --release --target $target
             # Determine source directory: Use target/release for native Linux build, target/$target/release otherwise
             if [ "$target" = "x86_64-unknown-linux-gnu" ]; then
               src_dir="target/release"
@@ -91,7 +92,8 @@ jobs:
           mkdir packages
           host_triple=$(rustc -vV | sed -n 's/host: //p') # Get the host triple
           for pair in "x86_64-apple-darwin:macos-x86_64" "aarch64-apple-darwin:macos-aarch64"; do
-            IFS=":" read -r target name <<< "$pair"            cargo build --release --target $target
+            IFS=":" read -r target name <<< "$pair"            
+            cargo build --release --target $target
             # Determine source directory: Use target/release if target matches host, target/$target/release otherwise
             if [ "$target" = "$host_triple" ]; then
               src_dir="target/release"
