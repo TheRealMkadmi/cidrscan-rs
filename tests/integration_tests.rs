@@ -13,8 +13,9 @@ fn ipv4_to_u128(a: u8, b: u8, c: u8, d: u8) -> u128 {
 
 #[test]
 fn basic_insert_lookup_delete() {
-    let tree = PatriciaTree::open("test_basic", 128).expect("open failed");
-    let key = ipv4_to_u128(192, 168, 0, 1);
+    let name = format!("test_basic_insert_delete_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 1024).unwrap();
+        let key = ipv4_to_u128(192, 168, 0, 1);
     // initially not found
     assert!(!tree.lookup(key));
     // insert & lookup
@@ -27,7 +28,8 @@ fn basic_insert_lookup_delete() {
 
 #[test]
 fn ttl_expiry_various() {
-    let tree = PatriciaTree::open("test_ttl", 128).unwrap();
+    let name = format!("test_ttl_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 128).unwrap();
     let key1 = ipv4_to_u128(10, 0, 0, 1);
     // zero TTL → immediate expiry
     let _ = tree.insert(key1, 32, 0);
@@ -42,7 +44,8 @@ fn ttl_expiry_various() {
 
 #[test]
 fn ipv6_prefix_behavior() {
-    let tree = PatriciaTree::open("test_ipv6", 64).unwrap();
+    let name = format!("test_ipv6_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 64).unwrap();
     // a sample IPv6 address: 2001:0db8::1
     let segments = [
         0x2001u128 << 112,
@@ -61,12 +64,13 @@ fn ipv6_prefix_behavior() {
 
 #[test]
 fn shared_memory_visibility_between_handles() {
-    let tree1 = PatriciaTree::open("test_shared", 128).unwrap();
+    let name = format!("test_shared_{}", std::process::id());
+    let tree1 = PatriciaTree::open(&name, 128).unwrap();
     let key = ipv4_to_u128(172, 16, 0, 1);
     let _ = tree1.insert(key, 32, 60);
 
     // open a second handle on the same OS‐ID
-    let tree2 = PatriciaTree::open("test_shared", 128).unwrap();
+    let tree2 = PatriciaTree::open(&name, 128).unwrap();
     assert!(tree2.lookup(key));
 
     // ensure delete in one handle is visible in the other
@@ -79,7 +83,8 @@ fn concurrent_threaded_inserts_and_lookups() {
     const THREADS: usize = 8;
     const OPS_PER_THREAD: usize = 1_000;
     // Use Arc directly, PatriciaTree handles internal locking
-    let tree = Arc::new(PatriciaTree::open("test_conc", 16_384).unwrap());
+    let name = format!("test_conc_{}", std::process::id());
+    let tree = Arc::new(PatriciaTree::open(&name, 16_384).unwrap());
     let barrier = Arc::new(Barrier::new(THREADS));
 
     let mut handles = vec![];
@@ -111,7 +116,8 @@ fn stress_test_timing() {
     const CAPACITY: usize = 65_536;
     const NUM_KEYS: usize = 20_000;
 
-    let tree = PatriciaTree::open("test_stress", CAPACITY).unwrap();
+    let name = format!("test_stress_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, CAPACITY).unwrap();
     let keys: Vec<u128> = (0..NUM_KEYS).map(|i| i as u128).collect();
     
     // Assuming bulk_insert exists and works. If not, replace with individual inserts.
