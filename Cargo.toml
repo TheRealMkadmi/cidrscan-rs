@@ -7,6 +7,11 @@ description = "A cross-process, memory-resident, lock-free-read LPM engine with 
 license = "MIT"
 repository = "https://github.com/TheRealMkadmi/cidrscan-rs"
 
+[lib]
+name = "cidrscan"
+# Build both dynamic and static libraries for C compatibility
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
 log = "0.4"
 env_logger = { version = "0.11", default-features = false }

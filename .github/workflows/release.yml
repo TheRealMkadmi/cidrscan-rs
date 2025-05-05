@@ -34,27 +34,32 @@ jobs:
         run: |
           mkdir packages
           for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-gnu:windows-x86_64"; do
-            IFS=":" read -r target name <<< "$pair"
-            cross build --release --target $target
+            IFS=":" read -r target name <<< "$pair"            cross build --release --target $target
             # Determine source directory: Use target/release for native Linux build, target/$target/release otherwise
             if [ "$target" = "x86_64-unknown-linux-gnu" ]; then
               src_dir="target/release"
             else
               src_dir="target/$target/release"
             fi
+            
+            # Check what files were built
+            echo "Files built in $src_dir:"
+            ls -la $src_dir | grep -E 'libcidrscan|cidrscan.dll'
             # Generate C header with cbindgen
             cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
             mkdir -p packages/$name
             # Copy header file
-            cp $src_dir/cidrscan.h packages/$name/
-            # Copy binary files based on target
+            cp $src_dir/cidrscan.h packages/$name/            # Copy binary files based on target
             case "$target" in
               *windows-gnu)
                 # For MinGW builds
-                cp $src_dir/cidrscan.dll packages/$name/ || true
+                cp $src_dir/cidrscan.dll packages/$name/ || echo "No .dll file found"
+                cp $src_dir/libcidrscan.a packages/$name/ || echo "No static .a file found"
                 ;;
               *)
-                cp $src_dir/libcidrscan.* packages/$name/ || true
+                # For Linux builds
+                cp $src_dir/libcidrscan.so packages/$name/ || echo "No .so file found"
+                cp $src_dir/libcidrscan.a packages/$name/ || echo "No static .a file found"
                 ;;
             esac
             cd packages/$name
@@ -62,7 +67,6 @@ jobs:
             cd ../../
           done
       - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: '*.zip'
@@ -87,26 +91,43 @@ jobs:
           mkdir packages
           host_triple=$(rustc -vV | sed -n 's/host: //p') # Get the host triple
           for pair in "x86_64-apple-darwin:macos-x86_64" "aarch64-apple-darwin:macos-aarch64"; do
-            IFS=":" read -r target name <<< "$pair"
-            cargo build --release --target $target
+            IFS=":" read -r target name <<< "$pair"            cargo build --release --target $target
             # Determine source directory: Use target/release if target matches host, target/$target/release otherwise
             if [ "$target" = "$host_triple" ]; then
               src_dir="target/release"
             else
               src_dir="target/$target/release"
             fi
+            
+            # Check what library files were built
+            echo "Library files built in $src_dir:"
+            ls -la $src_dir | grep libcidrscan
+            
+            echo "Source directory: $src_dir"
+            echo "Available files in $src_dir:"
+            ls -la $src_dir
+            
             # Generate C header with cbindgen
             cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
             mkdir -p packages/$name
+            
             # Copy header file
             cp $src_dir/cidrscan.h packages/$name/
-            cp $src_dir/libcidrscan.dylib packages/$name/ || true
+              # Copy all library files that might exist with different extensions
+            # macOS primarily uses .dylib for dynamic libraries
+            cp $src_dir/libcidrscan.dylib packages/$name/ || echo "No .dylib file found"
+            # Also include static library
+            cp $src_dir/libcidrscan.a packages/$name/ || echo "No .a file found"
+            
+            # Check what was actually copied
+            echo "Files in packages/$name directory:"
+            ls -la packages/$name
+            
             cd packages/$name
             zip -r ../../$name.zip *
             cd ../../
           done
       - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: '*.zip'
