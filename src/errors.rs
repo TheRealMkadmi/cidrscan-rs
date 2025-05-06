@@ -17,6 +17,8 @@ pub enum ErrorCode {
     ShmemOpenFailed = 8,
     ResizeFailed = 9,
     FlushFailed = 10,
+    TagTooLong = 11,
+    NotFound = 12,
     Unknown = 255,
 }
 
@@ -34,6 +36,8 @@ impl ErrorCode {
             ErrorCode::ShmemOpenFailed => "Shared memory open failed",
             ErrorCode::ResizeFailed => "Resize operation failed",
             ErrorCode::FlushFailed => "Flush operation failed",
+            ErrorCode::TagTooLong => "Tag too long",
+            ErrorCode::NotFound => "Not found",
             ErrorCode::Unknown => "Unknown error",
         }
     }
@@ -71,6 +75,8 @@ pub extern "C" fn patricia_strerror(code: ErrorCode) -> *const c_char {
         ErrorCode::ShmemOpenFailed => b"Shared memory open failed\0".as_ptr() as *const c_char,
         ErrorCode::ResizeFailed => b"Resize operation failed\0".as_ptr() as *const c_char,
         ErrorCode::FlushFailed => b"Flush operation failed\0".as_ptr() as *const c_char,
+        ErrorCode::TagTooLong => b"Tag too long\0".as_ptr() as *const c_char,
+        ErrorCode::NotFound => b"Not found\0".as_ptr() as *const c_char,
         ErrorCode::Unknown => b"Unknown error\0".as_ptr() as *const c_char,
     }
 }
@@ -84,6 +90,8 @@ pub fn map_error(e: &crate::types::Error) -> ErrorCode {
         InvalidPrefix => ErrorCode::InvalidPrefix,
         BranchHasChildren => ErrorCode::BranchHasChildren,
         LockInitFailed => ErrorCode::LockInitFailed,
+        TagTooLong => ErrorCode::TagTooLong,
         // Add more mappings as needed
+            _ => ErrorCode::Unknown,
     }
 }

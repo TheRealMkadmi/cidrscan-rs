@@ -19,3 +19,8 @@ env     = { RUSTFLAGS = "-Zsanitizer=thread" }
 command = "cargo"
 args    = ["test", "-Zbuild-std", "--target", "x86_64-unknown-linux-gnu"]
 env     = { RUSTFLAGS = "-Zsanitizer=memory -Zsanitizer-memory-track-origins" }
+# Generate C header for FFI bindings
+[tasks.generate-header]
+description = "Generate C header via cbindgen"
+command = "cbindgen"
+args = ["--config", "cbindgen.toml", "--crate", "cidrscan", "--output", "cidrscan.h"]

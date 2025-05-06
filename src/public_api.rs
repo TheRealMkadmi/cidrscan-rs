@@ -4,6 +4,16 @@ use std::sync::Arc;
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 
+use std::os::raw::c_char;
+use crate::constants::TAG_MAX_LEN;
+
+#[repr(C)]
+pub struct PatriciaMatchT {
+    pub key_high: u64,
+    pub key_low: u64,
+    pub plen: u8,
+    pub tag: [c_char; TAG_MAX_LEN],
+}
 static REGISTRY: Lazy<DashMap<i32, Arc<PatriciaTree>>> = Lazy::new(|| DashMap::new());
 static NEXT_HANDLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
@@ -61,7 +71,7 @@ pub extern "C" fn patricia_insert(
         }
     };
     let key = ((key_high as u128) << 64) | (key_low as u128);
-    match tree.insert(key, prefix_len, ttl) {
+    match tree.insert(key, prefix_len, ttl, None) {
         Ok(_) => {
             set_last_error(ErrorCode::Success);
             ErrorCode::Success
@@ -88,7 +98,7 @@ pub extern "C" fn patricia_lookup(
         }
     };
     let key = ((key_high as u128) << 64) | (key_low as u128);
-    let found = tree.lookup(key);
+    let found = tree.lookup(key).is_some();
     set_last_error(ErrorCode::Success);
     found
 }
@@ -242,7 +252,7 @@ pub extern "C" fn patricia_lookup_v4(
             return false;
         }
     };
-    let found = tree.lookup_v4(addr);
+    let found = tree.lookup_v4(addr).is_some();
     set_last_error(ErrorCode::Success);
     found
 }
@@ -378,5 +388,48 @@ pub extern "C" fn patricia_resize(handle: i32, new_capacity: usize) -> ErrorCode
     } else {
         set_last_error(ErrorCode::InvalidHandle);
         ErrorCode::InvalidHandle
+    }
+}
+
+// C ABI: lookup with full match info
+#[no_mangle]
+pub extern "C" fn patricia_lookup_full(
+    handle: i32,
+    key_high: u64,
+    key_low: u64,
+    out: *mut PatriciaMatchT,
+) -> ErrorCode {
+    let tree = match get_tree(handle) {
+        Ok(tree) => tree,
+        Err(code) => {
+            set_last_error(code);
+            return code;
+        }
+    };
+    let key = ((key_high as u128) << 64) | (key_low as u128);
+    match tree.lookup(key) {
+        Some(m) => {
+            unsafe {
+                (*out).key_high = (m.cidr_key >> 64) as u64;
+                (*out).key_low = m.cidr_key as u64;
+                (*out).plen = m.plen;
+                // zero out tag buffer
+                for i in 0..TAG_MAX_LEN {
+                    (*out).tag[i] = 0;
+                }
+                // copy tag bytes up to TAG_MAX_LEN
+                let bytes = m.tag.as_bytes();
+                let len = bytes.len().min(TAG_MAX_LEN);
+                for i in 0..len {
+                    (*out).tag[i] = bytes[i] as c_char;
+                }
+            }
+            set_last_error(ErrorCode::Success);
+            ErrorCode::Success
+        }
+        None => {
+            set_last_error(ErrorCode::NotFound);
+            ErrorCode::NotFound
+        }
     }
 }

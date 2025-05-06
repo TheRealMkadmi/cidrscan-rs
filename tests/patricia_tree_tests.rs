@@ -14,10 +14,10 @@ fn basic_ops() {
     let ip = 0xC0A80001; // 192.168.0.1
     let key = v4_key(ip);
     let plen = v4_plen(32);
-    let _ = tree.insert(key, plen, 60);
-    assert!(tree.lookup(key));
+    let _ = tree.insert(key, plen, 60, None);
+    assert!(tree.lookup(key).is_some());
     _ = tree.delete(key, plen);
-    assert!(!tree.lookup(key));
+    assert!(tree.lookup(key).is_none());
 }
 
 #[test]
@@ -27,9 +27,9 @@ fn ttl_expiry() {
     let ip = 0x01020304;
     let key = v4_key(ip);
     let plen = v4_plen(32);
-    let _ = tree.insert(key, plen, 1);
+    let _ = tree.insert(key, plen, 1, None);
     std::thread::sleep(std::time::Duration::from_secs(2));
-    assert!(!tree.lookup(key));
+    assert!(tree.lookup(key).is_none());
 }
 #[test]
 fn split_creates_balanced_branches() {
@@ -40,20 +40,20 @@ fn split_creates_balanced_branches() {
 
     let name = format!("test_shm_split_{}", std::process::id());
     let tree = PatriciaTree::open(&name, 1024).unwrap();
-    let _ = tree.insert(key1, plen, 60);
-    _ = tree.insert(key2, plen, 60);
+    let _ = tree.insert(key1, plen, 6, None);
+    _ = tree.insert(key2, plen, 60, None);
 
     // Both keys should be found
-    assert!(tree.lookup(key1));
-    assert!(tree.lookup(key2));
+    assert!(tree.lookup(key1).is_some());
+    assert!(tree.lookup(key2).is_some());
 
     // Deleting one should not affect the other
     _ = tree.delete(key1, plen);
-    assert!(!tree.lookup(key1));
-    assert!(tree.lookup(key2));
+    assert!(tree.lookup(key1).is_none());
+    assert!(tree.lookup(key2).is_some());
 
     _ = tree.delete(key2, plen);
-    assert!(!tree.lookup(key2));
+    assert!(tree.lookup(key2).is_none());
 }
 
 
@@ -95,11 +95,11 @@ proptest! {
 
         // Deleted keys must be absent
         for &(k, _) in to_delete {
-            assert!(!tree.lookup_v4(k as u32), "Deleted key still present: {k:#x}");
+            assert!(tree.lookup_v4(k as u32).is_none(), "Deleted key still present: {k:#x}");
         }
         // Kept keys must be present
         for &(k, _) in to_keep {
-            assert!(tree.lookup_v4(k as u32), "Kept key missing: {k:#x}");
+            assert!(tree.lookup_v4(k as u32).is_some(), "Kept key missing: {k:#x}");
         }
     }
 }
@@ -118,8 +118,8 @@ fn stress_concurrent_inserts_and_lookups() {
             let base = (t as u128) << 32;
             for i in 0..ops_per_thread {
                 let key = base | (i as u128);
-                tree.insert(key, 128, 60).expect("insert should not fail");
-                assert!(tree.lookup(key));
+                tree.insert(key, 128, 60, None).expect("insert should not fail");
+                assert!(tree.lookup(key).is_some());
                 if i % 2 == 0 {
                     let _ = tree.delete(key, 128);
                 }
@@ -137,17 +137,27 @@ fn test_internal_node_terminal_flag_and_delete() {
     let tree = PatriciaTree::open("test_internal_node", 16).unwrap();
 
     // Insert /32 and /24, so /24 is an internal node after /32
-    tree.insert(v4_key(0x01020304), v4_plen(32), 60).unwrap(); // exact /32 → 128 bits
-    tree.insert(v4_key(0x01020300), v4_plen(24), 60).unwrap(); // prefix /24
+    tree.insert(v4_key(0x01020304), v4_plen(32), 60,None).unwrap(); // exact /32 → 128 bits
+    tree.insert(v4_key(0x01020300), v4_plen(24), 60,None).unwrap(); // prefix /24
 
     // Both should be found
-    assert!(tree.lookup(v4_key(0x01020304)));
-    assert!(tree.lookup(v4_key(0x01020300)));
+    assert!(tree.lookup(v4_key(0x01020304)).is_some());
+    assert!(tree.lookup(v4_key(0x01020300)).is_some());
 
     // Delete /24 (internal node)
     tree.delete(v4_key(0x01020300), v4_plen(24)).unwrap();
 
     // /24 should be gone, /32 should remain
-    assert!(!tree.lookup(v4_key(0x01020300)));
-    assert!(tree.lookup(v4_key(0x01020304)));
+    assert!(tree.lookup(v4_key(0x01020300)).is_none());
+    assert!(tree.lookup(v4_key(0x01020304)).is_some());
+}
+ 
+#[test]
+fn v4_lookup_returns_tag() {
+    let name = format!("test_shm_tag_{}", std::process::id());
+    let t = PatriciaTree::open(&name, 128).unwrap();
+    t.insert(v4_key(0x08080808), v4_plen(24), 3600, Some("Google-DNS")).unwrap();
+    let m = t.lookup(v4_key(0x08080808)).unwrap();
+    assert_eq!(m.plen, v4_plen(24));
+    assert_eq!(m.tag, "Google-DNS");
 }

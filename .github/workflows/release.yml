@@ -26,68 +26,100 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 1. Build native targets
       - name: Install cross
         run: cargo install cross
       - name: Install cbindgen
         run: cargo install cbindgen
-
       - name: Install Rust stable toolchain
         run: rustup default stable
       - name: Add Rust targets
         run: rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
       - name: Install MinGW dependencies
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
-      - name: Build and package cross targets
+
+      - name: Build Linux and Windows binaries
         run: |
-          mkdir -p packages          
-          for pair in "x86_64-unknown-linux-gnu:linux-x86_64" "aarch64-unknown-linux-gnu:linux-aarch64" "x86_64-pc-windows-gnu:windows-x86_64"; do
-            IFS=":" read -r target name <<< "$pair"            
+          mkdir -p packages
+          for pair in \
+            "x86_64-unknown-linux-gnu:linux-x86_64" \
+            "aarch64-unknown-linux-gnu:linux-aarch64" \
+            "x86_64-pc-windows-gnu:windows-x86_64"; do
+
+            IFS=":" read -r target name <<< "$pair"
             cross build --release --target $target
-            # Always use target/$target/release for cross builds with cross tool
-            src_dir="target/$target/release"
-              # Check what files were built
-            echo "Files built in $src_dir:"
-            ls -la $src_dir | grep -E 'libcidrscan|cidrscan.dll' || true
-            
-            # Generate C header with cbindgen
-            cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
-            
-            # Create package directory
+            src="target/$target/release"
+
+            # generate C header
+            cbindgen --config cbindgen.toml --crate cidrscan --output $src/cidrscan.h
+
+            # copy into per-arch folder
             mkdir -p packages/$name
-            
-            # Copy header file
-            cp $src_dir/cidrscan.h packages/$name/
-            
-            # Copy binary files based on target           
-             case "$target" in *windows-gnu)
-                # For MinGW builds
-                cp $src_dir/cidrscan.dll packages/$name/ || echo "No .dll file found"
-                cp $src_dir/libcidrscan.a packages/$name/ || echo "No static .a file found"
-                # Also copy lib files for MSVC compatibility
-                cp $src_dir/cidrscan.lib packages/$name/ || echo "No .lib file found"
-                cp $src_dir/cidrscan.dll.lib packages/$name/ || echo "No .dll.lib file found"
+            cp $src/cidrscan.h                            packages/$name/
+            case "$target" in
+              *windows-gnu)
+                cp $src/cidrscan.dll     packages/$name/ || true
+                cp $src/libcidrscan.a     packages/$name/ || true
+                cp $src/cidrscan.lib      packages/$name/ || true
+                cp $src/cidrscan.dll.lib  packages/$name/ || true
                 ;;
               *)
-                # For Linux builds
-                cp $src_dir/libcidrscan.so packages/$name/ || echo "No .so file found"
-                cp $src_dir/libcidrscan.a packages/$name/ || echo "No static .a file found"
+                cp $src/libcidrscan.so    packages/$name/ || true
+                cp $src/libcidrscan.a      packages/$name/ || true
                 ;;
             esac
-            
-            # Create zip from current directory
-            (cd packages/$name && zip -r ../../$name.zip *)
+
           done
+
+      # 2. Generate PHP FFI wrappers with FFIMe
+      - name: Setup PHP with PECL extension
+        uses: shivammathur/setup-php@v2 
+        with:
+          php-version: '8.4'
+
+      - name: Install FFIMe generator
+        run: |
+          cd binding_skeletons/php
+          composer require ircmaxell/ffime --no-interaction --dev
+
+      - name: Generate PHP wrappers
+        run: |
+          cd binding_skeletons/php
+          # point generate.php at the Linux build
+          LIB_PATH="$(pwd)/../../target/x86_64-unknown-linux-gnu/release/libcidrscan.so"
+          HDR_PATH="$(pwd)/../../target/x86_64-unknown-linux-gnu/release/cidrscan.h"
+          php generate.php \
+            --lib "$LIB_PATH" \
+            --header "$HDR_PATH" \
+            --output php
+
+      # 3. Package PHP wrappers
+      - name: Zip PHP wrappers
+        run: |
+          cd binding_skeletons/php
+          zip -r ../../../citadel-ffi-php.zip \
+            php/ composer.json README.md LICENSE
+
+      # 4. Zip native libraries per-arch
+      - name: Create native zips
+        run: |
+          for name in linux-x86_64 linux-aarch64 windows-x86_64; do
+            (cd packages/$name && zip -r ../../$name.zip .)
+          done
+
+      # 5. Upload all zips
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           files: '*.zip'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-macos:
     name: Build macOS
     needs: test
     runs-on: macos-latest
-
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable toolchain
@@ -99,40 +131,28 @@ jobs:
       - name: Build and package macOS targets
         run: |
           mkdir -p packages
-          host_triple=$(rustc -vV | sed -n 's/host: //p')
-          for pair in "x86_64-apple-darwin:macos-x86_64" "aarch64-apple-darwin:macos-aarch64"; do
-            IFS=":" read -r target name <<< "$pair"            
-            cargo build --release --target $target            
-            # On macOS, artifacts are always in target/$target/release regardless of whether it's the host architecture
-            src_dir="target/$target/release"
-            # Check what library files were built
-            echo "Library files built in $src_dir:"
-            ls -la $src_dir | grep libcidrscan || true
-            
-            echo "Source directory: $src_dir"
-            echo "Available files in $src_dir:"
-            ls -la $src_dir
-            
-            # Generate C header with cbindgen
-            cbindgen --config cbindgen.toml --crate cidrscan --output $src_dir/cidrscan.h
+          for pair in \
+            "x86_64-apple-darwin:macos-x86_64" \
+            "aarch64-apple-darwin:macos-aarch64"; do
+
+            IFS=":" read -r target name <<< "$pair"
+            cargo build --release --target $target
+            src="target/$target/release"
+
+            cbindgen --config cbindgen.toml --crate cidrscan --output $src/cidrscan.h
             mkdir -p packages/$name
-            
-            # Copy header file            
-            cp $src_dir/cidrscan.h packages/$name/
-            # Copy all library files that might exist with different extensions
-            # macOS primarily uses .dylib for dynamic libraries
-            cp $src_dir/libcidrscan.dylib packages/$name/ || echo "No .dylib file found"
-            # Also include static library
-            cp $src_dir/libcidrscan.a packages/$name/ || echo "No .a file found"
-            
-            # Check what was actually copied
-            echo "Files in packages/$name directory:"
-            ls -la packages/$name
-            
-            # Create zip from current directory
-            (cd packages/$name && zip -r ../../$name.zip *)
+            cp $src/cidrscan.h            packages/$name/
+            cp $src/libcidrscan.dylib     packages/$name/ || true
+            cp $src/libcidrscan.a         packages/$name/ || true
           done
-      - name: Upload release assets
+
+      - name: Create macOS zips
+        run: |
+          for name in macos-x86_64 macos-aarch64; do
+            (cd packages/$name && zip -r ../../$name.zip .)
+          done
+
+      - name: Upload macOS assets
         uses: softprops/action-gh-release@v2
         with:
           files: '*.zip'

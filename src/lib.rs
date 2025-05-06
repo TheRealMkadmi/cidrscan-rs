@@ -1,10 +1,10 @@
-pub mod helpers;
 pub mod constants;
-pub mod types;
-pub mod shmem_rwlock;
-pub mod platform;
 pub mod errors;
+pub mod helpers;
+pub mod platform;
+pub mod shmem_rwlock;
 pub mod telemetry;
+pub mod types;
 
 // Install metrics recorder when the crate is loaded
 #[doc(hidden)]
@@ -17,40 +17,36 @@ fn _telemetry_bootstrap() {
 #[used]
 static _BOOTSTRAP: fn() = _telemetry_bootstrap;
 
-use helpers::*;
 use constants::*;
-use types::*;
 use crossbeam_queue::SegQueue;
+use helpers::*;
 use types::Offset;
+use types::*;
 
 use crate::shmem_rwlock::RawRwLock;
 use crossbeam_epoch as epoch;
+use log::{debug, error, info, trace, warn};
+use metrics::{counter, gauge};
+use once_cell::sync::OnceCell;
 use raw_sync::Timeout; // needed by API
 use shared_memory::{ShmemConf, ShmemError};
+use std::sync::Arc;
 use std::{
     mem::size_of,
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-    time::{SystemTime, UNIX_EPOCH, Duration},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use std::sync::Arc;
-use log::{trace, debug, info, warn, error};
-use once_cell::sync::OnceCell;
-use metrics::{counter, gauge};
-
-
 
 #[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
 pub use crate::platform::windows::enable_se_create_global_privilege;
 
-
 // ===== Compile-time assertions for alignment and size =====
-const HEADER_PADDED: usize = helpers::align_up(std::mem::size_of::<types::Header>(), constants::CACHE_LINE);
+const HEADER_PADDED: usize =
+    helpers::align_up(std::mem::size_of::<types::Header>(), constants::CACHE_LINE);
 const _: () = assert!(HEADER_PADDED % constants::CACHE_LINE == 0);
 const _: () = assert!(std::mem::align_of::<types::Header>() == constants::CACHE_LINE);
 const _: () = assert!(std::mem::align_of::<types::Node>() == constants::CACHE_LINE);
-
-
 
 #[allow(dead_code)]
 impl PatriciaTree {
@@ -78,7 +74,7 @@ impl PatriciaTree {
     pub fn insert_v4(&self, addr: u32, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
         let key = v4_key(addr);
         let plen128 = v4_plen(prefix_len);
-        self.insert(key, plen128, ttl_secs)
+        self.insert(key, plen128, ttl_secs, None)
     }
 
     /// Delete an IPv4 prefix.
@@ -88,8 +84,8 @@ impl PatriciaTree {
         self.delete(key, plen128)
     }
 
-    /// Lookup an IPv4 address against stored prefixes.
-    pub fn lookup_v4(&self, addr: u32) -> bool {
+    /// Lookup an IPv4 address against stored prefixes, returning match info if found.
+    pub fn lookup_v4(&self, addr: u32) -> Option<Match<'_>> {
         let key = v4_key(addr);
         self.lookup(key)
     }
@@ -113,7 +109,7 @@ impl PatriciaTree {
         Self::ensure_logging();
         let hash = fnv1a_64(name);
         let os_name = format!("{PREFIX}{:016x}", hash);
-        let region_size = HEADER_PADDED + capacity * size_of::<Node>();
+        let region_size = HEADER_PADDED + capacity * size_of::<Node>() + capacity * TAG_MAX_LEN;
 
         let conf = || ShmemConf::new().os_id(&os_name).size(region_size);
         let (shmem, is_creator) = match conf().create() {
@@ -127,6 +123,12 @@ impl PatriciaTree {
         let hdr_ptr = base_ptr as *mut Header;
         let hdr = NonNull::new(hdr_ptr).ok_or_else(|| ShmemError::MapOpenFailed(71))?;
         let hdr_mut = unsafe { &mut *hdr_ptr };
+
+        let tag_base_ptr = unsafe {
+            base.as_ptr()
+                .add(HEADER_PADDED + capacity * size_of::<Node>())
+        };
+        let tag_base = NonNull::new(tag_base_ptr).unwrap();
 
         // === PATCH 1: Header parameter mismatch guard ===
         if !is_creator {
@@ -187,6 +189,7 @@ impl PatriciaTree {
         Ok(Self {
             shmem,
             base,
+            tag_base,
             hdr,
             os_id: os_name.clone(),
             freelist: Arc::new(SegQueue::new()),
@@ -203,7 +206,7 @@ impl PatriciaTree {
     }
 
     /// Insert a key with a given prefix length and TTL
-    pub fn insert(&self, key: u128, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
+    pub fn insert(&self, key: u128, prefix_len: u8, ttl_secs: u64, tag: Option<&str>) -> Result<(), Error> {
         counter!("cidrscan_inserts_total").increment(1);
         info!(
             "[INSERT] key={:x}, prefix_len={}, ttl={}",
@@ -263,8 +266,8 @@ impl PatriciaTree {
                     error!("[INSERT] PANIC: Capacity exceeded before allocation.");
                     return Err(Error::CapacityExceeded);
                 }
-                let (leaf_offset, leaf_gen) =
-                    self.allocate_node_with_gen(stored_key, prefix_len, expires)?;
+                let (leaf_offset, leaf_gen, _) =
+                    self.alloc_node(stored_key, prefix_len, expires, tag)?;
                 debug!(
                     "[INSERT] Allocated leaf node at offset={}, gen={}. Storing link.",
                     leaf_offset,
@@ -342,8 +345,8 @@ impl PatriciaTree {
                     error!("[INSERT] PANIC: Capacity exceeded before insert above allocation.");
                     return Err(Error::CapacityExceeded);
                 }
-                let (new_node_offset, new_node_gen) =
-                    self.allocate_node_with_gen(stored_key, prefix_len, expires)?;
+                let (new_node_offset, new_node_gen, _) =
+                    self.alloc_node(stored_key, prefix_len, expires, tag)?;
                 debug!(
                     "[INSERT] Allocated new node for insert above at offset={}, gen={}.",
                     new_node_offset,
@@ -588,8 +591,8 @@ impl PatriciaTree {
 
                 if child_ptr == 0 {
                     // Child missing → insert leaf *here*
-                    let (leaf_off, leaf_gen) =
-                        self.allocate_node_with_gen(stored_key, prefix_len, expires)?;
+                    let (leaf_off, leaf_gen, _) =
+                        self.alloc_node(stored_key, prefix_len, expires, tag)?;
                     child_atomic.store(pack(leaf_off, leaf_gen), Ordering::Release);
                     debug!(
                         "[INSERT] Inserted new leaf at offset={}, gen={}",
@@ -675,10 +678,16 @@ impl PatriciaTree {
             // ─── PATCH 4: only the thread that over‑allocated rolls back ───
             loop {
                 let cur = hdr.next_index.load(Ordering::SeqCst);
-                if cur == 0 { break; }
-                if hdr.next_index
-                      .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
-                      .is_ok() { break; }
+                if cur == 0 {
+                    break;
+                }
+                if hdr
+                    .next_index
+                    .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
             }
 
             // ③ Arena full – try once to flush deferred frees
@@ -704,6 +713,35 @@ impl PatriciaTree {
                 return Err(Error::CapacityExceeded); // caller will drop lock and retry
             }
         }
+    }
+
+    /// Allocates a node and optionally copies a tag (≤ TAG_MAX_LEN).
+    /// Returns (node_offset, generation, tag_index).
+    pub fn alloc_node(
+        &self,
+        key: u128,
+        plen: u8,
+        ttl: u64,
+        tag: Option<&str>,
+    ) -> Result<(Offset, u32, u32), Error> {
+        if let Some(s) = tag {
+            if s.len() > TAG_MAX_LEN {
+                return Err(Error::TagTooLong);
+            }
+        }
+        let (off, gen) = self.allocate_node_with_gen(key, plen, ttl)?;
+        let idx = (off - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+        // Only write into the slab if we actually have a tag
+        if let Some(s) = tag {
+            unsafe {
+                let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+            }
+        }
+        let node = unsafe { &*(self.base.as_ptr().add(off as usize) as *const Node) };
+        node.tag_off.store(idx, Ordering::Release);
+        Ok((off, gen, idx))
     }
 
     #[inline(always)]
@@ -757,17 +795,17 @@ impl PatriciaTree {
         self.retire_offset(off_u32);
     }
 
-    /// Lookup a key; true if found and not expired (Revised for Patricia structure)
-    pub fn lookup(&self, key: u128) -> bool {
+    /// Lookup a key and return detailed match information if found and not expired.
+    pub fn lookup(&self, key: u128) -> Option<Match<'_>> {
         let hdr = unsafe { &*self.hdr.as_ptr() };
-        let mut link          = hdr.root_offset.load(Ordering::Acquire);
-        let mut parent_link   = &hdr.root_offset as *const AtomicU64; // track parent
-        let mut parent_plen   = 0u8;
+        let mut link = hdr.root_offset.load(Ordering::Acquire);
+        let mut parent_link = &hdr.root_offset as *const AtomicU64; // track parent
+        let mut parent_plen = 0u8;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        loop {
+        while link != 0 {
             let (node, gen) = match self.follow(link) {
                 Some((n, g)) => (n, g),
                 None => break,
@@ -783,9 +821,9 @@ impl PatriciaTree {
 
             // Work with the masked (canonical) value for CPL and equality
             let canon = canonical(key, node.prefix_len);
-            let cpl   = common_prefix_len(canon, node.key, node.prefix_len);
+            let cpl = common_prefix_len(canon, node.key, node.prefix_len);
             if cpl < node.prefix_len {
-                return false;
+                return None;
             }
 
             let exp = node.expires.load(Ordering::Acquire);
@@ -797,27 +835,46 @@ impl PatriciaTree {
                 {
                     // ─── PATCH 3: opportunistic GC of dead leaves ───
                     if exp < now {
-                        if let Some(_g) = unsafe { hdr.lock.assume_init_ref().try_write_lock(Timeout::Val(Duration::from_secs(0))) } {
+                        if let Some(_g) = unsafe {
+                            hdr.lock
+                                .assume_init_ref()
+                                .try_write_lock(Timeout::Val(Duration::from_secs(0)))
+                        } {
                             // double‑check under lock
                             if node.expires.load(Ordering::Acquire) < now {
                                 node.is_terminal.store(0, Ordering::Release);
                                 node.refcnt.store(0, Ordering::Release);
                                 hdr.free_slots.fetch_add(1, Ordering::Release);
-                                let off = (node as *const _ as usize
-                                              - self.base.as_ptr() as usize) as Offset;
+                                let off = (node as *const _ as usize - self.base.as_ptr() as usize)
+                                    as Offset;
                                 self.retire_offset(off);
                             }
                         }
                         link = hdr.root_offset.load(Ordering::Acquire);
                         continue;
                     }
-                    return true;
+                    // Return the match info
+                    let idx = node.tag_off.load(Ordering::Acquire);
+                    unsafe {
+                        let ptr = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN);
+                        let slice = std::slice::from_raw_parts(ptr, TAG_MAX_LEN);
+                        let mut len = TAG_MAX_LEN;
+                        while len > 0 && slice[len - 1] == 0 {
+                            len -= 1;
+                        }
+                        let tag = core::str::from_utf8_unchecked(&slice[..len]);
+                        return Some(Match {
+                            cidr_key: node.key,
+                            plen: node.prefix_len,
+                            tag,
+                        });
+                    }
                 }
                 // else: internal node expired, but traversal continues
             }
 
             if node.prefix_len >= 128 {
-                return false;
+                return None;
             }
 
             let next_bit = get_bit(key, node.prefix_len);
@@ -844,7 +901,7 @@ impl PatriciaTree {
 
             link = child_link;
         }
-        false
+        None
     }
     /// Delete a key with a given prefix length (expire immediately, concurrency-safe, only expires exact leaf nodes).
     /// Both `key` and `prefix_len` must match a leaf node for deletion to occur.
@@ -867,8 +924,7 @@ impl PatriciaTree {
         (current_offset, current_gen) = unpack(current_ptr);
         debug!(
             "[DELETE] Starting at root_offset={}, gen={}",
-            current_offset,
-            current_gen
+            current_offset, current_gen
         );
 
         while current_offset != 0 {
@@ -886,9 +942,7 @@ impl PatriciaTree {
             }
             debug!(
                 "[DELETE] Node: key={:x}, prefix_len={}, gen={}",
-                node.key,
-                node.prefix_len,
-                node_gen
+                node.key, node.prefix_len, node_gen
             );
 
             // Compare the canonical key against the node's key up to the node's prefix length.
@@ -967,7 +1021,7 @@ impl PatriciaTree {
     /// Bulk insert multiple entries
     pub fn bulk_insert(&self, items: &[(u128, u8, u64)]) -> Result<(), Error> {
         for &(k, l, t) in items {
-            self.insert(k, l, t)?;
+            self.insert(k, l, t, None)?;
         }
         Ok(())
     }
@@ -1064,8 +1118,8 @@ impl PatriciaTree {
 
         // ---- build a bigger mapping next to the old one -------------------
         let next_name = format!("{}_next{}", self.os_id, std::process::id());
-        let mut next = PatriciaTree::open(&next_name, new_capacity)
-            .map_err(|_| Error::CapacityExceeded)?;
+        let mut next =
+            PatriciaTree::open(&next_name, new_capacity).map_err(|_| Error::CapacityExceeded)?;
 
         // ---- DFS copy live prefixes --------------------------------------
         let mut stack = Vec::with_capacity(64);
@@ -1079,16 +1133,13 @@ impl PatriciaTree {
             if node.is_terminal.load(Ordering::Acquire) == 1
                 && node.refcnt.load(Ordering::Acquire) > 0
             {
-                let ttl = node
-                    .expires
-                    .load(Ordering::Acquire)
-                    .saturating_sub(
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                    );
-                next.insert(node.key, node.prefix_len, ttl)?;
+                let ttl = node.expires.load(Ordering::Acquire).saturating_sub(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                );
+                next.insert(node.key, node.prefix_len, ttl, None)?;
             }
             let l = node.left.load(Ordering::Acquire);
             let r = node.right.load(Ordering::Acquire);
@@ -1105,8 +1156,8 @@ impl PatriciaTree {
         // `self` mutably while the swap happens.
         unsafe {
             std::ptr::swap(&mut self.shmem, &mut next.shmem);
-            std::ptr::swap(&mut self.base,  &mut next.base);
-            std::ptr::swap(&mut self.hdr,   &mut next.hdr);
+            std::ptr::swap(&mut self.base, &mut next.base);
+            std::ptr::swap(&mut self.hdr, &mut next.hdr);
             std::ptr::swap(&mut self.os_id, &mut next.os_id);
         }
         // `next` now owns the *old* mapping and will unmap it on drop.

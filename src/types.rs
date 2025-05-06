@@ -22,6 +22,8 @@ pub enum Error {
     /// Failed to open or initialise the in‑place RW‑lock.
     LockInitFailed,
     // ... (extend as needed)
+    /// Tag string exceeds maximum allowed length
+    TagTooLong,
 }
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
@@ -52,7 +54,7 @@ pub struct Node {
     /// ABA generation counter to prevent reuse hazards
     pub generation: AtomicU32, // ABA generation counter
     pub is_terminal: AtomicU8, // 0 = not stored; 1 = stored
-    pub _pad2: [u8; 4], // padding to align next atomics
+    pub tag_off: AtomicU32,
     pub left: AtomicU64, // packed (offset, generation) to left child
     pub right: AtomicU64, // packed (offset, generation) to right child
     pub expires: AtomicU64, // Unix epoch seconds: TTL expiration
@@ -64,6 +66,7 @@ pub struct PatriciaTree {
     pub shmem: Shmem,         // The shared memory mapping
     pub hdr: NonNull<Header>, // Pointer to header in shared memory
     pub base: NonNull<u8>,    // Base pointer for node offsets
+    pub tag_base: NonNull<u8>, // start of tag slab
     pub os_id: String,        // Track the shared memory name for Drop
     pub freelist: Arc<SegQueue<Offset>>, // locally-owned queue of freed offsets
 }
@@ -81,3 +84,8 @@ unsafe impl Sync for PatriciaTree {}
 // 2. The raw pointers themselves are stable and safe even across unwinding boundaries
 impl std::panic::RefUnwindSafe for PatriciaTree {}
 impl std::panic::UnwindSafe for PatriciaTree {}
+pub struct Match<'a> {
+    pub cidr_key: u128,
+    pub plen: u8,
+    pub tag: &'a str,
+}
