@@ -22,6 +22,7 @@ dashmap = "6.1.0"
 crossbeam-epoch = "0.9.18"
 crossbeam-queue = "0.3.12"
 metrics = "0.22"
+ipnet = "2.11.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = "0.59.0"

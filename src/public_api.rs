@@ -1,12 +1,30 @@
-use crate::PatriciaTree;
-use crate::errors::{ErrorCode, set_last_error, map_error};
-use std::sync::Arc;
+//! Safe-by-default, registry-free FFI surface for CIDRScan-rs 0.2
+//! ---------------------------------------------------------------------------
+//! * Opaque handle = raw pointer returned from `cidr_open`
+//! * CIDRs & IPs are accepted as UTF-8 strings (parsed with `ipnet`)
+//! * No global registry, no integer IDs.
+//!
+//! In Rust you normally use `PatriciaTree` directly; this file exists purely
+//! to yield a minimal, language-agnostic C ABI.
+
+use crate::{
+    constants::TAG_MAX_LEN,
+    errors::{map_error, ErrorCode},
+    helpers::{v4_key, v4_plen},
+    PatriciaTree,
+};
+use ipnet::IpNet;
 use once_cell::sync::Lazy;
-use dashmap::DashMap;
+use std::{
+    ffi::{CStr, CString},
+    os::raw::c_char,
+    ptr,
+};
 
-use std::os::raw::c_char;
-use crate::constants::TAG_MAX_LEN;
+/// Opaque handle type exposed to foreign code.
+pub type PatriciaHandle = *mut PatriciaTree;
 
+/// C-ABI view of a successful lookup.
 #[repr(C)]
 pub struct PatriciaMatchT {
     pub key_high: u64,
@@ -14,422 +32,318 @@ pub struct PatriciaMatchT {
     pub plen: u8,
     pub tag: [c_char; TAG_MAX_LEN],
 }
-static REGISTRY: Lazy<DashMap<i32, Arc<PatriciaTree>>> = Lazy::new(|| DashMap::new());
-static NEXT_HANDLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
-fn get_tree(handle: i32) -> Result<Arc<PatriciaTree>, ErrorCode> {
-    REGISTRY.get(&handle)
-        .map(|entry| Arc::clone(&*entry))
-        .ok_or(ErrorCode::InvalidHandle)
+// ---------------------------------------------------------------------------
+//  Helper utilities
+// ---------------------------------------------------------------------------
+
+fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, ErrorCode> {
+    if ptr.is_null() {
+        return Err(ErrorCode::Utf8Error);
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_str()
+        .map_err(|_| ErrorCode::Utf8Error)
 }
 
+fn write_tag_buf(dst: &mut [c_char; TAG_MAX_LEN], tag: &str) {
+    for b in dst.iter_mut() {
+        *b = 0;
+    }
+    let bytes = tag.as_bytes();
+    let len = bytes.len().min(TAG_MAX_LEN);
+    for i in 0..len {
+        dst[i] = bytes[i] as c_char;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Lifetime
+// ---------------------------------------------------------------------------
+
+/// Open or create a shared-memory arena and return an opaque handle.
+///
+/// * `name_utf8` – logical name (process-wide); will be hashed to an OS-specific
+///                 identifier, so any UTF-8 string is fine.
+/// * `capacity`  – maximum number of prefixes (nodes).
+///
+/// Returns **NULL** on error – consult `cidr_last_error()`.
 #[no_mangle]
-pub extern "C" fn patricia_open(name: *const u8, name_len: usize, capacity: usize, out_handle: *mut i32) -> ErrorCode {
-    let slice = unsafe { std::slice::from_raw_parts(name, name_len) };
-    let s = match std::str::from_utf8(slice) {
-        Ok(val) => val,
-        Err(_) => {
-            set_last_error(ErrorCode::Utf8Error);
-            return ErrorCode::Utf8Error;
-        }
-    };
-    match PatriciaTree::open(s, capacity) {
+pub extern "C" fn cidr_open(name_utf8: *const c_char, capacity: usize) -> PatriciaHandle {
+    match cstr_to_str(name_utf8)
+        .and_then(|s| PatriciaTree::open(s, capacity).map_err(|_| ErrorCode::ShmemOpenFailed))
+    {
         Ok(tree) => {
-            let handle = NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            REGISTRY.insert(handle, Arc::new(tree));
-            unsafe { *out_handle = handle; }
             set_last_error(ErrorCode::Success);
-            ErrorCode::Success
+            Box::into_raw(Box::new(tree))
         }
-        Err(_e) => {
-            // e is a ShmemError, not a types::Error
-            set_last_error(ErrorCode::ShmemOpenFailed);
-            ErrorCode::ShmemOpenFailed
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn patricia_close(handle: i32) -> ErrorCode {
-    // For backward compatibility, patricia_close is an alias for destroy.
-    patricia_destroy(handle)
-}
-
-#[no_mangle]
-pub extern "C" fn patricia_insert(
-    handle: i32,
-    key_high: u64,
-    key_low: u64,
-    prefix_len: u8,
-    ttl: u64,
-) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
         Err(code) => {
             set_last_error(code);
-            return code;
-        }
-    };
-    let key = ((key_high as u128) << 64) | (key_low as u128);
-    match tree.insert(key, prefix_len, ttl, None) {
-        Ok(_) => {
-            set_last_error(ErrorCode::Success);
-            ErrorCode::Success
-        }
-        Err(e) => {
-            let code = map_error(&e);
-            set_last_error(code);
-            code
+            ptr::null_mut()
         }
     }
 }
 
+/// Close the handle (idempotent).  NULL is ignored.
 #[no_mangle]
-pub extern "C" fn patricia_lookup(
-    handle: i32,
-    key_high: u64,
-    key_low: u64,
-) -> bool {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
+pub extern "C" fn cidr_close(h: PatriciaHandle) {
+    if !h.is_null() {
+        // SAFETY – we created it with Box::into_raw
+        unsafe { drop(Box::from_raw(h)) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  CRUD
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn cidr_insert(
+    h: PatriciaHandle,
+    cidr_utf8: *const c_char,
+    ttl: u64,
+    tag_utf8: *const c_char, // may be NULL
+) -> ErrorCode {
+    let tree = match unsafe { h.as_ref() } {
+        Some(t) => t,
+        None => return ErrorCode::InvalidHandle,
+    };
+    let cidr_str = match cstr_to_str(cidr_utf8) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let net: IpNet = match cidr_str.parse() {
+        Ok(n) => n,
+        Err(_) => return ErrorCode::InvalidPrefix,
+    };
+    
+    let tag = if tag_utf8.is_null() {
+        None
+    } else {
+        match cstr_to_str(tag_utf8) {
+            Ok(s) => Some(s),
+            Err(code) => return code,
+        }
+    };
+    
+    // Convert IpAddr to u128 based on type
+    let key = match net.network() {
+        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
+        std::net::IpAddr::V6(ipv6) => {
+            let mut val = 0u128;
+            for (i, octet) in ipv6.octets().iter().enumerate() {
+                val |= (*octet as u128) << (120 - (i * 8));
+            }
+            val
+        }
+    };
+    
+    match tree.insert(key, net.prefix_len() as u8, ttl, tag) {
+        Ok(_) => ErrorCode::Success,
+        Err(e) => map_error(&e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_delete(h: PatriciaHandle, cidr_utf8: *const c_char) -> ErrorCode {
+    let tree = match unsafe { h.as_ref() } {
+        Some(t) => t,
+        None => return ErrorCode::InvalidHandle,
+    };
+    let cidr_str = match cstr_to_str(cidr_utf8) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let net: IpNet = match cidr_str.parse() {
+        Ok(n) => n,
+        Err(_) => return ErrorCode::InvalidPrefix,
+    };
+    
+    // Convert IpAddr to u128 based on type
+    let key = match net.network() {
+        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
+        std::net::IpAddr::V6(ipv6) => {
+            let mut val = 0u128;
+            for (i, octet) in ipv6.octets().iter().enumerate() {
+                val |= (*octet as u128) << (120 - (i * 8));
+            }
+            val
+        }
+    };
+    
+    match tree.delete(key, net.prefix_len() as u8) {
+        Ok(_) => ErrorCode::Success,
+        Err(e) => map_error(&e),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_lookup(h: PatriciaHandle, addr_utf8: *const c_char) -> bool {
+    let tree = match unsafe { h.as_ref() } {
+        Some(t) => t,
+        None => {
+            set_last_error(ErrorCode::InvalidHandle);
+            return false;
+        }
+    };
+    let addr_str = match cstr_to_str(addr_utf8) {
+        Ok(s) => s,
         Err(code) => {
             set_last_error(code);
             return false;
         }
     };
-    let key = ((key_high as u128) << 64) | (key_low as u128);
-    let found = tree.lookup(key).is_some();
-    set_last_error(ErrorCode::Success);
-    found
-}
-
-#[no_mangle]
-pub extern "C" fn patricia_delete(
-    handle: i32,
-    key_high: u64,
-    key_low: u64,
-    prefix_len: u8,
-) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
-        }
-    };
-    let key = ((key_high as u128) << 64) | (key_low as u128);
-    match tree.delete(key, prefix_len) {
-        Ok(_) => {
-            set_last_error(ErrorCode::Success);
-            ErrorCode::Success
-        }
-        Err(e) => {
-            let code = map_error(&e);
-            set_last_error(code);
-            code
-        }
-    }
-}
-
-/// Bulk insert multiple prefixes into the Patricia tree.
-///
-/// # Safety
-/// - `items` must point to an array of (u64, u64, u8, u64) tuples of length `count`.
-/// - Each tuple is (key_high, key_low, prefix_len, ttl).
-///
-/// Returns `ErrorCode::Success` on success, or an error code on failure.
-#[no_mangle]
-pub extern "C" fn patricia_bulk_insert(
-    handle: i32,
-    items: *const (u64, u64, u8, u64),
-    count: usize,
-) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
-        }
-    };
-    let slice = unsafe { std::slice::from_raw_parts(items, count) };
-    let mut vec = Vec::with_capacity(count);
-    for &(high, low, len, ttl) in slice {
-        vec.push(((high as u128) << 64 | low as u128, len, ttl));
-    }
-    match tree.bulk_insert(&vec) {
-        Ok(_) => {
-            set_last_error(ErrorCode::Success);
-            ErrorCode::Success
-        }
-        Err(e) => {
-            let code = map_error(&e);
-            set_last_error(code);
-            code
-        }
-    }
-}
-
-// Destroys the Patricia tree for the given handle, removing it from the registry and triggering cleanup.
-// Returns ErrorCode::InvalidHandle if the handle is not found.
-#[no_mangle]
-pub extern "C" fn patricia_destroy(handle: i32) -> ErrorCode {
-    // Remove from registry and drop Arc, then explicitly destroy the shared memory segment.
-    if let Some((_, tree_arc)) = REGISTRY.remove(&handle) {
-        // Only destroy if this is the last Arc (strong_count == 1)
-        if Arc::strong_count(&tree_arc) == 1 {
-            // Safety: we have the only Arc, so we can get a mutable reference
-            let mut_tree = Arc::try_unwrap(tree_arc).ok().unwrap();
-            // Explicitly drop the mapping and unlink the segment
-            mut_tree.destroy();
-        }
-        set_last_error(ErrorCode::Success);
-        return ErrorCode::Success
+    
+    // Parse the address string into either IpNet or IpAddr
+    let ip_addr = if let Ok(n) = addr_str.parse::<IpNet>() {
+        n.network()
+    } else if let Ok(ip) = addr_str.parse() {
+        ip
     } else {
-        set_last_error(ErrorCode::InvalidHandle);
-        return ErrorCode::InvalidHandle
-    }
-#[no_mangle]
-pub extern "C" fn patricia_available_capacity(handle: i32) -> u64 {
-    match get_tree(handle) {
-        Ok(tree) => tree.available_capacity() as u64,
-        Err(_) => 0,
-    }
-}
-}
-
-/// Insert an IPv4 prefix into the Patricia tree.
-/// 
-/// # Safety
-/// - The handle must be valid.
-/// - `addr` is a 32-bit IPv4 address in host byte order.
-/// - `prefix_len` is the prefix length (0-32).
-/// - `ttl` is the time-to-live in seconds.
-/// 
-/// Returns `ErrorCode::Success` on success, or an error code on failure.
-#[no_mangle]
-pub extern "C" fn patricia_insert_v4(
-    handle: i32,
-    addr: u32,
-    prefix_len: u8,
-    ttl: u64,
-) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
-        }
+        set_last_error(ErrorCode::InvalidPrefix);
+        return false;
     };
-    match tree.insert_v4(addr, prefix_len, ttl) {
-        Ok(_) => {
-            set_last_error(ErrorCode::Success);
-            ErrorCode::Success
-        }
-        Err(e) => {
-            let code = map_error(&e);
-            set_last_error(code);
-            code
-        }
-    }
-}
-
-/// Lookup an IPv4 address in the Patricia tree.
-/// 
-/// # Safety
-/// - The handle must be valid.
-/// - `addr` is a 32-bit IPv4 address in host byte order.
-/// 
-/// Returns `true` if found, `false` otherwise.
-#[no_mangle]
-pub extern "C" fn patricia_lookup_v4(
-    handle: i32,
-    addr: u32,
-) -> bool {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return false;
-        }
-    };
-    let found = tree.lookup_v4(addr).is_some();
-    set_last_error(ErrorCode::Success);
-    found
-}
-
-/// Delete an IPv4 prefix from the Patricia tree.
-/// 
-/// # Safety
-/// - The handle must be valid.
-/// - `addr` is a 32-bit IPv4 address in host byte order.
-/// - `prefix_len` is the prefix length (0-32).
-/// 
-/// Returns `ErrorCode::Success` on success, or an error code on failure.
-#[no_mangle]
-pub extern "C" fn patricia_delete_v4(
-    handle: i32,
-    addr: u32,
-    prefix_len: u8,
-) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
-        }
-    };
-    match tree.delete_v4(addr, prefix_len) {
-        Ok(_) => {
-            set_last_error(ErrorCode::Success);
-            ErrorCode::Success
-        }
-        Err(e) => {
-            let code = map_error(&e);
-            set_last_error(code);
-            code
-        }
-    }
-}
-
-/// Flushes pending epoch callbacks for the Patricia tree.
-/// 
-/// # Safety
-/// - The handle must be valid.
-/// 
-/// Returns `ErrorCode::Success` on success, or an error code on failure.
-#[no_mangle]
-pub extern "C" fn patricia_flush(handle: i32) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
-        }
-    };
-    tree.flush();
-    set_last_error(ErrorCode::Success);
-    ErrorCode::Success
-}
-
-/// Clears all prefixes from the Patricia tree.
-/// 
-/// # Safety
-/// - The handle must be valid.
-/// 
-/// Returns `ErrorCode::Success` on success, or an error code on failure.
-#[no_mangle]
-pub extern "C" fn patricia_clear(handle: i32) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
-        }
-    };
-    tree.clear();
-    set_last_error(ErrorCode::Success);
-    ErrorCode::Success
-}
-
-/// Resizes the Patricia tree arena to a new capacity.
-/// 
-/// # Safety
-/// - The handle must be valid.
-/// - `new_capacity` must be greater than the current capacity.
-/// 
-/// Returns `ErrorCode::Success` on success, or an error code on failure.
-/// Resizes the Patricia tree arena to a new capacity.
-///
-/// # Safety
-/// - The handle must be valid.
-/// - `new_capacity` must be greater than the current capacity.
-///
-/// Returns `ErrorCode::Success` on success, `ErrorCode::InvalidHandle` if handle is invalid,
-/// `ErrorCode::ResizeFailed` if the tree is in use by multiple handles, or other mapped errors on failure.
-#[no_mangle]
-pub extern "C" fn patricia_resize(handle: i32, new_capacity: usize) -> ErrorCode {
-    // Remove the existing PatriciaTree from the registry to obtain ownership.
-    if let Some((_, tree_arc)) = REGISTRY.remove(&handle) {
-        // Must be the only strong reference.
-        if Arc::strong_count(&tree_arc) != 1 {
-            // Reinsert the original Arc back into the registry.
-            REGISTRY.insert(handle, tree_arc);
-            set_last_error(ErrorCode::ResizeFailed);
-            return ErrorCode::ResizeFailed;
-        }
-        // Unwrap the Arc to get owned PatriciaTree.
-        let mut tree = match Arc::try_unwrap(tree_arc) {
-            Ok(t) => t,
-            Err(original_arc) => {
-                // Unexpected, reinsert and error.
-                REGISTRY.insert(handle, original_arc);
-                set_last_error(ErrorCode::ResizeFailed);
-                return ErrorCode::ResizeFailed;
+    
+    // Convert IpAddr to u128 based on type
+    let key = match ip_addr {
+        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
+        std::net::IpAddr::V6(ipv6) => {
+            let mut val = 0u128;
+            for (i, octet) in ipv6.octets().iter().enumerate() {
+                val |= (*octet as u128) << (120 - (i * 8));
             }
-        };
-        // Perform resize.
-        match tree.resize(new_capacity) {
-            Ok(_) => {
-                // Reinsert resized tree.
-                REGISTRY.insert(handle, Arc::new(tree));
-                set_last_error(ErrorCode::Success);
-                ErrorCode::Success
-            }
-            Err(e) => {
-                // On error, reinsert original tree.
-                // original tree is mutated or not? We mutated tree in place which may have failed,
-                // but leave original mapping intact.
-                REGISTRY.insert(handle, Arc::new(tree));
-                let code = map_error(&e);
-                set_last_error(code);
-                code
-            }
+            val
         }
-    } else {
-        set_last_error(ErrorCode::InvalidHandle);
-        ErrorCode::InvalidHandle
-    }
+    };
+    
+    set_last_error(ErrorCode::Success);
+    tree.lookup(key).is_some()
 }
 
-// C ABI: lookup with full match info
 #[no_mangle]
-pub extern "C" fn patricia_lookup_full(
-    handle: i32,
-    key_high: u64,
-    key_low: u64,
+pub extern "C" fn cidr_lookup_full(
+    h: PatriciaHandle,
+    addr_utf8: *const c_char,
     out: *mut PatriciaMatchT,
 ) -> ErrorCode {
-    let tree = match get_tree(handle) {
-        Ok(tree) => tree,
-        Err(code) => {
-            set_last_error(code);
-            return code;
+    let tree = match unsafe { h.as_ref() } {
+        Some(t) => t,
+        None => return ErrorCode::InvalidHandle,
+    };
+    
+    let addr_str = match cstr_to_str(addr_utf8) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    
+    // Parse the address string into either IpNet or IpAddr
+    let ip_addr = if let Ok(n) = addr_str.parse::<IpNet>() {
+        n.network()
+    } else if let Ok(ip) = addr_str.parse() {
+        ip
+    } else {
+        return ErrorCode::InvalidPrefix;
+    };
+    
+    // Convert IpAddr to u128 based on type
+    let key = match ip_addr {
+        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
+        std::net::IpAddr::V6(ipv6) => {
+            let mut val = 0u128;
+            for (i, octet) in ipv6.octets().iter().enumerate() {
+                val |= (*octet as u128) << (120 - (i * 8));
+            }
+            val
         }
     };
-    let key = ((key_high as u128) << 64) | (key_low as u128);
+    
     match tree.lookup(key) {
-        Some(m) => {
-            unsafe {
-                (*out).key_high = (m.cidr_key >> 64) as u64;
-                (*out).key_low = m.cidr_key as u64;
-                (*out).plen = m.plen;
-                // zero out tag buffer
-                for i in 0..TAG_MAX_LEN {
-                    (*out).tag[i] = 0;
-                }
-                // copy tag bytes up to TAG_MAX_LEN
-                let bytes = m.tag.as_bytes();
-                let len = bytes.len().min(TAG_MAX_LEN);
-                for i in 0..len {
-                    (*out).tag[i] = bytes[i] as c_char;
-                }
+        Some(m) => unsafe {
+            if out.is_null() {
+                return ErrorCode::InvalidHandle;
             }
-            set_last_error(ErrorCode::Success);
+            (*out).key_high = (m.cidr_key >> 64) as u64;
+            (*out).key_low = m.cidr_key as u64;
+            (*out).plen = m.plen;
+            write_tag_buf(&mut (*out).tag, m.tag);
             ErrorCode::Success
-        }
-        None => {
-            set_last_error(ErrorCode::NotFound);
-            ErrorCode::NotFound
-        }
+        },
+        None => ErrorCode::NotFound,
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Capacity & maintenance
+// ---------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn cidr_available_capacity(h: PatriciaHandle) -> u64 {
+    unsafe { h.as_ref() }
+        .map(|t| t.available_capacity() as u64)
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_flush(h: PatriciaHandle) -> ErrorCode {
+    unsafe { h.as_ref() }
+        .map(|t| {
+            t.flush();
+            ErrorCode::Success
+        })
+        .unwrap_or(ErrorCode::InvalidHandle)
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_clear(h: PatriciaHandle) -> ErrorCode {
+    unsafe { h.as_ref() }
+        .map(|t| {
+            t.clear();
+            ErrorCode::Success
+        })
+        .unwrap_or(ErrorCode::InvalidHandle)
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_resize(h: PatriciaHandle, new_capacity: usize) -> ErrorCode {
+    // Safety: we have exclusive ownership only if the caller guarantees no other
+    // threads use the handle.  That must be documented on the C side.
+    let tree = match unsafe { h.as_mut() } {
+        Some(t) => t,
+        None => return ErrorCode::InvalidHandle,
+    };
+    match tree.resize(new_capacity) {
+        Ok(_) => ErrorCode::Success,
+        Err(e) => map_error(&e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Error helpers (unchanged signatures)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static LAST_ERROR: std::cell::Cell<ErrorCode> = std::cell::Cell::new(ErrorCode::Success);
+}
+
+pub(crate) fn set_last_error(code: ErrorCode) {
+    LAST_ERROR.with(|c| c.set(code));
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_last_error() -> ErrorCode {
+    LAST_ERROR.with(|c| c.get())
+}
+
+#[no_mangle]
+pub extern "C" fn cidr_strerror(code: ErrorCode) -> *const c_char {
+    static TABLE: Lazy<Vec<CString>> = Lazy::new(|| {
+        use ErrorCode::*;
+        [Success, CapacityExceeded, ZeroCapacity, InvalidPrefix, BranchHasChildren,
+         InvalidHandle, Utf8Error, LockInitFailed, ShmemOpenFailed, ResizeFailed,
+         FlushFailed, TagTooLong, NotFound, Unknown]
+            .iter()
+            .map(|c| CString::new(c.as_str()).unwrap())
+            .collect()
+    });
+    TABLE[code as usize].as_ptr()
 }
