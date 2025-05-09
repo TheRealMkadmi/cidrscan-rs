@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "cidrscan_core/Cargo.toml",
+    "cidrscan_php/Cargo.toml"
+  ],
+  "rust-analyzer.procMacro.enable": true,
+  "rust-analyzer.cargo.loadOutDirsFromCheck": true
+}

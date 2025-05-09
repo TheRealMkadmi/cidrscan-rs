@@ -2,159 +2,187 @@ name: Build and Release Libraries
 
 on:
   push:
-    tags:
+    tags: 
       - 'v*'
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
   packages: write
 
+env:
+  CARGO_TERM_COLOR: always
+
+###############################################################################
+# 1. Test suite
+###############################################################################
 jobs:
   test:
-    name: Run Tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable toolchain
-        run: rustup default stable
-      - name: Run all tests
-        run: cargo test
-  
-  build-linux-windows:
+      - uses: dtolnay/rust-toolchain@v1
+      - run: cargo test --workspace
+
+###############################################################################
+# 2. Native C-ABI libraries (Linux & Windows)
+###############################################################################
+  build-libs:
     needs: test
     runs-on: ubuntu-latest
+    container: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest 
     steps:
       - uses: actions/checkout@v4
-
-      # 1. Build native targets
-      - name: Install cross
-        run: cargo install cross
-      - name: Install cbindgen
-        run: cargo install cbindgen
-      - name: Install Rust stable toolchain
-        run: rustup default stable
-      - name: Add Rust targets
-        run: rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
-      - name: Install MinGW dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64
-
-      - name: Build Linux and Windows binaries
+      - run: cargo install cross --locked
+      - run: cargo install cbindgen --locked
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          targets: |
+            x86_64-unknown-linux-gnu
+            aarch64-unknown-linux-gnu
+            x86_64-pc-windows-gnu
+      - run: apt-get update && apt-get install -y gcc-mingw-w64
+      - name: Build & package
+        shell: bash
         run: |
           mkdir -p packages
-          for pair in \
-            "x86_64-unknown-linux-gnu:linux-x86_64" \
-            "aarch64-unknown-linux-gnu:linux-aarch64" \
-            "x86_64-pc-windows-gnu:windows-x86_64"; do
-
-            IFS=":" read -r target name <<< "$pair"
+          declare -A map=(
+            [x86_64-unknown-linux-gnu]=linux-x86_64
+            [aarch64-unknown-linux-gnu]=linux-aarch64
+            [x86_64-pc-windows-gnu]=windows-x86_64
+          )
+          for target in "${!map[@]}"; do
+            name=${map[$target]}
             cross build --release --target $target
-            src="target/$target/release"
-
-            # generate C header
-            cbindgen --config cbindgen.toml --crate cidrscan --output $src/cidrscan.h
-
-            # copy into per-arch folder
+            src=target/$target/release
+            cbindgen --config cbindgen.toml --crate cidrscan_core --output $src/cidrscan.h
             mkdir -p packages/$name
-            cp $src/cidrscan.h                            packages/$name/
-            case "$target" in
-              *windows-gnu)
-                cp $src/cidrscan.dll     packages/$name/ || true
-                cp $src/libcidrscan.a     packages/$name/ || true
-                cp $src/cidrscan.lib      packages/$name/ || true
-                cp $src/cidrscan.dll.lib  packages/$name/ || true
-                ;;
-              *)
-                cp $src/libcidrscan.so    packages/$name/ || true
-                cp $src/libcidrscan.a      packages/$name/ || true
-                ;;
+            cp $src/cidrscan.h packages/$name/
+            case $target in
+              *windows*) cp $src/cidrscan.{dll,lib} packages/$name/ 2>/dev/null || true ;;
+              *)         cp $src/libcidrscan.{so,a} packages/$name/ 2>/dev/null || true ;;
             esac
-
-          done
-
-      # 2. Generate PHP FFI wrappers with FFIMe
-      - name: Setup PHP with PECL extension
-        uses: shivammathur/setup-php@v2 
-        with:
-          php-version: '8.4'
-
-      - name: Install FFIMe generator
-        run: |
-          cd binding_skeletons/php
-          composer require ircmaxell/ffime --no-interaction --dev
-
-      - name: Generate PHP wrappers
-        run: |
-          cd binding_skeletons/php
-          # point generate.php at the Linux build
-          LIB_PATH="$(pwd)/../../target/x86_64-unknown-linux-gnu/release/libcidrscan.so"
-          HDR_PATH="$(pwd)/../../target/x86_64-unknown-linux-gnu/release/cidrscan.h"
-          php generate.php \
-            --lib "$LIB_PATH" \
-            --header "$HDR_PATH" \
-            --output php
-
-      # 3. Package PHP wrappers
-      - name: Zip PHP wrappers
-        run: |
-          cd binding_skeletons/php
-          zip -r ../../../citadel-ffi-php.zip \
-            php/ composer.json README.md LICENSE
-
-      # 4. Zip native libraries per-arch
-      - name: Create native zips
-        run: |
-          for name in linux-x86_64 linux-aarch64 windows-x86_64; do
             (cd packages/$name && zip -r ../../$name.zip .)
           done
-
-      # 5. Upload all zips
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          files: '*.zip'
+          files: |
+            linux-*.zip
+            windows-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  build-macos:
-    name: Build macOS
+###############################################################################
+# 3. PHP extensions (+ stubs) for every PHP version / TS combo
+###############################################################################
+  build-php:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          # ---------- Linux ----------
+          - { os: ubuntu-latest , osname: linux  , arch: x86_64 , libext: so  , phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest , osname: linux  , arch: x86_64 , libext: so  , phpts: nts, version: '8.4' }
+          - { os: ubuntu-latest , osname: linux  , arch: arm     , libext: so  , phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest , osname: linux  , arch: arm     , libext: so  , phpts: nts, version: '8.4' }
+          - { os: ubuntu-latest , osname: linux  , arch: arm64   , libext: so  , phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest , osname: linux  , arch: arm64   , libext: so  , phpts: nts, version: '8.4' }
+          # ---------- macOS ----------
+          - { os: macos-latest  , osname: macos  , arch: universal , libext: so, phpts: nts, version: '8.3' }
+          - { os: macos-latest  , osname: macos  , arch: universal , libext: so, phpts: nts, version: '8.4' }
+          # ---------- Windows (NTS + TS) ----------
+          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: nts, version: '8.3' }
+          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: ts , version: '8.3' }
+          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: nts, version: '8.4' }
+          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: ts , version: '8.4' }
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- PHP runtime ----------
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '${{ matrix.version }}'
+          phpts: '${{ matrix.phpts }}'         # nts or ts 
+
+      # ---------- Extra Windows SDK ----------
+      - if: runner.os == 'Windows'
+        id: php_sdk
+        uses: php/setup-php-sdk@v0.10       
+        with:
+          version: '${{ matrix.version }}'
+          arch: x64
+          ts: '${{ matrix.phpts }}'
+      - if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: ${{ steps.php_sdk.outputs.toolset }}
+
+      # ---------- Rust & cargo-php ----------
+      - uses: dtolnay/rust-toolchain@v1
+      - run: cargo install cargo-php --locked
+
+      # ---------- Build & stubs ----------
+      - name: Build extension & generate stubs
+        shell: bash
+        run: |
+          VERSION=${{ matrix.version }}
+          OSNAME=${{ matrix.osname }}
+          ARCH=${{ matrix.arch }}
+          TS=${{ matrix.phpts }}
+          OUTDIR=../packages/php-${VERSION}_${OSNAME}_${ARCH}_${TS}
+          mkdir -p $OUTDIR
+          cd cidrscan_php
+          cargo php build --release
+          cp ../../target/release/*cidrscan_php.${{ matrix.libext }} $OUTDIR/
+          cargo php stubs -o $OUTDIR/cidrscan_php.phpstub
+
+      # ---------- Zip & upload ----------
+      - name: Zip PHP deliverable
+        shell: bash
+        run: |
+          ZIP=cidrscan_php${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
+          (cd packages/php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }} && zip -r ../../$ZIP .)
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            cidrscan_php${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+###############################################################################
+# 4. Native libs for macOS (cross can’t target macOS)
+###############################################################################
+  build-macos-libs:
     needs: test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust stable toolchain
-        run: rustup default stable
-      - name: Add Rust targets
-        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
-      - name: Install cbindgen
-        run: brew install cbindgen      
-      - name: Build and package macOS targets
+      - uses: dtolnay/rust-toolchain@v1
+        with: { targets: x86_64-apple-darwin,aarch64-apple-darwin }
+      - run: brew install cbindgen
+      - name: Build & package
+        shell: bash
         run: |
           mkdir -p packages
-          for pair in \
-            "x86_64-apple-darwin:macos-x86_64" \
-            "aarch64-apple-darwin:macos-aarch64"; do
-
-            IFS=":" read -r target name <<< "$pair"
+          declare -A map=( [x86_64-apple-darwin]=macos-x86_64 [aarch64-apple-darwin]=macos-aarch64 )
+          for target in "${!map[@]}"; do
+            name=${map[$target]}
             cargo build --release --target $target
-            src="target/$target/release"
-
-            cbindgen --config cbindgen.toml --crate cidrscan --output $src/cidrscan.h
+            src=target/$target/release
+            cbindgen --config cbindgen.toml --crate cidrscan_core --output $src/cidrscan.h
             mkdir -p packages/$name
-            cp $src/cidrscan.h            packages/$name/
-            cp $src/libcidrscan.dylib     packages/$name/ || true
-            cp $src/libcidrscan.a         packages/$name/ || true
-          done
-
-      - name: Create macOS zips
-        run: |
-          for name in macos-x86_64 macos-aarch64; do
+            cp $src/cidrscan.h packages/$name/
+            cp $src/libcidrscan.{dylib,a} packages/$name/ 2>/dev/null || true
             (cd packages/$name && zip -r ../../$name.zip .)
           done
-
-      - name: Upload macOS assets
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          files: '*.zip'
+          files: macos-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

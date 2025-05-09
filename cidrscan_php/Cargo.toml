@@ -1,0 +1,13 @@
+[package]
+name        = "cidrscan_php"
+version     = "0.1.0"
+edition     = "2021"
+
+[lib]
+crate-type  = ["cdylib"]          
+name = "cidrscan_php"
+
+[dependencies]
+ext-php-rs  = "0.13"            
+cidrscan = { path = "../cidrscan_core" }
+once_cell   = "1"
