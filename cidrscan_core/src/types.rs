@@ -25,6 +25,18 @@ pub enum Error {
     /// Tag string exceeds maximum allowed length
     TagTooLong,
 }
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::CapacityExceeded => write!(f, "Capacity exceeded"),
+            Error::ZeroCapacity => write!(f, "Zero capacity is not allowed"),
+            Error::InvalidPrefix => write!(f, "Invalid prefix"),
+            Error::BranchHasChildren => write!(f, "Branch has children"),
+            Error::LockInitFailed => write!(f, "Failed to initialize in-place RW-lock"),
+            Error::TagTooLong => write!(f, "Tag string exceeds maximum allowed length"),
+        }
+    }
+}
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
 pub type Offset = u32; // <= 4 294 967 295 bytes from base

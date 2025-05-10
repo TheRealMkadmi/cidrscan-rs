@@ -1,5 +1,5 @@
 [package]
-name = "cidrscan"
+name = "cidrscan_core"
 version = "0.1.0"
 authors = ["TheRealMkadmi <wahibmkadmi16@gmail.com>"]
 edition = "2021"
@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/TheRealMkadmi/cidrscan-rs"
 
 [lib]
-name = "cidrscan"
+name = "cidrscan_core"
 # Build both dynamic and static libraries for C compatibility
 crate-type = ["cdylib", "staticlib", "rlib"]
 

@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - run: cargo test --workspace
 
 ###############################################################################
@@ -39,6 +41,7 @@ jobs:
       - run: cargo install cbindgen --locked
       - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           targets: |
             x86_64-unknown-linux-gnu
             aarch64-unknown-linux-gnu
@@ -124,6 +127,8 @@ jobs:
 
       # ---------- Rust & cargo-php ----------
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - run: cargo install cargo-php --locked
 
       # ---------- Build & stubs ----------

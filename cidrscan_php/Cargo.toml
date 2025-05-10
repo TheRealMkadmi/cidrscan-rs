@@ -8,6 +8,7 @@ crate-type  = ["cdylib"]
 name = "cidrscan_php"
 
 [dependencies]
-ext-php-rs  = "0.13"            
-cidrscan = { path = "../cidrscan_core" }
+ext-php-rs  = "0.13"
+cidrscan_core = { path = "../cidrscan_core" }
 once_cell   = "1"
+ipnetwork = "0.21.1"

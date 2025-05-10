@@ -10,7 +10,7 @@
 use crate::{
     constants::TAG_MAX_LEN,
     errors::{map_error, ErrorCode},
-    helpers::{v4_key, v4_plen},
+    helpers::v4_key,
     PatriciaTree,
 };
 use ipnet::IpNet;

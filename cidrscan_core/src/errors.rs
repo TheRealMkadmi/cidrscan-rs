@@ -90,8 +90,6 @@ pub fn map_error(e: &crate::types::Error) -> ErrorCode {
         InvalidPrefix => ErrorCode::InvalidPrefix,
         BranchHasChildren => ErrorCode::BranchHasChildren,
         LockInitFailed => ErrorCode::LockInitFailed,
-        TagTooLong => ErrorCode::TagTooLong,
-        // Add more mappings as needed
-            _ => ErrorCode::Unknown,
+        TagTooLong => ErrorCode::TagTooLong
     }
 }

@@ -1,3 +1,7 @@
 [workspace]
 members = ["cidrscan_core", "cidrscan_php"]
 resolver = "2"
+
+
+[profile.release]
+strip = "debuginfo"
