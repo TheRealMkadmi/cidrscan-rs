@@ -37,10 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Install cbindgen so we can generate the public C header
-      - name: Install cbindgen
-        run: cargo install cbindgen --locked
-
       - name: Build & package every native target
         shell: bash
         run: |
@@ -55,12 +51,10 @@ jobs:
             NAME=${MAP[$TARGET]}
             cross build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
             SRC=target/$TARGET/release
-
-            cbindgen --config cbindgen.toml --crate cidrscan_core --output "$SRC/cidrscan.h"
+            INC=target/include
 
             mkdir -p "packages/$NAME"
-            cp "$SRC/cidrscan.h" "packages/$NAME/"
-
+            cp "$INC/cidrscan.h" "packages/$NAME/"
             # Copy shared + static libraries
             for PAT in "libcidrscan*.so" "libcidrscan*.a" "cidrscan*.dll" "cidrscan*.lib"; do
               cp "$SRC/$PAT" "packages/$NAME/" 2>/dev/null || true
@@ -68,6 +62,12 @@ jobs:
 
             (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
           done
+
+      # If Node.js is needed, install it via package manager to avoid GLIBC issues
+      - name: Install Node.js (if needed)
+        if: false  # Set to true and adjust if you actually need Node.js in this job
+        run: |
+          apt-get update && apt-get install -y nodejs npm
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -182,7 +182,6 @@ jobs:
           targets: |
             x86_64-apple-darwin
             aarch64-apple-darwin
-      - run: brew install cbindgen
       - name: Build & package (fat)
         shell: bash
         run: |
@@ -198,13 +197,10 @@ jobs:
             target/aarch64-apple-darwin/release/libcidrscan_core.dylib \
             -output target/universal/release/libcidrscan_core.dylib
 
-          cbindgen --config cbindgen.toml --crate cidrscan_core \
-                   --output target/universal/release/cidrscan.h
-
           NAME=macos-universal
           mkdir -p "packages/$NAME"
           cp target/universal/release/libcidrscan_core.dylib "packages/$NAME/"
-          cp target/universal/release/cidrscan.h             "packages/$NAME/"
+          cp target/include/cidrscan.h             "packages/$NAME/"
           (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
       - uses: softprops/action-gh-release@v2
         with:
