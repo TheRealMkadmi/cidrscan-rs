@@ -36,7 +36,11 @@ jobs:
     container: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest
     steps:
       - uses: actions/checkout@v4
-      # ⬇ No extra apt/cross install – container already contains everything
+
+      # Install cbindgen so we can generate the public C header
+      - name: Install cbindgen
+        run: cargo install cbindgen --locked
+
       - name: Build & package every native target
         shell: bash
         run: |
@@ -49,24 +53,22 @@ jobs:
           mkdir -p packages
           for TARGET in "${!MAP[@]}"; do
             NAME=${MAP[$TARGET]}
-            cross build --release --target "$TARGET"
+            cross build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
             SRC=target/$TARGET/release
 
-            # Generate the public C header once per target
             cbindgen --config cbindgen.toml --crate cidrscan_core --output "$SRC/cidrscan.h"
 
             mkdir -p "packages/$NAME"
             cp "$SRC/cidrscan.h" "packages/$NAME/"
 
-            # Copy all shared + static libraries that actually exist
-            for PAT in "libcidrscan*.so" "libcidrscan*.a" \
-                       "libcidrscan*.dylib" "libcidrscan*.a" \
-                       "cidrscan*.dll" "cidrscan*.lib"; do
+            # Copy shared + static libraries
+            for PAT in "libcidrscan*.so" "libcidrscan*.a" "cidrscan*.dll" "cidrscan*.lib"; do
               cp "$SRC/$PAT" "packages/$NAME/" 2>/dev/null || true
             done
 
             (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
           done
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -76,31 +78,43 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 ###############################################################################
-# 3. PHP extensions (+ stubs) for every PHP version / TS combo
+# 3. PHP extensions (+ stubs) for PHP 8.3 & 8.4 across OS/arch/TS combos
 ###############################################################################
   build-php:
     needs: test
     strategy:
       matrix:
         include:
-          #  Linux
-          - { os: ubuntu-latest , osname: linux  , arch: x86_64, target: x86_64-unknown-linux-gnu , libext: so , phpts: nts, version: '8.3' }
-          - { os: ubuntu-latest , osname: linux  , arch: aarch64, target: aarch64-unknown-linux-gnu , libext: so , phpts: nts, version: '8.3' }
-          - { os: ubuntu-latest , osname: linux  , arch: aarch64, target: aarch64-unknown-linux-gnu , libext: so , phpts: nts, version: '8.4' }
+          # Linux NTS (x86_64 + aarch64)
+          - { os: ubuntu-latest, osname: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, libext: so, phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest, osname: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, libext: so, phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest, osname: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, libext: so, phpts: nts, version: '8.4' }
+          - { os: ubuntu-latest, osname: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, libext: so, phpts: nts, version: '8.4' }
 
-          #  macOS – build per arch then merge
-          - { os: macos-latest  , osname: macos  , arch: x86_64, target: x86_64-apple-darwin      , libext: so , phpts: nts, version: '8.3' }
-          - { os: macos-latest  , osname: macos  , arch: aarch64, target: aarch64-apple-darwin    , libext: so , phpts: nts, version: '8.3' }
+          # macOS NTS (x86_64 + aarch64)
+          - { os: macos-latest, osname: macos, arch: x86_64, target: x86_64-apple-darwin, libext: so, phpts: nts, version: '8.3' }
+          - { os: macos-latest, osname: macos, arch: aarch64, target: aarch64-apple-darwin, libext: so, phpts: nts, version: '8.3' }
+          - { os: macos-latest, osname: macos, arch: x86_64, target: x86_64-apple-darwin, libext: so, phpts: nts, version: '8.4' }
+          - { os: macos-latest, osname: macos, arch: aarch64, target: aarch64-apple-darwin, libext: so, phpts: nts, version: '8.4' }
 
-          #  Windows (NTS & TS)
-          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc   , libext: dll, phpts: nts, version: '8.3' }
-          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc   , libext: dll, phpts: ts , version: '8.3' }
+          # Windows NTS & TS (x86_64 only)
+          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc, libext: dll, phpts: nts, version: '8.3' }
+          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc, libext: dll, phpts: ts,  version: '8.3' }
+          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc, libext: dll, phpts: nts, version: '8.4' }
+          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc, libext: dll, phpts: ts,  version: '8.4' }
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # PHP runtime
+      - name: Install aarch64 cross-compiler
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-multilib g++-multilib
+
+      - name: Install macOS cross-compilers
+        if: runner.os == 'macOS'
+        run: brew install llvm cctools
+
       - name: Setup PHP
         uses: shivammathur/setup-php@v2
         with:
@@ -108,7 +122,6 @@ jobs:
         env:
           phpts: ${{ matrix.phpts }}
 
-      # Extra Windows build tools
       - if: runner.os == 'Windows'
         id: php_sdk
         uses: php/setup-php-sdk@v0.10
@@ -116,20 +129,20 @@ jobs:
           version: ${{ matrix.version }}
           arch: x64
           ts: ${{ matrix.phpts }}
+
       - if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           toolset: ${{ steps.php_sdk.outputs.toolset }}
 
-      # Rust & cargo-php
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+
       - run: cargo install cargo-php --locked
 
-      # Build extension + stubs
       - name: Build extension & generate stubs
         shell: bash
         run: |
@@ -137,20 +150,18 @@ jobs:
           OUTDIR="packages/php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}"
           mkdir -p "$OUTDIR"
 
-          # Build the extension for the explicit target triple
           cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
-          # Move artefacts & stubs
           SRC="target/${{ matrix.target }}/release"
           cp "$SRC"/*cidrscan_php.${{ matrix.libext }} "$OUTDIR/"
           cargo php stubs --manifest-path cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
 
-      # Zip & upload
       - name: Zip PHP deliverable
         shell: bash
         run: |
           ZIP="cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip"
           (cd packages && zip -rq "../$ZIP" "php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}")
+
       - uses: softprops/action-gh-release@v2
         with:
           files: cidrscan_php_*.zip
@@ -178,10 +189,10 @@ jobs:
           set -euo pipefail
           mkdir -p target/universal/release packages
           for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo build --release --target "$ARCH"
+            cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$ARCH"
           done
 
-          # Combine dylibs into a single universal binary
+          # Combine into a single universal dylib
           lipo -create \
             target/x86_64-apple-darwin/release/libcidrscan_core.dylib \
             target/aarch64-apple-darwin/release/libcidrscan_core.dylib \
@@ -198,5 +209,47 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: macos-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+###############################################################################
+# 5. Merge macOS PHP extensions into universal .so (for each PHP version)
+###############################################################################
+  merge-php-macos-universal:
+    needs: build-php
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        version: [ '8.3', '8.4' ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download PHP extension artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: |
+            cidrscan_php_${{ matrix.version }}_macos_x86_64_nts.zip
+            cidrscan_php_${{ matrix.version }}_macos_aarch64_nts.zip
+
+      - name: Unzip artifacts
+        run: |
+          unzip cidrscan_php_${{ matrix.version }}_macos_x86_64_nts.zip -d x86_64
+          unzip cidrscan_php_${{ matrix.version }}_macos_aarch64_nts.zip -d aarch64
+
+      - name: Merge PHP extensions into universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            x86_64/cidrscan_php.so \
+            aarch64/cidrscan_php.so \
+            -output universal/cidrscan_php.so
+
+      - name: Zip universal PHP extension
+        run: |
+          cd universal
+          zip ../cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip cidrscan_php.so
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
