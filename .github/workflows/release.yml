@@ -142,7 +142,7 @@ jobs:
           OUTDIR=../packages/php-${VERSION}_${OSNAME}_${ARCH}_${TS}
           mkdir -p $OUTDIR
           cd cidrscan_php
-          cargo php build --release
+          cargo build --release
           cp ../../target/release/*cidrscan_php.${{ matrix.libext }} $OUTDIR/
           cargo php stubs -o $OUTDIR/cidrscan_php.phpstub
 
@@ -162,14 +162,17 @@ jobs:
 
 ###############################################################################
 # 4. Native libs for macOS (cross can’t target macOS)
-###############################################################################
-  build-macos-libs:
+###############################################################################  build-macos-libs:
     needs: test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
-        with: { targets: x86_64-apple-darwin,aarch64-apple-darwin }
+        with:
+          toolchain: stable
+          targets: |
+            x86_64-apple-darwin
+            aarch64-apple-darwin
       - run: brew install cbindgen
       - name: Build & package
         shell: bash
