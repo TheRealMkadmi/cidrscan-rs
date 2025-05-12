@@ -1,12 +1,3 @@
-//! Safe-by-default, registry-free FFI surface for CIDRScan-rs 0.2
-//! ---------------------------------------------------------------------------
-//! * Opaque handle = raw pointer returned from `cidr_open`
-//! * CIDRs & IPs are accepted as UTF-8 strings (parsed with `ipnet`)
-//! * No global registry, no integer IDs.
-//!
-//! In Rust you normally use `PatriciaTree` directly; this file exists purely
-//! to yield a minimal, language-agnostic C ABI.
-
 use crate::{
     constants::TAG_MAX_LEN,
     errors::{map_error, ErrorCode},
@@ -21,7 +12,6 @@ use std::{
     ptr,
 };
 
-/// Opaque handle type exposed to foreign code.
 pub type PatriciaHandle = *mut PatriciaTree;
 
 /// C-ABI view of a successful lookup.

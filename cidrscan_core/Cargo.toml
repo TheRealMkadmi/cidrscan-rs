@@ -24,6 +24,7 @@ crossbeam-queue = "0.3.12"
 metrics = "0.22"
 ipnet = "2.11.0"
 
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = "0.59.0"
 
@@ -35,6 +36,9 @@ proptest = "1"
 num_cpus = "1"
 rand = "0.9.1"
 cargo-make = "0.37"
+
+[build-dependencies]
+cbindgen = "0.28.0"
 
 [features]
 trace = []

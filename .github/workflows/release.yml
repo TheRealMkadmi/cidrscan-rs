@@ -1,11 +1,10 @@
+# .github/workflows/build-and-release.yml
 name: Build and Release Libraries
 
 on:
   push:
-    tags: 
-      - 'v*'
-    branches:
-      - main
+    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -34,40 +33,39 @@ jobs:
   build-libs:
     needs: test
     runs-on: ubuntu-latest
-    container: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest 
+    container: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo install cross --locked
-      - run: cargo install cbindgen --locked
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: |
-            x86_64-unknown-linux-gnu
-            aarch64-unknown-linux-gnu
-            x86_64-pc-windows-gnu
-      - run: apt-get update && apt-get install -y gcc-mingw-w64
-      - name: Build & package
+      # ⬇ No extra apt/cross install – container already contains everything
+      - name: Build & package every native target
         shell: bash
         run: |
-          mkdir -p packages
-          declare -A map=(
+          set -euo pipefail
+          declare -A MAP=(
             [x86_64-unknown-linux-gnu]=linux-x86_64
             [aarch64-unknown-linux-gnu]=linux-aarch64
             [x86_64-pc-windows-gnu]=windows-x86_64
           )
-          for target in "${!map[@]}"; do
-            name=${map[$target]}
-            cross build --release --target $target
-            src=target/$target/release
-            cbindgen --config cbindgen.toml --crate cidrscan_core --output $src/cidrscan.h
-            mkdir -p packages/$name
-            cp $src/cidrscan.h packages/$name/
-            case $target in
-              *windows*) cp $src/cidrscan.{dll,lib} packages/$name/ 2>/dev/null || true ;;
-              *)         cp $src/libcidrscan.{so,a} packages/$name/ 2>/dev/null || true ;;
-            esac
-            (cd packages/$name && zip -r ../../$name.zip .)
+          mkdir -p packages
+          for TARGET in "${!MAP[@]}"; do
+            NAME=${MAP[$TARGET]}
+            cross build --release --target "$TARGET"
+            SRC=target/$TARGET/release
+
+            # Generate the public C header once per target
+            cbindgen --config cbindgen.toml --crate cidrscan_core --output "$SRC/cidrscan.h"
+
+            mkdir -p "packages/$NAME"
+            cp "$SRC/cidrscan.h" "packages/$NAME/"
+
+            # Copy all shared + static libraries that actually exist
+            for PAT in "libcidrscan*.so" "libcidrscan*.a" \
+                       "libcidrscan*.dylib" "libcidrscan*.a" \
+                       "cidrscan*.dll" "cidrscan*.lib"; do
+              cp "$SRC/$PAT" "packages/$NAME/" 2>/dev/null || true
+            done
+
+            (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
           done
       - uses: softprops/action-gh-release@v2
         with:
@@ -85,84 +83,83 @@ jobs:
     strategy:
       matrix:
         include:
-          # ---------- Linux ----------
-          - { os: ubuntu-latest , osname: linux  , arch: x86_64 , libext: so  , phpts: nts, version: '8.3' }
-          - { os: ubuntu-latest , osname: linux  , arch: x86_64 , libext: so  , phpts: nts, version: '8.4' }
-          - { os: ubuntu-latest , osname: linux  , arch: arm     , libext: so  , phpts: nts, version: '8.3' }
-          - { os: ubuntu-latest , osname: linux  , arch: arm     , libext: so  , phpts: nts, version: '8.4' }
-          - { os: ubuntu-latest , osname: linux  , arch: arm64   , libext: so  , phpts: nts, version: '8.3' }
-          - { os: ubuntu-latest , osname: linux  , arch: arm64   , libext: so  , phpts: nts, version: '8.4' }
-          # ---------- macOS ----------
-          - { os: macos-latest  , osname: macos  , arch: universal , libext: so, phpts: nts, version: '8.3' }
-          - { os: macos-latest  , osname: macos  , arch: universal , libext: so, phpts: nts, version: '8.4' }
-          # ---------- Windows (NTS + TS) ----------
-          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: nts, version: '8.3' }
-          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: ts , version: '8.3' }
-          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: nts, version: '8.4' }
-          - { os: windows-latest, osname: windows, arch: x86_64 , libext: dll , phpts: ts , version: '8.4' }
+          #  Linux
+          - { os: ubuntu-latest , osname: linux  , arch: x86_64, target: x86_64-unknown-linux-gnu , libext: so , phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest , osname: linux  , arch: aarch64, target: aarch64-unknown-linux-gnu , libext: so , phpts: nts, version: '8.3' }
+          - { os: ubuntu-latest , osname: linux  , arch: aarch64, target: aarch64-unknown-linux-gnu , libext: so , phpts: nts, version: '8.4' }
+
+          #  macOS – build per arch then merge
+          - { os: macos-latest  , osname: macos  , arch: x86_64, target: x86_64-apple-darwin      , libext: so , phpts: nts, version: '8.3' }
+          - { os: macos-latest  , osname: macos  , arch: aarch64, target: aarch64-apple-darwin    , libext: so , phpts: nts, version: '8.3' }
+
+          #  Windows (NTS & TS)
+          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc   , libext: dll, phpts: nts, version: '8.3' }
+          - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc   , libext: dll, phpts: ts , version: '8.3' }
     runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
 
-      # ---------- PHP runtime ----------
-      - uses: shivammathur/setup-php@v2
+      # PHP runtime
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
         with:
-          php-version: '${{ matrix.version }}'
-          phpts: '${{ matrix.phpts }}'         # nts or ts 
+          php-version: ${{ matrix.version }}
+        env:
+          phpts: ${{ matrix.phpts }}
 
-      # ---------- Extra Windows SDK ----------
+      # Extra Windows build tools
       - if: runner.os == 'Windows'
         id: php_sdk
-        uses: php/setup-php-sdk@v0.10       
+        uses: php/setup-php-sdk@v0.10
         with:
-          version: '${{ matrix.version }}'
+          version: ${{ matrix.version }}
           arch: x64
-          ts: '${{ matrix.phpts }}'
+          ts: ${{ matrix.phpts }}
       - if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           toolset: ${{ steps.php_sdk.outputs.toolset }}
 
-      # ---------- Rust & cargo-php ----------
+      # Rust & cargo-php
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
+          targets: ${{ matrix.target }}
       - run: cargo install cargo-php --locked
 
-      # ---------- Build & stubs ----------
+      # Build extension + stubs
       - name: Build extension & generate stubs
         shell: bash
         run: |
-          VERSION=${{ matrix.version }}
-          OSNAME=${{ matrix.osname }}
-          ARCH=${{ matrix.arch }}
-          TS=${{ matrix.phpts }}
-          OUTDIR=../packages/php-${VERSION}_${OSNAME}_${ARCH}_${TS}
-          mkdir -p $OUTDIR
-          cd cidrscan_php
-          cargo build --release
-          cp ../../target/release/*cidrscan_php.${{ matrix.libext }} $OUTDIR/
-          cargo php stubs -o $OUTDIR/cidrscan_php.phpstub
+          set -euo pipefail
+          OUTDIR="packages/php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}"
+          mkdir -p "$OUTDIR"
 
-      # ---------- Zip & upload ----------
+          # Build the extension for the explicit target triple
+          cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
+
+          # Move artefacts & stubs
+          SRC="target/${{ matrix.target }}/release"
+          cp "$SRC"/*cidrscan_php.${{ matrix.libext }} "$OUTDIR/"
+          cargo php stubs --manifest-path cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
+
+      # Zip & upload
       - name: Zip PHP deliverable
         shell: bash
         run: |
-          ZIP=cidrscan_php${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
-          (cd packages/php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }} && zip -r ../../$ZIP .)
-
+          ZIP="cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip"
+          (cd packages && zip -rq "../$ZIP" "php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}")
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            cidrscan_php${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
+          files: cidrscan_php_*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 ###############################################################################
-# 4. Native libs for macOS (cross can’t target macOS)
-###############################################################################  
+# 4. Native libs for macOS (fat/universal)
+###############################################################################
   build-macos-libs:
     needs: test
     runs-on: macos-latest
@@ -175,21 +172,29 @@ jobs:
             x86_64-apple-darwin
             aarch64-apple-darwin
       - run: brew install cbindgen
-      - name: Build & package
+      - name: Build & package (fat)
         shell: bash
         run: |
-          mkdir -p packages
-          declare -A map=( [x86_64-apple-darwin]=macos-x86_64 [aarch64-apple-darwin]=macos-aarch64 )
-          for target in "${!map[@]}"; do
-            name=${map[$target]}
-            cargo build --release --target $target
-            src=target/$target/release
-            cbindgen --config cbindgen.toml --crate cidrscan_core --output $src/cidrscan.h
-            mkdir -p packages/$name
-            cp $src/cidrscan.h packages/$name/
-            cp $src/libcidrscan.{dylib,a} packages/$name/ 2>/dev/null || true
-            (cd packages/$name && zip -r ../../$name.zip .)
+          set -euo pipefail
+          mkdir -p target/universal/release packages
+          for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --target "$ARCH"
           done
+
+          # Combine dylibs into a single universal binary
+          lipo -create \
+            target/x86_64-apple-darwin/release/libcidrscan_core.dylib \
+            target/aarch64-apple-darwin/release/libcidrscan_core.dylib \
+            -output target/universal/release/libcidrscan_core.dylib
+
+          cbindgen --config cbindgen.toml --crate cidrscan_core \
+                   --output target/universal/release/cidrscan.h
+
+          NAME=macos-universal
+          mkdir -p "packages/$NAME"
+          cp target/universal/release/libcidrscan_core.dylib "packages/$NAME/"
+          cp target/universal/release/cidrscan.h             "packages/$NAME/"
+          (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
       - uses: softprops/action-gh-release@v2
         with:
           files: macos-*.zip
