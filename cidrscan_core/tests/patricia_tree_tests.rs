@@ -4,8 +4,8 @@ use proptest::prelude::*;
 use rand;
 use std::sync::Arc;
 use std::thread;
-use cidrscan::helpers::{v4_key, v4_plen};
-use cidrscan::types::PatriciaTree;
+use cidrscan_core::helpers::{v4_key, v4_plen};
+use cidrscan_core::types::PatriciaTree;
 
 #[test]
 fn basic_ops() {

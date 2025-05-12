@@ -1,4 +1,4 @@
-use cidrscan::shmem_rwlock::RawRwLock;
+use cidrscan_core::shmem_rwlock::RawRwLock;
 use raw_sync::Timeout;
 use std::{
     sync::{atomic::Ordering, Arc, Barrier},
