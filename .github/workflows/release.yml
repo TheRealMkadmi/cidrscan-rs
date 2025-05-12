@@ -33,9 +33,16 @@ jobs:
   build-libs:
     needs: test
     runs-on: ubuntu-latest
-    container: ghcr.io/cross-rs/x86_64-unknown-linux-gnu:latest
     steps:
+
       - uses: actions/checkout@v4
+
+      - name: Install cross-rs
+        run: cargo install cross --locked
+
+      - name: Add required Rust targets
+        run: |
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
 
       - name: Build & package every native target
         shell: bash
@@ -51,7 +58,7 @@ jobs:
             NAME=${MAP[$TARGET]}
             cross build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
             SRC=target/$TARGET/release
-            INC=target/include
+            INC=cidrscan_core/include
 
             mkdir -p "packages/$NAME"
             cp "$INC/cidrscan.h" "packages/$NAME/"
@@ -62,12 +69,6 @@ jobs:
 
             (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
           done
-
-      # If Node.js is needed, install it via package manager to avoid GLIBC issues
-      - name: Install Node.js (if needed)
-        if: false  # Set to true and adjust if you actually need Node.js in this job
-        run: |
-          apt-get update && apt-get install -y nodejs npm
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -109,7 +110,7 @@ jobs:
 
       - name: Install aarch64 cross-compiler
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu gcc-multilib g++-multilib
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       - name: Install macOS cross-compilers
         if: runner.os == 'macOS'
@@ -182,6 +183,17 @@ jobs:
           targets: |
             x86_64-apple-darwin
             aarch64-apple-darwin
+      - name: List target directory before copying header
+        shell: bash
+        run: |
+          echo "Listing target directory (recursive):"
+          find target
+          echo "Listing cidrscan_core/include directory:"
+          ls -l cidrscan_core/include || true
+          echo "Listing target/include directory:"
+          ls -l target/include || true
+          echo "Listing target/universal/release directory:"
+          ls -l target/universal/release || true
       - name: Build & package (fat)
         shell: bash
         run: |
@@ -200,7 +212,7 @@ jobs:
           NAME=macos-universal
           mkdir -p "packages/$NAME"
           cp target/universal/release/libcidrscan_core.dylib "packages/$NAME/"
-          cp target/include/cidrscan.h             "packages/$NAME/"
+          cp cidrscan_core/include/cidrscan.h             "packages/$NAME/"
           (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
       - uses: softprops/action-gh-release@v2
         with:
