@@ -103,8 +103,10 @@ jobs:
             mkdir -p "packages/$NAME"
             cp "$INC/cidrscan.h" "packages/$NAME/"
             # Copy shared + static libraries
-            for PAT in "libcidrscan*.so" "libcidrscan*.a" "cidrscan*.dll" "cidrscan*.lib" "libcidrscan*.dylib"; do
-              cp "$SRC/$PAT" "packages/$NAME/" 2>/dev/null || true
+            # Copy shared + static libraries (unquoted → glob expands)
+            for PAT in libcidrscan*.so libcidrscan*.a cidrscan*.dll \
+                       cidrscan*.lib  libcidrscan*.dylib; do
+              cp $SRC/$PAT packages/$NAME/ 2>/dev/null || true
             done
 
             (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
@@ -219,13 +221,16 @@ jobs:
           cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
           SRC="target/${{ matrix.target }}/release"
-          # macOS builds yield .dylib; Linux/Windows produce .so/.dll
-          ART="$(ls "$SRC"/libcidrscan_php.{dylib,${{ matrix.libext }}} 2>/dev/null | head -n1)"
-          if [ -z "$ART" ]; then
-            echo "::error file=$SRC::cidrscan_php.{${{ matrix.libext }},dylib} not found"; exit 1
+          shopt -s nullglob                 # empty globs → empty array, not literal
+          # candidates for every OS naming convention
+          libs=("$SRC"/libcidrscan_php.${{ matrix.libext }} \
+                "$SRC"/cidrscan_php.${{ matrix.libext }} \
+                "$SRC"/libcidrscan_php.dylib)
+          if (( ${#libs[@]} == 0 )); then
+            echo "::error file=$SRC::no built library found"; exit 1
           fi
-          # Always store as .so so PHP can load it uniformly
-          cp "$ART" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
+          cp "${libs[0]}" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
+          shopt -u nullglob
           cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
 
       - name: Zip PHP deliverable
