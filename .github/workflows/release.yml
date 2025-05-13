@@ -231,13 +231,6 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # Use rust-lld instead of the default MSVC linker (ext-php-rs advice)
-      - name: Configure rust-lld linker
-        if: runner.os == 'Windows'
-        run: |
-          mkdir -p .cargo
-          printf '[target.x86_64-pc-windows-msvc]\nlinker = "rust-lld"\n' > .cargo/config.toml
-
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ runner.os }}-${{ matrix.target || '' }}
