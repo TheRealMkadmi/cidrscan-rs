@@ -160,15 +160,47 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload native library zips as artifacts
+      - name: Upload native library zips as artifacts (linux-x86_64)
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: native-libs
-          path: |
-            linux-*.zip
-            windows-*.zip
-            macos-*.zip
-            macos-universal.zip
+          name: native-libs-linux-x86_64
+          path: linux-x86_64.zip
+
+      - name: Upload native library zips as artifacts (linux-aarch64)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-linux-aarch64
+          path: linux-aarch64.zip
+
+      - name: Upload native library zips as artifacts (windows-x86_64)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-windows-x86_64
+          path: windows-x86_64.zip
+
+      - name: Upload native library zips as artifacts (macos-x86_64)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-macos-x86_64
+          path: macos-x86_64.zip
+
+      - name: Upload native library zips as artifacts (macos-aarch64)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-macos-aarch64
+          path: macos-aarch64.zip
+
+      - name: Upload native library zips as artifacts (macos-universal)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-macos-universal
+          path: macos-universal.zip
 
 ###############################################################################
 # 3. PHP extensions (+ stubs) for PHP 8.3 & 8.4 across OS/arch/TS combos
@@ -321,8 +353,8 @@ jobs:
       - name: Upload PHP extension zips as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: php-extensions
-          path: cidrscan_php_*.zip
+          name: php-ext-${{ matrix.version }}-${{ matrix.osname }}-${{ matrix.arch }}-${{ matrix.phpts }}
+          path: cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
 
 ###############################################################################
 # 5. Merge macOS PHP extensions into universal .so (for each PHP version)
@@ -370,5 +402,5 @@ jobs:
       - name: Upload macOS universal PHP extension as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-universal-php
+          name: php-ext-macos-universal-${{ matrix.version }}-nts
           path: cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip
