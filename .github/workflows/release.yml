@@ -14,10 +14,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-###############################################################################
-# 1. Test suite
-###############################################################################
 jobs:
+###############################################################################
+# 0. Test suite
+###############################################################################
   test:
     runs-on: ubuntu-latest
     steps:
@@ -28,6 +28,26 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+###############################################################################
+# 1. Generate the IDE stubs once (Linux) and expose them as an artifact
+###############################################################################
+  generate-stubs:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-php --locked
+      - name: Build stubs
+        run: cargo php stubs --manifest cidrscan_php/Cargo.toml -o cidrscan_php.phpstub
+      - name: Upload stub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-stubs
+          path: cidrscan_php.phpstub
 ###############################################################################
 # 2. Native C-ABI libraries (Linux, Windows, macOS)
 ###############################################################################
@@ -144,7 +164,7 @@ jobs:
 # 3. PHP extensions (+ stubs) for PHP 8.3 & 8.4 across OS/arch/TS combos
 ###############################################################################
   build-php:
-    needs: test
+    needs: generate-stubs
     strategy:
       matrix:
         include:
@@ -199,18 +219,40 @@ jobs:
           arch: x64
           toolset: ${{ steps.php_sdk.outputs.toolset }}
 
-      - uses: dtolnay/rust-toolchain@v1
+      # ─────────── Rust (nightly on Windows, stable elsewhere) ────────────
+      - if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+          targets: ${{ matrix.target }}
+      - if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+
+      # Use rust-lld instead of the default MSVC linker (ext-php-rs advice)
+      - name: Configure rust-lld linker
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p .cargo
+          printf '[target.x86_64-pc-windows-msvc]\nlinker = "rust-lld"\n' > .cargo/config.toml
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ runner.os }}-${{ matrix.target || '' }}
 
-      - run: cargo install cargo-php --locked
+      # cargo-php is only needed where we *create* the stubs
+      - if: runner.os == 'Linux'
+        run: cargo install cargo-php --locked
 
-      - name: Build extension & generate stubs
+      # Bring the pre-built stub onto every runner
+      - name: Download stub artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: php-stubs
+
+      - name: Build extension & (generate / copy) stubs
         shell: bash
         run: |
           set -euo pipefail
@@ -235,7 +277,12 @@ jobs:
             echo "::error file=$SRC::no built cidrscan_php library found"; exit 1
           fi
           cp "$found" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
-          cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
+
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
+          else
+            cp cidrscan_php.phpstub "$OUTDIR/"
+          fi
 
       - name: Zip PHP deliverable
         shell: bash
