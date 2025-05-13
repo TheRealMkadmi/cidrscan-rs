@@ -57,6 +57,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Install Info-ZIP so that the bash loop can call `zip`
+      - name: Install zip CLI (Windows)
+        if: runner.os == 'Windows'
+        run: choco install -y zip
+
       - name: Add required Rust targets
         run: |
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin
@@ -191,15 +196,6 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # cross binary cached
-      - uses: actions/cache@v4
-        id: cache-cross
-        with:
-          path: ~/.cargo/bin/cross
-          key: cross-bin-v${{ env.CARGO_TERM_COLOR }}
-      - if: steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ runner.os }}-${{ matrix.target || '' }}
@@ -214,15 +210,7 @@ jobs:
           mkdir -p "$OUTDIR"
 
           # Inline build.sh logic
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
-          else
-            if command -v cross >/dev/null 2>&1; then
-              cross build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
-            else
-              cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
-            fi
-          fi
+          cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
           SRC="target/${{ matrix.target }}/release"
           cp "$SRC"/*cidrscan_php.${{ matrix.libext }} "$OUTDIR/"
