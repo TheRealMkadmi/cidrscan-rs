@@ -62,7 +62,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x ./github/scripts/build.sh
           declare -A MAP=(
             [x86_64-unknown-linux-gnu]=linux-x86_64
             [aarch64-unknown-linux-gnu]=linux-aarch64
@@ -71,7 +70,16 @@ jobs:
           mkdir -p packages
           for TARGET in "${!MAP[@]}"; do
             NAME=${MAP[$TARGET]}
-            ./github/scripts/build.sh build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
+            # Inline build.sh logic
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
+            else
+              if command -v cross >/dev/null 2>&1; then
+                cross build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
+              else
+                cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
+              fi
+            fi
             SRC=target/$TARGET/release
             INC=cidrscan_core/include
 
@@ -180,7 +188,16 @@ jobs:
           OUTDIR="packages/php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}"
           mkdir -p "$OUTDIR"
 
-          ./github/scripts/build.sh build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
+          # Inline build.sh logic
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
+          else
+            if command -v cross >/dev/null 2>&1; then
+              cross build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
+            else
+              cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
+            fi
+          fi
 
           SRC="target/${{ matrix.target }}/release"
           cp "$SRC"/*cidrscan_php.${{ matrix.libext }} "$OUTDIR/"
