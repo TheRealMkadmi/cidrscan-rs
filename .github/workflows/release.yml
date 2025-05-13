@@ -221,16 +221,20 @@ jobs:
           cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
           SRC="target/${{ matrix.target }}/release"
-          shopt -s nullglob                 # empty globs → empty array, not literal
-          # candidates for every OS naming convention
-          libs=("$SRC"/libcidrscan_php.${{ matrix.libext }} \
-                "$SRC"/cidrscan_php.${{ matrix.libext }} \
-                "$SRC"/libcidrscan_php.dylib)
-          if (( ${#libs[@]} == 0 )); then
-            echo "::error file=$SRC::no built library found"; exit 1
+          # find the first file that actually exists, regardless of extension/prefix
+          found=""
+          for cand in \
+                "$SRC/libcidrscan_php.${{ matrix.libext }}" \
+                "$SRC/cidrscan_php.${{ matrix.libext }}"  \
+                "$SRC/libcidrscan_php.dylib"; do
+            if [ -f "$cand" ]; then
+              found="$cand"; break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "::error file=$SRC::no built cidrscan_php library found"; exit 1
           fi
-          cp "${libs[0]}" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
-          shopt -u nullglob
+          cp "$found" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
           cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
 
       - name: Zip PHP deliverable
