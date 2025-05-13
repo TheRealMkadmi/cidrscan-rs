@@ -29,11 +29,14 @@ jobs:
       - run: cargo test --workspace
 
 ###############################################################################
-# 2. Native C-ABI libraries (Linux & Windows)
+# 2. Native C-ABI libraries (Linux, Windows, macOS)
 ###############################################################################
   build-libs:
     needs: test
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
 
       - uses: actions/checkout@v4
@@ -42,56 +45,76 @@ jobs:
         with:
           toolchain: stable
 
-      # cross binary cached
-      - uses: actions/cache@v4
+      # cross binary cached – Linux only
+      - if: runner.os == 'Linux'
+        uses: actions/cache@v4
         id: cache-cross
         with:
           path: ~/.cargo/bin/cross
           key: cross-bin
-      - if: steps.cache-cross.outputs.cache-hit != 'true'
+      - if: runner.os == 'Linux' && steps.cache-cross.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Add required Rust targets
         run: |
-          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-msvc x86_64-apple-darwin aarch64-apple-darwin
 
-      # Optionally, you can use houseabsolute/actions-rust-cross@v1 here instead of the manual loop below.
-      - name: Build & package every native target
+      - name: Build & package targets for this OS
         shell: bash
         run: |
           set -euo pipefail
-          declare -A MAP=(
-            [x86_64-unknown-linux-gnu]=linux-x86_64
-            [aarch64-unknown-linux-gnu]=linux-aarch64
-            [x86_64-pc-windows-msvc]=windows-x86_64
-          )
+          case "$RUNNER_OS" in
+            Linux)
+              TARGETS=("x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu")
+              ;;
+            Windows)
+              TARGETS=("x86_64-pc-windows-msvc")
+              ;;
+            macOS)
+              TARGETS=("x86_64-apple-darwin" "aarch64-apple-darwin")
+              ;;
+          esac
           mkdir -p packages
-          for TARGET in "${!MAP[@]}"; do
-            NAME=${MAP[$TARGET]}
-            # Inline build.sh logic
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
+          for TARGET in "${TARGETS[@]}"; do
+            case "$TARGET" in
+              x86_64-unknown-linux-gnu)  NAME=linux-x86_64 ;;
+              aarch64-unknown-linux-gnu) NAME=linux-aarch64 ;;
+              x86_64-pc-windows-msvc)    NAME=windows-x86_64 ;;
+              x86_64-apple-darwin|aarch64-apple-darwin) NAME=macos-${TARGET%%-*} ;;
+            esac
+
+            # build ─────────────
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              cross build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
             else
-              if command -v cross >/dev/null 2>&1; then
-                cross build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
-              else
-                cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
-              fi
+              cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$TARGET"
             fi
+
             SRC=target/$TARGET/release
             INC=cidrscan_core/include
 
             mkdir -p "packages/$NAME"
             cp "$INC/cidrscan.h" "packages/$NAME/"
             # Copy shared + static libraries
-            for PAT in "libcidrscan*.so" "libcidrscan*.a" "cidrscan*.dll" "cidrscan*.lib"; do
+            for PAT in "libcidrscan*.so" "libcidrscan*.a" "cidrscan*.dll" "cidrscan*.lib" "libcidrscan*.dylib"; do
               cp "$SRC/$PAT" "packages/$NAME/" 2>/dev/null || true
             done
 
             (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
           done
+
+          # macOS only – fuse into one universal dylib
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            mkdir -p packages/macos-universal
+            lipo -create \
+              target/x86_64-apple-darwin/release/libcidrscan_core.dylib \
+              target/aarch64-apple-darwin/release/libcidrscan_core.dylib \
+              -output packages/macos-universal/libcidrscan_core.dylib
+            cp cidrscan_core/include/cidrscan.h packages/macos-universal/
+            (cd packages/macos-universal && zip -rq "../../macos-universal.zip" .)
+          fi
 
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
@@ -99,6 +122,8 @@ jobs:
           files: |
             linux-*.zip
             windows-*.zip
+            macos-*.zip
+            macos-universal.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -213,47 +238,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           files: cidrscan_php_*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-###############################################################################
-# 4. Native libs for macOS (fat/universal)
-###############################################################################
-  build-macos-libs:
-    needs: test
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-          targets: |
-            x86_64-apple-darwin
-            aarch64-apple-darwin
-      - name: Build & package (fat)
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/universal/release packages
-          for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo build --release --manifest-path cidrscan_core/Cargo.toml --target "$ARCH"
-          done
-
-          # Combine into a single universal dylib
-          lipo -create \
-            target/x86_64-apple-darwin/release/libcidrscan_core.dylib \
-            target/aarch64-apple-darwin/release/libcidrscan_core.dylib \
-            -output target/universal/release/libcidrscan_core.dylib
-
-          NAME=macos-universal
-          mkdir -p "packages/$NAME"
-          cp target/universal/release/libcidrscan_core.dylib "packages/$NAME/"
-          cp cidrscan_core/include/cidrscan.h             "packages/$NAME/"
-          (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v')
-        with:
-          files: macos-*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
