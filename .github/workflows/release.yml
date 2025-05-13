@@ -160,6 +160,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Upload native library zips as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs
+          path: |
+            linux-*.zip
+            windows-*.zip
+            macos-*.zip
+            macos-universal.zip
+
 ###############################################################################
 # 3. PHP extensions (+ stubs) for PHP 8.3 & 8.4 across OS/arch/TS combos
 ###############################################################################
@@ -308,6 +318,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Upload PHP extension zips as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-extensions
+          path: cidrscan_php_*.zip
+
 ###############################################################################
 # 5. Merge macOS PHP extensions into universal .so (for each PHP version)
 ###############################################################################
@@ -350,3 +366,9 @@ jobs:
           files: cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload macOS universal PHP extension as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal-php
+          path: cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip
