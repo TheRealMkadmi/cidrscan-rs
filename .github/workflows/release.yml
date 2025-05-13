@@ -108,6 +108,9 @@ jobs:
             done
 
             (cd "packages/$NAME" && zip -rq "../../$NAME.zip" .)
+            echo "::group::Contents of $NAME.zip"
+            unzip -l "$NAME.zip"
+            echo "::endgroup::"
           done
 
           # macOS only – fuse into one universal dylib
@@ -119,6 +122,9 @@ jobs:
               -output packages/macos-universal/libcidrscan_core.dylib
             cp cidrscan_core/include/cidrscan.h packages/macos-universal/
             (cd packages/macos-universal && zip -rq "../../macos-universal.zip" .)
+            echo "::group::Contents of macos-universal.zip"
+            unzip -l macos-universal.zip
+            echo "::endgroup::"
           fi
 
       - uses: softprops/action-gh-release@v2
@@ -213,7 +219,13 @@ jobs:
           cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
           SRC="target/${{ matrix.target }}/release"
-          cp "$SRC"/*cidrscan_php.${{ matrix.libext }} "$OUTDIR/"
+          # macOS builds yield .dylib; Linux/Windows produce .so/.dll
+          ART="$(ls "$SRC"/libcidrscan_php.{dylib,${{ matrix.libext }}} 2>/dev/null | head -n1)"
+          if [ -z "$ART" ]; then
+            echo "::error file=$SRC::cidrscan_php.{${{ matrix.libext }},dylib} not found"; exit 1
+          fi
+          # Always store as .so so PHP can load it uniformly
+          cp "$ART" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
           cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
 
       - name: Zip PHP deliverable
@@ -221,6 +233,9 @@ jobs:
         run: |
           ZIP="cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip"
           (cd packages && zip -rq "../$ZIP" "php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}")
+          echo "::group::Contents of $ZIP"
+          unzip -l "$ZIP"
+          echo "::endgroup::"
 
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
