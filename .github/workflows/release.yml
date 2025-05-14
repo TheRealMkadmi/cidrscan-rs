@@ -216,11 +216,9 @@ jobs:
           - { os: ubuntu-latest, osname: linux, arch: x86_64, target: x86_64-unknown-linux-gnu, libext: so, phpts: nts, version: '8.4' }
           - { os: ubuntu-latest, osname: linux, arch: aarch64, target: aarch64-unknown-linux-gnu, libext: so, phpts: nts, version: '8.4' }
 
-          # macOS NTS (x86_64 + aarch64)
-          - { os: macos-latest, osname: macos, arch: x86_64, target: x86_64-apple-darwin, libext: so, phpts: nts, version: '8.3' }
-          - { os: macos-latest, osname: macos, arch: aarch64, target: aarch64-apple-darwin, libext: so, phpts: nts, version: '8.3' }
-          - { os: macos-latest, osname: macos, arch: x86_64, target: x86_64-apple-darwin, libext: so, phpts: nts, version: '8.4' }
-          - { os: macos-latest, osname: macos, arch: aarch64, target: aarch64-apple-darwin, libext: so, phpts: nts, version: '8.4' }
+          # macOS NTS – build both archs in one job and output a universal binary
+          - { os: macos-latest, osname: macos, arch: universal, target: x86_64-apple-darwin, libext: so, phpts: nts, version: '8.3' }
+          - { os: macos-latest, osname: macos, arch: universal, target: x86_64-apple-darwin, libext: so, phpts: nts, version: '8.4' }
 
           # Windows NTS & TS (x86_64 only)
           - { os: windows-latest, osname: windows, arch: x86_64, target: x86_64-pc-windows-msvc, libext: dll, phpts: nts, version: '8.3' }
@@ -306,16 +304,26 @@ jobs:
         run: rustup component add rustfmt --toolchain nightly
         if: runner.os == 'Windows'
 
-      - name: Build extension & (generate / copy) stubs
+      - name: Build extension / create universal binary / copy stubs
         shell: bash
         run: |
           set -euo pipefail
           OUTDIR="packages/php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}"
           mkdir -p "$OUTDIR"
 
-          # Inline build.sh logic
+          # ---------- build primary arch ----------
           cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
+          # ---------- macOS universal: build second arch + lipo merge ----------
+          if [ "$RUNNER_OS" = "macOS" ] && [ "${{ matrix.arch }}" = "universal" ]; then
+            cargo build --manifest-path cidrscan_php/Cargo.toml --release --target=aarch64-apple-darwin
+            lipo -create \
+              target/x86_64-apple-darwin/release/libcidrscan_php.${{ matrix.libext }} \
+              target/aarch64-apple-darwin/release/libcidrscan_php.${{ matrix.libext }} \
+              -output "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
+          fi
+
+          # ---------- pick the first-built library for non-macOS or copy merged one ----------
           SRC="target/${{ matrix.target }}/release"
           # find the first file that actually exists, regardless of extension/prefix
           found=""
@@ -327,10 +335,12 @@ jobs:
               found="$cand"; break
             fi
           done
-          if [ -z "$found" ]; then
-            echo "::error file=$SRC::no built cidrscan_php library found"; exit 1
+          if [ "$RUNNER_OS" != "macOS" ] || [ "${{ matrix.arch }}" != "universal" ]; then
+            if [ -z "$found" ]; then
+              echo "::error file=$SRC::no built cidrscan_php library found"; exit 1
+            fi
+            cp "$found" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
           fi
-          cp "$found" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
 
           if [ "$RUNNER_OS" = "Linux" ]; then
             cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
@@ -342,7 +352,7 @@ jobs:
         shell: bash
         run: |
           ZIP="cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip"
-          (cd packages && zip -rq "../$ZIP" "php-${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}")
+          (cd "$OUTDIR" && zip -rq "../../$ZIP" .)
           echo "::group::Contents of $ZIP"
           unzip -l "$ZIP"
           echo "::endgroup::"
@@ -360,51 +370,3 @@ jobs:
           name: php-ext-${{ matrix.version }}-${{ matrix.osname }}-${{ matrix.arch }}-${{ matrix.phpts }}
           path: cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
 
-###############################################################################
-# 5. Merge macOS PHP extensions into universal .so (for each PHP version)
-###############################################################################
-  merge-php-macos-universal:
-    needs: build-php
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        version: [ '8.3', '8.4' ]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download PHP extension artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: |
-            cidrscan_php_${{ matrix.version }}_macos_x86_64_nts.zip
-            cidrscan_php_${{ matrix.version }}_macos_aarch64_nts.zip
-
-      - name: Unzip artifacts
-        run: |
-          unzip cidrscan_php_${{ matrix.version }}_macos_x86_64_nts.zip -d x86_64
-          unzip cidrscan_php_${{ matrix.version }}_macos_aarch64_nts.zip -d aarch64
-
-      - name: Merge PHP extensions into universal binary
-        run: |
-          mkdir -p universal
-          lipo -create \
-            x86_64/cidrscan_php.so \
-            aarch64/cidrscan_php.so \
-            -output universal/cidrscan_php.so
-
-      - name: Zip universal PHP extension
-        run: |
-          cd universal
-          zip ../cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip cidrscan_php.so
-
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v')
-        with:
-          files: cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload macOS universal PHP extension as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: php-ext-macos-universal-${{ matrix.version }}-nts
-          path: cidrscan_php_${{ matrix.version }}_macos_universal_nts.zip
