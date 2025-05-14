@@ -148,7 +148,7 @@ jobs:
             echo "::group::Contents of macos-universal.zip"
             unzip -l macos-universal.zip
             echo "::endgroup::"
-          fi
+          fi 
 
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
