@@ -284,13 +284,9 @@ jobs:
 
           # ---------- build primary arch ----------
           cargo build --workspace --release --target="${{ matrix.target }}"  
-          cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
           # ---------- macOS universal: build second arch + lipo merge ----------
           if [ "$RUNNER_OS" = "macOS" ] && [ "${{ matrix.arch }}" = "universal" ]; then
-            # ext-php-rs produces .dylib slices on macOS; merge those,
-            # but still publish the universal file with .so extension
-            cargo build --manifest-path cidrscan_php/Cargo.toml --release --target=aarch64-apple-darwin
             lipo -create \
               target/x86_64-apple-darwin/release/libcidrscan_php.dylib \
               target/aarch64-apple-darwin/release/libcidrscan_php.dylib \
@@ -316,11 +312,7 @@ jobs:
             cp "$found" "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
           fi
 
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            cargo php stubs --manifest cidrscan_php/Cargo.toml -o "$OUTDIR/cidrscan_php.phpstub"
-          else
-            cp cidrscan_php.phpstub "$OUTDIR/"
-          fi
+          cp cidrscan_php.phpstub "$OUTDIR/"
 
       - name: Zip PHP deliverable
         shell: bash
