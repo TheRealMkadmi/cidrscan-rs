@@ -26,6 +26,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build cidrscan_core staticlib + cdylib
+        run: |
+          cargo build
       - run: cargo test --workspace --all-targets
 
 ###############################################################################
