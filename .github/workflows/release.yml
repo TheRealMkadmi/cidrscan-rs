@@ -28,7 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build cidrscan_core staticlib + cdylib
         run: |
-          cargo build
+          cargo build --workspace --all-targets
       - run: cargo test --workspace --all-targets
 
 ###############################################################################
@@ -283,6 +283,7 @@ jobs:
           mkdir -p "$OUTDIR"
 
           # ---------- build primary arch ----------
+          cargo build --workspace --release --target="${{ matrix.target }}"  
           cargo build --manifest-path cidrscan_php/Cargo.toml --release --target="${{ matrix.target }}"
 
           # ---------- macOS universal: build second arch + lipo merge ----------
@@ -294,7 +295,7 @@ jobs:
               target/x86_64-apple-darwin/release/libcidrscan_php.dylib \
               target/aarch64-apple-darwin/release/libcidrscan_php.dylib \
               -output "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
-          fi
+          fi 
 
           # ---------- pick the first-built library for non-macOS or copy merged one ----------
           SRC="target/${{ matrix.target }}/release"
