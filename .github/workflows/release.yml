@@ -147,8 +147,7 @@ jobs:
             echo "::group::Contents of macos-universal.zip"
             unzip -l macos-universal.zip
             echo "::endgroup::"
-          fi
-
+            
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
@@ -160,13 +159,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-          
-      - name: Upload native library zips as artifacts
+      - name: Upload individual native library zips
         if: success()          # run on every OS job
         uses: actions/upload-artifact@v4
         with:
-          name: native-libs-${{ runner.os }}
-          path: "*.zip"
+          name: ${{ github.job }}-${{ matrix.os }}
+          path: |
+            linux-*.zip
+            windows-*.zip
+            macos-*.zip
+            macos-universal.zip
           if-no-files-found: error
 
 ###############################################################################

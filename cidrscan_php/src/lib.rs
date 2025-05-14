@@ -67,7 +67,6 @@ extern "C" {
     fn cidr_strerror(code: ErrorCode) -> *const c_char;
 }
 
-/// ─── PHP-facing shims (unique Rust names + `name =` option) ───────────────
 #[php_function(name = "cidr_open")]
 pub fn rs_cidr_open(name_utf8: String, capacity: u64) -> i64 {
     let cname = CString::new(name_utf8).expect("UTF-8 error");
