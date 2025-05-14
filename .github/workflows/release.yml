@@ -26,6 +26,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build cidrscan_core staticlib + cdylib
+        run: |
+          cargo build
       - run: cargo test --workspace
 
 ###############################################################################
@@ -48,6 +51,7 @@ jobs:
         with:
           name: php-stubs
           path: cidrscan_php.phpstub
+
 ###############################################################################
 # 2. Native C-ABI libraries (Linux, Windows, macOS)
 ###############################################################################
@@ -58,9 +62,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
@@ -74,7 +76,6 @@ jobs:
           key: cross-bin
       - if: runner.os == 'Linux' && steps.cache-cross.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
-
       - uses: Swatinem/rust-cache@v2
 
       # Install Info-ZIP so that the bash loop can call `zip`
@@ -147,7 +148,7 @@ jobs:
             echo "::group::Contents of macos-universal.zip"
             unzip -l macos-universal.zip
             echo "::endgroup::"
-            
+
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
@@ -346,4 +347,3 @@ jobs:
         with:
           name: php-ext-${{ matrix.version }}-${{ matrix.osname }}-${{ matrix.arch }}-${{ matrix.phpts }}
           path: cidrscan_php_${{ matrix.version }}_${{ matrix.osname }}_${{ matrix.arch }}_${{ matrix.phpts }}.zip
-
