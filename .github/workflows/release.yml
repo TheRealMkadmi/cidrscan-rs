@@ -283,10 +283,12 @@ jobs:
 
           # ---------- macOS universal: build second arch + lipo merge ----------
           if [ "$RUNNER_OS" = "macOS" ] && [ "${{ matrix.arch }}" = "universal" ]; then
+            # ext-php-rs produces .dylib slices on macOS; merge those,
+            # but still publish the universal file with .so extension
             cargo build --manifest-path cidrscan_php/Cargo.toml --release --target=aarch64-apple-darwin
             lipo -create \
-              target/x86_64-apple-darwin/release/libcidrscan_php.${{ matrix.libext }} \
-              target/aarch64-apple-darwin/release/libcidrscan_php.${{ matrix.libext }} \
+              target/x86_64-apple-darwin/release/libcidrscan_php.dylib \
+              target/aarch64-apple-darwin/release/libcidrscan_php.dylib \
               -output "$OUTDIR/cidrscan_php.${{ matrix.libext }}"
           fi
 
