@@ -26,10 +26,7 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build cidrscan_core staticlib + cdylib
-        run: |
-          cargo build
-      - run: cargo test --workspace
+      - run: cargo test --workspace --all-targets
 
 ###############################################################################
 # 1. Generate the IDE stubs once (Linux) and expose them as an artifact
