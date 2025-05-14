@@ -302,6 +302,10 @@ jobs:
           # 2. Add the directory to PATH for *all* later steps (bash included)
           echo "$(Split-Path $phpExe)" | Out-File -FilePath $Env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Expose PHP import-lib path
+        if: runner.os == 'Windows'
+        run: echo "PHP_LIB=${{ steps.php_sdk.outputs.sdk_path }}\\lib" >> $Env:GITHUB_ENV
+
       - name: Build extension & (generate / copy) stubs
         shell: bash
         run: |
