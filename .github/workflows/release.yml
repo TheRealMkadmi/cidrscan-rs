@@ -287,6 +287,7 @@ jobs:
 
           # ---------- macOS universal: build second arch + lipo merge ----------
           if [ "$RUNNER_OS" = "macOS" ] && [ "${{ matrix.arch }}" = "universal" ]; then
+            cargo build --manifest-path cidrscan_php/Cargo.toml --release --target=aarch64-apple-darwin
             lipo -create \
               target/x86_64-apple-darwin/release/libcidrscan_php.dylib \
               target/aarch64-apple-darwin/release/libcidrscan_php.dylib \
