@@ -29,7 +29,9 @@ jobs:
       - name: Build cidrscan_core staticlib + cdylib
         run: |
           cargo build --workspace --all-targets
-      - run: cargo test --workspace --all-targets
+      - run: |
+          cargo test --workspace --all-targets
+          cargo test --workspace --features enable_global_priv
 
 ###############################################################################
 # 1. Generate the IDE stubs once (Linux) and expose them as an artifact

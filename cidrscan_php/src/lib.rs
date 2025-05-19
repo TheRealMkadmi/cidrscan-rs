@@ -1,103 +1,186 @@
 #![cfg_attr(windows, feature(abi_vectorcall))]
 
 use ext_php_rs::prelude::*;
-use std::ffi::{CStr, CString};
-use std::ptr;
-use cidrscan_core::public_api::*;
+use ext_php_rs::exception::PhpException;
 use cidrscan_core::types::PatriciaTree;
+use cidrscan_core::errors::{map_error, ErrorCode as CoreErrorCode};
+use ipnet::IpNet;
+use std::ffi::CStr;
+use std::ptr;
+use std::collections::HashMap;
 
-type PatriciaHandle = *mut PatriciaTree;
-
-
-#[php_function(name = "cidr_open")]
-pub fn rs_cidr_open(name_utf8: String, capacity: u64) -> i64 {
-    let cname = CString::new(name_utf8).expect("UTF-8 error");
-    cidr_open(cname.as_ptr(), capacity as usize) as i64
+// Convert a CoreErrorCode into a PhpException
+fn errcode_to_exception(code: CoreErrorCode) -> PhpException {
+    // Safety: cidr_strerror returns a valid C‐string pointer
+    let msg = unsafe {
+        CStr::from_ptr(cidrscan_core::public_api::cidr_strerror(code as i32))
+            .to_string_lossy()
+            .into_owned()
+    };
+    PhpException::default(msg)
 }
 
-#[php_function(name = "cidr_close")]
-pub fn rs_cidr_close(handle: i64) {
-    cidr_close(handle as PatriciaHandle);
+/// Open or create the tree; return the opaque handle as an `isize`.
+#[php_function]
+pub fn cidr_open(name: String, capacity: usize) -> PhpResult<isize> {
+    let tree = PatriciaTree::open(&name, capacity)
+        .map_err(|_| errcode_to_exception(CoreErrorCode::ShmemOpenFailed))?;
+    // Leak it into a raw pointer
+    let raw = Box::into_raw(Box::new(tree));
+    Ok(raw as isize)
 }
 
-#[php_function(name = "cidr_insert")]
-pub fn rs_cidr_insert(
-    handle: i64,
-    cidr_utf8: String,
-    ttl: u64,
-    tag_utf8: Option<String>,
-) -> i32 {
-    let ccidr = CString::new(cidr_utf8).expect("UTF-8 error");
-    let tag_ptr = tag_utf8
-        .as_ref()
-        .map(|s| CString::new(s.as_str()).unwrap())
-        .map_or(ptr::null(), |c| c.as_ptr());
-
-    cidr_insert(
-        handle as PatriciaHandle,
-        ccidr.as_ptr(),
-        ttl,
-        tag_ptr,
-    ) as i32
-}
-
-#[php_function(name = "cidr_delete")]
-pub fn rs_cidr_delete(handle: i64, cidr_utf8: String) -> i32 {
-    let ccidr = CString::new(cidr_utf8).expect("UTF-8 error");
-    cidr_delete(handle as PatriciaHandle, ccidr.as_ptr()) as i32
-}
-
-#[php_function(name = "cidr_lookup")]
-pub fn rs_cidr_lookup(handle: i64, addr_utf8: String) -> bool {
-    let caddr = CString::new(addr_utf8).expect("UTF-8 error");
-    cidr_lookup(handle as PatriciaHandle, caddr.as_ptr())
-}
-
-#[php_function(name = "cidr_lookup_full")]
-pub fn rs_cidr_lookup_full(handle: i64, addr_utf8: String, out_ptr: i64) -> i32 {
-    let caddr = CString::new(addr_utf8).expect("UTF-8 error");
-    cidr_lookup_full(
-        handle as PatriciaHandle,
-        caddr.as_ptr(),
-        out_ptr as *mut PatriciaMatchT,
-    ) as i32
-}
-
-#[php_function(name = "cidr_available_capacity")]
-pub fn rs_cidr_available_capacity(handle: i64) -> u64 {
-    cidr_available_capacity(handle as PatriciaHandle)
-}
-
-#[php_function(name = "cidr_flush")]
-pub fn rs_cidr_flush(handle: i64) -> i32 {
-    cidr_flush(handle as PatriciaHandle) as i32
-}
-
-#[php_function(name = "cidr_clear")]
-pub fn rs_cidr_clear(handle: i64) -> i32 {
-    cidr_clear(handle as PatriciaHandle) as i32
-}
-
-#[php_function(name = "cidr_resize")]
-pub fn rs_cidr_resize(handle: i64, new_capacity: u64) -> i32 {
-    cidr_resize(handle as PatriciaHandle, new_capacity as usize) as i32
-}
-
-#[php_function(name = "cidr_last_error")]
-pub fn rs_cidr_last_error() -> i32 {
-    cidr_last_error() as i32
-}
-
-#[php_function(name = "cidr_strerror")]
-pub fn rs_cidr_strerror(code: i32) -> String {
-    unsafe {
-        let cstr = cidr_strerror(std::mem::transmute(code));
-        CStr::from_ptr(cstr).to_string_lossy().into_owned() 
+/// Close the tree (idempotent).
+#[php_function]
+pub fn cidr_close(handle: isize) {
+    if handle != 0 {
+        // SAFETY: we trust that handle was originally from Box::into_raw
+        unsafe { drop(Box::from_raw(handle as *mut PatriciaTree)) };
     }
 }
 
-/// ─── module entry point ───────────────────────────────────────────────────
+/// Insert a CIDR entry.
+#[php_function]
+pub fn cidr_insert(
+    handle: isize,
+    cidr: String,
+    ttl: u64,
+    tag: Option<String>,
+) -> PhpResult<()> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_ref()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    let net: IpNet = cidr.parse()
+        .map_err(|_| PhpException::default("Invalid prefix".into()))?;
+    let key = match net.network() {
+        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()) as u128,
+        std::net::IpAddr::V6(v6) => v6.octets().iter().fold(0u128, |acc, &b| (acc << 8) | b as u128),
+    };
+    let plen = net.prefix_len() as u8;
+
+    tree.insert(key, plen, ttl, tag.as_deref())
+        .map_err(|e| errcode_to_exception(map_error(&e)))?;
+    Ok(())
+}
+
+/// Delete a CIDR entry.
+#[php_function]
+pub fn cidr_delete(handle: isize, cidr: String) -> PhpResult<()> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_mut()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    let net: IpNet = cidr.parse()
+        .map_err(|_| PhpException::default("Invalid prefix".into()))?;
+    let key = match net.network() {
+        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()) as u128,
+        std::net::IpAddr::V6(v6) => v6.octets().iter().fold(0u128, |acc, &b| (acc << 8) | b as u128),
+    };
+    let plen = net.prefix_len() as u8;
+
+    tree.delete(key, plen)
+        .map_err(|e| errcode_to_exception(map_error(&e)))?;
+    Ok(())
+}
+
+/// Lookup an address, returning true if found.
+#[php_function]
+pub fn cidr_lookup(handle: isize, addr: String) -> PhpResult<bool> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_ref()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    let ip_addr = addr.parse()
+        .map_err(|_| PhpException::default("Invalid prefix".into()))?;
+    let key = match ip_addr {
+        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()) as u128,
+        std::net::IpAddr::V6(v6) => v6.octets().iter().fold(0u128, |acc, &b| (acc << 8) | b as u128),
+    };
+    Ok(tree.lookup(key).is_some())
+}
+
+/// Full lookup info as an associative array.
+#[php_function]
+pub fn cidr_lookup_full(
+    handle: isize,
+    addr: String,
+) -> PhpResult<HashMap<String, ext_php_rs::types::Zval>> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_ref()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    let ip_addr = addr.parse()
+        .map_err(|_| PhpException::default("Invalid prefix".into()))?;
+    let key = match ip_addr {
+        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()) as u128,
+        std::net::IpAddr::V6(v6) => v6.octets().iter().fold(0u128, |acc, &b| (acc << 8) | b as u128),
+    };
+
+    if let Some(m) = tree.lookup(key) {
+        let mut out = HashMap::new();
+        out.insert("key_high".into(), ext_php_rs::types::Zval::from((m.cidr_key >> 64) as u128 as usize as i32));
+        out.insert("key_low".into(),  ext_php_rs::types::Zval::from(m.cidr_key as usize as i32));
+        out.insert("plen".into(),     ext_php_rs::types::Zval::from(m.plen as i32));
+        out.insert("tag".into(),      ext_php_rs::types::Zval::from(m.tag.clone()));
+        Ok(out)
+    } else {
+        Err(PhpException::default("Not found".into()))
+    }
+}
+
+/// Available capacity.
+#[php_function]
+pub fn cidr_available_capacity(handle: isize) -> PhpResult<u64> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_ref()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    Ok(tree.available_capacity() as u64)
+}
+
+/// Flush the tree.
+#[php_function]
+pub fn cidr_flush(handle: isize) -> PhpResult<()> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_mut()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    tree.flush();
+    Ok(())
+}
+
+/// Clear the tree.
+#[php_function]
+pub fn cidr_clear(handle: isize) -> PhpResult<()> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_mut()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    tree.clear();
+    Ok(())
+}
+
+/// Resize the tree.
+#[php_function]
+pub fn cidr_resize(handle: isize, new_capacity: usize) -> PhpResult<()> {
+    let tree = (handle as *mut PatriciaTree)
+        .as_mut()
+        .ok_or_else(|| PhpException::default("Invalid handle".into()))?;
+    tree.resize(new_capacity)
+        .map_err(|e| errcode_to_exception(map_error(&e)))?;
+    Ok(())
+}
+
+/// Last error and strerror for low‐level debugging.
+#[php_function]
+pub fn cidr_last_error() -> i32 {
+    cidrscan_core::public_api::cidr_last_error() as i32
+}
+#[php_function]
+pub fn cidr_strerror(code: i32) -> String {
+    unsafe {
+        CStr::from_ptr(cidrscan_core::public_api::cidr_strerror(code))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Boilerplate module registration.
 #[php_module]
-pub fn get_module(module: ModuleBuilder) -> ModuleBuilder {
-    module
+pub fn module(m: ModuleBuilder) -> ModuleBuilder {
+    m
 }

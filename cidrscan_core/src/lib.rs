@@ -30,6 +30,23 @@ use metrics::{counter, gauge};
 use once_cell::sync::OnceCell;
 use raw_sync::Timeout; // needed by API
 use shared_memory::{ShmemConf, ShmemError};
+
+#[cfg(target_os = "windows")]
+fn make_os_id(prefix: &str, hash: u64) -> String {
+    let local = format!(r"Local\\{}{:016x}", prefix, hash);
+    #[cfg(feature = "enable_global_priv")]
+    {
+        if crate::platform::windows::ensure_global_privilege() {
+            return format!(r"Global\\{}{:016x}", prefix, hash);
+        }
+    }
+    local
+}
+
+#[cfg(not(target_os = "windows"))]
+fn make_os_id(prefix: &str, hash: u64) -> String {
+    format!("{prefix}{:016x}", hash)
+}
 use std::sync::Arc;
 use std::{
     mem::size_of,
@@ -108,7 +125,7 @@ impl PatriciaTree {
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
         Self::ensure_logging();
         let hash = fnv1a_64(name);
-        let os_name = format!("{PREFIX}{:016x}", hash);
+        let os_name = make_os_id(PREFIX, hash);
         let region_size = HEADER_PADDED + capacity * size_of::<Node>() + capacity * TAG_MAX_LEN;
 
         let conf = || ShmemConf::new().os_id(&os_name).size(region_size);
