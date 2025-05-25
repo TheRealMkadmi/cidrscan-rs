@@ -6,6 +6,9 @@ pub mod shmem_rwlock;
 pub mod telemetry;
 pub mod types;
 
+#[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
+pub use crate::platform::windows::enable_se_create_global_privilege;
+
 // Install metrics recorder when the crate is loaded
 #[doc(hidden)]
 #[inline(always)]
@@ -22,7 +25,6 @@ use crossbeam_queue::SegQueue;
 use helpers::*;
 use types::Offset;
 use types::*;
-
 use crate::shmem_rwlock::RawRwLock;
 use crossbeam_epoch as epoch;
 use log::{debug, error, info, trace, warn};
@@ -30,23 +32,6 @@ use metrics::{counter, gauge};
 use once_cell::sync::OnceCell;
 use raw_sync::Timeout; // needed by API
 use shared_memory::{ShmemConf, ShmemError};
-
-#[cfg(target_os = "windows")]
-fn make_os_id(prefix: &str, hash: u64) -> String {
-    let local = format!(r"Local\\{}{:016x}", prefix, hash);
-    #[cfg(feature = "enable_global_priv")]
-    {
-        if crate::platform::windows::ensure_global_privilege() {
-            return format!(r"Global\\{}{:016x}", prefix, hash);
-        }
-    }
-    local
-}
-
-#[cfg(not(target_os = "windows"))]
-fn make_os_id(prefix: &str, hash: u64) -> String {
-    format!("{prefix}{:016x}", hash)
-}
 use std::sync::Arc;
 use std::{
     mem::size_of,
@@ -55,8 +40,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
-pub use crate::platform::windows::enable_se_create_global_privilege;
+#[cfg(target_os = "windows")]
+fn make_os_id(prefix: &str, hash: u64) -> String {
+    format!("{}{:016x}", prefix, hash)
+}
+
 
 // ===== Compile-time assertions for alignment and size =====
 const HEADER_PADDED: usize =
