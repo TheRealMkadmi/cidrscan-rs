@@ -286,9 +286,9 @@ pub extern "C" fn cidr_flush(h: PatriciaHandle) -> ErrorCode {
 #[no_mangle]
 pub extern "C" fn cidr_clear(h: PatriciaHandle) -> ErrorCode {
     unsafe { h.as_ref() }
-        .map(|t| {
-            t.clear();
-            ErrorCode::Success
+        .map(|t| match t.clear() {
+            Ok(_) => ErrorCode::Success,
+            Err(e) => map_error(&e),
         })
         .unwrap_or(ErrorCode::InvalidHandle)
 }

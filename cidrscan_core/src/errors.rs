@@ -3,6 +3,48 @@
 use std::cell::RefCell;
 use std::os::raw::c_char;
 
+/// Error type for PatriciaTree operations and C-ABI error codes for cidrscan
+
+use std::fmt;
+#[derive(Debug)]
+pub enum Error {
+    CapacityExceeded,
+    ZeroCapacity,
+    InvalidPrefix,
+    BranchHasChildren,
+    LockInitFailed,
+    TagTooLong,
+    Lock(String),
+    Other(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::CapacityExceeded => write!(f, "Capacity exceeded"),
+            Error::ZeroCapacity => write!(f, "Zero capacity is not allowed"),
+            Error::InvalidPrefix => write!(f, "Invalid prefix"),
+            Error::BranchHasChildren => write!(f, "Branch has children"),
+            Error::LockInitFailed => write!(f, "Failed to initialize in-place RW-lock"),
+            Error::TagTooLong => write!(f, "Tag string exceeds maximum allowed length"),
+            Error::Lock(msg) => write!(f, "Lock error: {msg}"),
+            Error::Other(msg) => write!(f, "Other error: {msg}"),
+        }
+    }
+}
+
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Other(msg)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Other(msg.to_string())
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -82,14 +124,15 @@ pub extern "C" fn patricia_strerror(code: ErrorCode) -> *const c_char {
 }
 
 // Map internal Error to ErrorCode
-pub fn map_error(e: &crate::types::Error) -> ErrorCode {
-    use crate::types::Error::*;
+pub fn map_error(e: &Error) -> ErrorCode {
     match e {
-        CapacityExceeded => ErrorCode::CapacityExceeded,
-        ZeroCapacity => ErrorCode::ZeroCapacity,
-        InvalidPrefix => ErrorCode::InvalidPrefix,
-        BranchHasChildren => ErrorCode::BranchHasChildren,
-        LockInitFailed => ErrorCode::LockInitFailed,
-        TagTooLong => ErrorCode::TagTooLong
+        Error::CapacityExceeded => ErrorCode::CapacityExceeded,
+        Error::ZeroCapacity => ErrorCode::ZeroCapacity,
+        Error::InvalidPrefix => ErrorCode::InvalidPrefix,
+        Error::BranchHasChildren => ErrorCode::BranchHasChildren,
+        Error::LockInitFailed => ErrorCode::LockInitFailed,
+        Error::TagTooLong => ErrorCode::TagTooLong,
+        Error::Lock(_) => ErrorCode::LockInitFailed, // Map lock errors to LockInitFailed
+        Error::Other(_) => ErrorCode::Unknown,
     }
 }

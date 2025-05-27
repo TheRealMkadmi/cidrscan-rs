@@ -1,42 +1,17 @@
 //! Data structures for Patricia tree
 
+
 use crate::shmem_rwlock::RawRwLock;
 use std::mem::MaybeUninit;
-
 use std::{
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize},
+    cell::Cell,
 };
-
 use shared_memory::Shmem;
 use crossbeam_queue::SegQueue;
 use std::sync::Arc;
 
-/// Error type for PatriciaTree operations.
-#[derive(Debug)]
-pub enum Error {
-    CapacityExceeded,
-    ZeroCapacity,
-    InvalidPrefix,
-    BranchHasChildren,
-    /// Failed to open or initialise the in‑place RW‑lock.
-    LockInitFailed,
-    // ... (extend as needed)
-    /// Tag string exceeds maximum allowed length
-    TagTooLong,
-}
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::CapacityExceeded => write!(f, "Capacity exceeded"),
-            Error::ZeroCapacity => write!(f, "Zero capacity is not allowed"),
-            Error::InvalidPrefix => write!(f, "Invalid prefix"),
-            Error::BranchHasChildren => write!(f, "Branch has children"),
-            Error::LockInitFailed => write!(f, "Failed to initialize in-place RW-lock"),
-            Error::TagTooLong => write!(f, "Tag string exceeds maximum allowed length"),
-        }
-    }
-}
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
 pub type Offset = u32; // <= 4 294 967 295 bytes from base
@@ -54,6 +29,7 @@ pub struct Header {
     pub root_offset: AtomicU64, // atomic root pointer for lock‑free reads (ABA-safe)
     pub capacity: usize,        // max nodes in arena
     pub ref_count: AtomicUsize, // live-handle counter
+    pub global_epoch: AtomicU64, // <── NEW: shared global epoch for GC
     pub init_flag: AtomicU32,   // 0 = un-initialised, 1 = ready
 }
 
@@ -81,6 +57,7 @@ pub struct PatriciaTree {
     pub tag_base: NonNull<u8>, // start of tag slab
     pub os_id: String,        // Track the shared memory name for Drop
     pub freelist: Arc<SegQueue<Offset>>, // locally-owned queue of freed offsets
+    pub local_epoch: Cell<u64>,          // <── NEW (std::cell::Cell)
 }
 
 // SAFETY: Even though PatriciaTree contains raw pointers (NonNull<u8>),
@@ -96,6 +73,7 @@ unsafe impl Sync for PatriciaTree {}
 // 2. The raw pointers themselves are stable and safe even across unwinding boundaries
 impl std::panic::RefUnwindSafe for PatriciaTree {}
 impl std::panic::UnwindSafe for PatriciaTree {}
+
 pub struct Match<'a> {
     pub cidr_key: u128,
     pub plen: u8,

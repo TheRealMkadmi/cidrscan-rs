@@ -9,6 +9,9 @@ use raw_sync::Timeout;
 // Stable allocation imports for boxed helper
 use core::marker::PhantomData;
 
+#[cfg(unix)]
+use crate::platform::unix::robust_mutex;
+
 const _: () = {
     assert!(core::mem::size_of::<RawRwLock>() % core::mem::align_of::<RawRwLock>() == 0);
 };
@@ -17,8 +20,8 @@ const _: () = {
 /// Our shared-memory lock layout: [mutex-bytes][event-bytes][reader_count]
 #[repr(C)]
 pub struct RawRwLock {
-    mutex_buf: Box<[u8]>,
-    event_buf: Box<[u8]>,
+    mutex_buf: [u8; 128],   // fits raw_sync::RawMutex::size_of(None)
+    event_buf: [u8; 128],
     /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
     /// OS mutex handle (lives as long as RawRwLock)
@@ -57,13 +60,16 @@ impl RawRwLock {
 
     /// Safe, cross-platform constructor.
     /// Allocates the backing buffers and initializes the OS handles.
-    pub fn new() -> Box<Self> {
+    pub fn new() -> Result<Box<Self>, crate::errors::Error> {
         let msz = RawMutex::size_of(None);
         let esz = RawEvent::size_of(None);
 
+        debug_assert!(msz <= 128);
+        debug_assert!(esz <= 128);
+
         let mut lock = Box::new(Self {
-            mutex_buf: vec![0u8; msz].into_boxed_slice(),
-            event_buf: vec![0u8; esz].into_boxed_slice(),
+            mutex_buf: [0u8; 128],
+            event_buf: [0u8; 128],
             readers: AtomicU32::new(0),
             mutex_handle: None,
             event_handle: None,
@@ -72,33 +78,42 @@ impl RawRwLock {
 
         // SAFETY: buffers are aligned + non-null
         unsafe {
-            let (m, _) = RawMutex::new(lock.mutex_buf.as_mut_ptr(), ptr::null_mut()).unwrap();
-            let (e, _) = RawEvent::new(lock.event_buf.as_mut_ptr(), true).unwrap();
+            let (m, _) = RawMutex::new(lock.mutex_buf.as_mut_ptr(), ptr::null_mut())
+                .map_err(|e| crate::errors::Error::from(format!("mutex init failed: {e}")))?;
+            let (e, _) = RawEvent::new(lock.event_buf.as_mut_ptr(), true)
+                .map_err(|e| crate::errors::Error::from(format!("event init failed: {e}")))?;
             lock.mutex_handle = Some(m);
             lock.event_handle = Some(e);
         }
-        lock
+        Ok(lock)
     }
 
     /// In-place initialization for shared memory usage.
     /// # Safety
     /// - `ptr` must be valid, properly aligned, and point to zeroed memory.
-    pub unsafe fn new_in_place(ptr: *mut RawRwLock) -> Result<(), Box<dyn std::error::Error>> {
+    pub unsafe fn new_in_place(ptr: *mut RawRwLock) -> Result<(), crate::errors::Error> {
         let this = &mut *ptr;
         let msz = RawMutex::size_of(None);
         let esz = RawEvent::size_of(None);
 
-        // Allocate backing storage for mutex and event buffers in place
-        // (Assume the struct's fields are already zeroed, but we must replace the Box<[u8]> fields)
-        this.mutex_buf = vec![0u8; msz].into_boxed_slice();
-        this.event_buf = vec![0u8; esz].into_boxed_slice();
+        debug_assert!(msz <= 128);
+        debug_assert!(esz <= 128);
+
+        this.mutex_buf = [0u8; 128];
+        this.event_buf = [0u8; 128];
         this.readers = AtomicU32::new(0);
         this.mutex_handle = None;
         this.event_handle = None;
 
         // SAFETY: buffers are aligned + non-null
-        let (m, _) = RawMutex::new(this.mutex_buf.as_mut_ptr(), ptr::null_mut())?;
-        let (e, _) = RawEvent::new(this.event_buf.as_mut_ptr(), true)?;
+        #[cfg(unix)]
+        let (m, _) = robust_mutex(this.mutex_buf.as_mut_ptr())
+            .map_err(|e| crate::errors::Error::from(format!("robust_mutex init failed: {e}")))?;
+        #[cfg(not(unix))]
+        let (m, _) = RawMutex::new(this.mutex_buf.as_mut_ptr(), ptr::null_mut())
+            .map_err(|e: Box<dyn std::error::Error>| crate::errors::Error::Other(format!("mutex init failed: {e}")))?;
+        let (e, _) = RawEvent::new(this.event_buf.as_mut_ptr(), true)
+            .map_err(|e: Box<dyn std::error::Error>| crate::errors::Error::Other(format!("event init failed: {e}")))?;
         this.mutex_handle = Some(m);
         this.event_handle = Some(e);
 
@@ -109,10 +124,10 @@ impl RawRwLock {
     /// Returns Ok(()) on success, or an Error if reopening fails.
     ///
     /// Safety: ptr must point at a properly initialized RawRwLock.
-    pub unsafe fn reopen_in_place(ptr: *mut RawRwLock) -> Result<(), Box<dyn std::error::Error>> {
+    pub unsafe fn reopen_in_place(ptr: *mut RawRwLock) -> Result<(), crate::errors::Error> {
         // Ensure the provided pointer is not null
         if ptr.is_null() {
-            return Err("Null pointer passed to reopen_in_place".into());
+            return Err(crate::errors::Error::from("Null pointer passed to reopen_in_place"));
         }
 
         // Reopen mutex and event handles in their buffers
@@ -120,9 +135,9 @@ impl RawRwLock {
         let mptr = this.mutex_buf.as_mut_ptr() as *mut u8;
         let eptr = this.event_buf.as_mut_ptr() as *mut u8;
         let (mutex, _) = RawMutex::from_existing(mptr, ptr::null_mut())
-            .map_err(|e| format!("re-open mutex failed: {e}"))?;
+            .map_err(|e| crate::errors::Error::from(format!("re-open mutex failed: {e}")))?;
         let (event, _) =
-            RawEvent::from_existing(eptr).map_err(|e| format!("re-open event failed: {e}"))?;
+            RawEvent::from_existing(eptr).map_err(|e| crate::errors::Error::from(format!("re-open event failed: {e}")))?;
         this.mutex_handle = Some(mutex);
         this.event_handle = Some(event);
 
@@ -170,24 +185,71 @@ impl RawRwLock {
     /// Acquire an **exclusive** (write) lock.
     /// Blocks new readers and waits for in-flight readers to drain.
     /// Returns a guard that releases the lock when dropped.
-    pub fn write_lock(&self) -> WriteGuard<'_> {
+    pub fn write_lock(&self) -> Result<WriteGuard<'_>, crate::errors::Error> {
         // Acquire OS mutex using cached handle
-        let guard = self.mutex().lock().expect("mutex lock failed");
-        // 1. clear any prior event signals _before_ announcing the writer
-        let evt = self.event();
-        evt.set(raw_sync::events::EventState::Clear).unwrap();
-        // 2. advertise writer (blocks new readers)
-        let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
-        // 3. if there are in-flight readers, wait until the last one signals
-        if prev != 0 {
-            evt.wait(Timeout::Infinite).unwrap();
-            while self.readers.load(Ordering::Acquire) != WRITER_BIT {
-                core::hint::spin_loop();
+        #[cfg(unix)]
+        {
+            use libc::{pthread_mutex_consistent, EOWNERDEAD, pthread_mutex_t};
+            let result = self.mutex().lock();
+            let guard = match result {
+                Ok(g) => g,
+                Err(e) => {
+                    let msg = format!("{}", e);
+                    // Try to detect EOWNERDEAD from error string (raw_sync does not expose errno directly)
+                    if msg.contains("EOWNERDEAD") {
+                        // Safety: mutex_buf is aligned and sized for pthread_mutex_t
+                        let mtx_ptr = self.mutex_buf.as_ptr() as *mut pthread_mutex_t;
+                        let rc = unsafe { pthread_mutex_consistent(mtx_ptr) };
+                        if rc != 0 {
+                            return Err(crate::errors::Error::from(format!("pthread_mutex_consistent failed: {rc}")));
+                        }
+                        // Try locking again
+                        self.mutex().lock().map_err(|e| crate::errors::Error::from(format!("mutex lock failed after recovery: {e}")))?
+                    } else {
+                        return Err(crate::errors::Error::from(format!("mutex lock failed: {e}")));
+                    }
+                }
+            };
+            // 1. clear any prior event signals _before_ announcing the writer
+            let evt = self.event();
+            evt.set(raw_sync::events::EventState::Clear)
+                .map_err(|e| crate::errors::Error::from(format!("event clear failed: {e}")))?;
+            // 2. advertise writer (blocks new readers)
+            let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+            // 3. if there are in-flight readers, wait until the last one signals
+            if prev != 0 {
+                evt.wait(Timeout::Infinite)
+                    .map_err(|e| crate::errors::Error::from(format!("event wait failed: {e}")))?;
+                while self.readers.load(Ordering::Acquire) != WRITER_BIT {
+                    core::hint::spin_loop();
+                }
             }
+            Ok(WriteGuard {
+                lock: self,
+                _guard: guard,
+            })
         }
-        WriteGuard {
-            lock: self,
-            _guard: guard,
+        #[cfg(not(unix))]
+        {
+            let guard = self.mutex().lock().map_err(|e| crate::errors::Error::from(format!("mutex lock failed: {e}")))?;
+            // 1. clear any prior event signals _before_ announcing the writer
+            let evt = self.event();
+            evt.set(raw_sync::events::EventState::Clear)
+                .map_err(|e| crate::errors::Error::from(format!("event clear failed: {e}")))?;
+            // 2. advertise writer (blocks new readers)
+            let prev = self.readers.fetch_or(WRITER_BIT, Ordering::AcqRel) & READER_MASK;
+            // 3. if there are in-flight readers, wait until the last one signals
+            if prev != 0 {
+                evt.wait(Timeout::Infinite)
+                    .map_err(|e| crate::errors::Error::from(format!("event wait failed: {e}")))?;
+                while self.readers.load(Ordering::Acquire) != WRITER_BIT {
+                    core::hint::spin_loop();
+                }
+            }
+            Ok(WriteGuard {
+                lock: self,
+                _guard: guard,
+            })
         }
     }
 

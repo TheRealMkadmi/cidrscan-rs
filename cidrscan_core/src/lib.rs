@@ -24,6 +24,7 @@ use constants::*;
 use crossbeam_queue::SegQueue;
 use helpers::*;
 use types::Offset;
+use crate::errors::Error;
 use types::*;
 use crate::shmem_rwlock::RawRwLock;
 use crossbeam_epoch as epoch;
@@ -38,6 +39,7 @@ use std::{
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
+    cell::Cell,
 };
 
 #[cfg(target_os = "windows")]
@@ -69,11 +71,8 @@ impl PatriciaTree {
 
     /// Helper to retire an offset safely for epoch-based reclamation.
     pub fn retire_offset(&self, off: Offset) {
-        counter!("cidrscan_gc_nodes_total").increment(1);
-        let fl = self.freelist.clone();
-        epoch::pin().defer(move || {
-            fl.push(off);
-        });
+        let cur = self.local_epoch.get();
+        self.freelist.push(off | ((cur & 0xFFFF) as u32) << 16);
     }
     /// Insert an IPv4 prefix (automatically maps the 32-bit address into the high 96 bits).
     pub fn insert_v4(&self, addr: u32, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
@@ -112,6 +111,11 @@ impl PatriciaTree {
     /// Create or open a shared‑memory tree
     pub fn open(name: &str, capacity: usize) -> Result<Self, ShmemError> {
         Self::ensure_logging();
+        // hard-cap: header + nodes + tags must still addressable by u32
+        let max_nodes = (u32::MAX as usize) / size_of::<Node>();
+        if capacity > max_nodes {
+            return Err(ShmemError::MapOpenFailed(72)); // “capacity too large”
+        }
         let hash = fnv1a_64(name);
         let os_name = make_os_id(PREFIX, hash);
         let region_size = HEADER_PADDED + capacity * size_of::<Node>() + capacity * TAG_MAX_LEN;
@@ -164,23 +168,25 @@ impl PatriciaTree {
                         root_offset: AtomicU64::new(0),
                         capacity,
                         ref_count: AtomicUsize::new(0),
+                        global_epoch: AtomicU64::new(0), // <── NEW
                         init_flag: AtomicU32::new(0),
                     },
                 );
             }
         }
+        if is_creator { hdr_mut.global_epoch.store(1, Ordering::Release); }
         let prev = hdr_mut.lock_init.fetch_or(1, Ordering::AcqRel);
         if prev == 0 {
             // first opener in this process: initialise the bytes
             unsafe {
-                let _ = RawRwLock::new_in_place((&mut hdr_mut.lock).as_mut_ptr())
-                    .map_err(|_| Error::LockInitFailed);
+                RawRwLock::new_in_place((&mut hdr_mut.lock).as_mut_ptr())
+                    .map_err(|_| ShmemError::MapOpenFailed(73))?;
             }
         } else {
             // subsequent opens: attach to existing lock state
             unsafe {
-                let _ = RawRwLock::reopen_in_place((&mut hdr_mut.lock).as_mut_ptr())
-                    .map_err(|_| Error::LockInitFailed);
+                RawRwLock::reopen_in_place((&mut hdr_mut.lock).as_mut_ptr())
+                    .map_err(|_| ShmemError::MapOpenFailed(74))?;
             }
         }
         let hdr_ref = unsafe { &*hdr_ptr };
@@ -198,6 +204,7 @@ impl PatriciaTree {
             hdr,
             os_id: os_name.clone(),
             freelist: Arc::new(SegQueue::new()),
+            local_epoch: Cell::new(0),
         })
     }
 
@@ -207,7 +214,16 @@ impl PatriciaTree {
     /// Execute pending epoch callbacks *now* and push recycled offsets
     /// into the freelist.  Cheap (< 1 µs) and wait‑free for other threads.
     pub fn flush(&self) {
-        epoch::pin().flush();
+        let g = unsafe { &*self.hdr.as_ptr() }.global_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.local_epoch.set(g);
+
+        // reclaim if two full epochs have passed
+        while let Some(raw) = self.freelist.pop() {
+            let node_epoch = (raw >> 16) as u64;
+            if g.wrapping_sub(node_epoch) < 2 { self.freelist.push(raw); break }
+            // real reclaim:
+            self.free_node((raw & 0xFFFF) as u64);
+        }
     }
 
     /// Insert a key with a given prefix length and TTL
@@ -228,7 +244,10 @@ impl PatriciaTree {
             return Err(Error::ZeroCapacity);
         }
         // Acquire write lock using guard
-        let _write_guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
+        let _write_guard = unsafe {
+            hdr.lock.assume_init_ref().write_lock()
+                .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
+        };
         debug!(
             "[INSERT] Lock acquired. Current next_index={}",
             hdr.next_index.load(Ordering::Relaxed)
@@ -238,7 +257,7 @@ impl PatriciaTree {
         let stored_key = canonical(key, prefix_len);
 
         let expires = if ttl_secs == 0 {
-            0
+            u64::MAX
         } else {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -914,7 +933,10 @@ impl PatriciaTree {
         info!("[DELETE] key={:x}, prefix_len={}", key, prefix_len);
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
-        let _write_guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
+        let _write_guard = unsafe {
+            hdr.lock.assume_init_ref().write_lock()
+                .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
+        };
         debug!("[DELETE] Lock acquired.");
 
         // Store canonical key
@@ -1032,21 +1054,31 @@ impl PatriciaTree {
     }
 
     /// Clears the entire tree (drops all nodes).
-    pub fn clear(&self) {
+    pub fn clear(&self) -> Result<(), Error> {
         info!("[CLEAR] Clearing tree.");
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
-        let _write_guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
+        let _write_guard = unsafe {
+            hdr.lock.assume_init_ref().write_lock()
+                .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
+        };
         debug!("[CLEAR] Lock acquired.");
 
-        // Reset root and allocator state
+        // walk arena, push all used offsets into freelist
+        for i in 0..hdr.next_index.load(Ordering::Acquire) {
+            let off = HEADER_PADDED as Offset + i * size_of::<Node>() as Offset;
+            self.retire_offset(off);
+        }
+        hdr.free_slots.store(
+            hdr.next_index.swap(0, Ordering::Release),
+            Ordering::Release,
+        );
         hdr.root_offset.store(0, Ordering::Release);
-        hdr.next_index.store(0, Ordering::Release);
-        hdr.free_slots.store(0, Ordering::Release);
 
         info!("[CLEAR] Tree cleared.");
         // Remove explicit unlock, guard will handle it
         // hdr.lock.write_unlock();
+        Ok(())
     }
     /// If the current root is a non‑terminal node with only one child,
     /// promote that child (repeat until this is no longer true).
@@ -1119,7 +1151,10 @@ impl PatriciaTree {
         }
 
         // ---- exclusive lock: no mutators, look‑ups keep running ----------
-        let _guard = unsafe { hdr.lock.assume_init_ref().write_lock() };
+        let _guard = unsafe {
+            hdr.lock.assume_init_ref().write_lock()
+                .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
+        };
 
         // ---- build a bigger mapping next to the old one -------------------
         let next_name = format!("{}_next{}", self.os_id, std::process::id());

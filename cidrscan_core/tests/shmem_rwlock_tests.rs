@@ -9,7 +9,7 @@ use std::{
 /// Helper: allocate and initialise a RawRwLock on the heap, wrapped in Arc.
 fn make_lock() -> Arc<RawRwLock> {
     print!("make_lock");
-    Arc::from(RawRwLock::new())
+    Arc::new(*RawRwLock::new().expect("RawRwLock::new() failed"))
 }
 
 #[test]
@@ -188,7 +188,7 @@ fn init_and_reopen_in_place_roundtrip() {
 /// and block a writer until they're done.
 #[test]
 fn multiple_readers_block_writer() {
-    let lock = Arc::new(RawRwLock::new());
+    let lock = make_lock();
 
     let n_readers = 4;
     let barrier = Arc::new(Barrier::new(n_readers + 1));
@@ -230,7 +230,7 @@ fn multiple_readers_block_writer() {
 fn try_write_lock_timeout_behavior() {
     use std::sync::mpsc;
 
-    let lock = Arc::new(RawRwLock::new());
+    let lock = make_lock();
     let (ready_tx, ready_rx) = mpsc::channel();
 
     // long-lived reader

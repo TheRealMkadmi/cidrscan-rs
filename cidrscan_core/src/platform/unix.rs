@@ -9,3 +9,26 @@ pub fn platform_drop(os_id: &str) {
         }
     }
 }
+#[cfg(unix)]
+pub fn robust_mutex(mutex_ptr: *mut u8) -> Result<(raw_sync::locks::Mutex, *mut libc::pthread_mutex_t), i32> {
+    use libc::{pthread_mutex_t, pthread_mutexattr_t, pthread_mutexattr_init, pthread_mutexattr_setrobust, PTHREAD_MUTEX_ROBUST};
+    use std::ptr;
+    use raw_sync::locks::RawMutex;
+
+    let mut attr: pthread_mutexattr_t = unsafe { std::mem::zeroed() };
+    let mut mutex_addr = mutex_ptr as *mut pthread_mutex_t;
+    unsafe {
+        if pthread_mutexattr_init(&mut attr) != 0 {
+            return Err(libc::errno());
+        }
+        if pthread_mutexattr_setrobust(&mut attr, PTHREAD_MUTEX_ROBUST) != 0 {
+            return Err(libc::errno());
+        }
+    }
+    // Use raw_sync's RawMutex::new with the robust attribute
+    let (mutex, _) = unsafe {
+        RawMutex::new(mutex_ptr, &mut attr as *mut _ as _)
+            .map_err(|_| libc::errno())?
+    };
+    Ok((mutex, mutex_addr))
+}
