@@ -857,14 +857,14 @@ impl PatriciaTree {
             }
 
             let exp = node.expires.load(Ordering::Acquire);
-            if exp != u64::MAX && cpl == node.prefix_len {
+            if cpl == node.prefix_len {
                 // Return if this node was explicitly stored (leaf or internal)
                 if node.is_terminal.load(Ordering::Acquire) == 1
                     && node.refcnt.load(Ordering::Acquire) > 0
                     && canon == node.key
                 {
-                    // ─── PATCH 3: opportunistic GC of dead leaves ───
-                    if exp < now {
+                    // opportunistic GC of dead leaves ───
+                    if exp != u64::MAX && exp < now {
                         if let Some(_g) = unsafe {
                             hdr.lock
                                 .assume_init_ref()
