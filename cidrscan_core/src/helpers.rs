@@ -25,7 +25,6 @@ pub const fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
 
-// Helper function to calculate the length of the common prefix (up to max_len bits)
 pub fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
     if max_len == 0 {
         return 0;
@@ -43,14 +42,12 @@ pub fn common_prefix_len(key1: u128, key2: u128, max_len: u8) -> u8 {
     lz.min(max_len)
 }
 
-// Helper function to get the bit at a specific index (0 = MSB)
 #[inline]
 pub fn get_bit(key: u128, index: u8) -> u8 {
     debug_assert!(index <= 127);
     ((key >> (127 - index)) & 1) as u8
 }
 
-// Helper function to create a mask for a given prefix length
 #[inline]
 pub fn mask(prefix_len: u8) -> u128 {
     if prefix_len == 0 {
@@ -74,8 +71,8 @@ pub fn pack(offset: u32, gen: u32) -> u64 {
     ((gen as u64) << 32) | (offset as u64)
 }
 
-// Unpacks a u64 pointer into (offset, generation).
 #[inline]
 pub fn unpack(ptr: u64) -> (u32, u32) {
     (ptr as u32, (ptr >> 32) as u32)
 }
+

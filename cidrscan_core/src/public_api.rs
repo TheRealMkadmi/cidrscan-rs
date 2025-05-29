@@ -307,6 +307,38 @@ pub extern "C" fn cidr_resize(h: PatriciaHandle, new_capacity: usize) -> ErrorCo
     }
 }
 
+#[no_mangle]
+pub extern "C" fn cidr_force_destroy(name_utf8: *const c_char) -> ErrorCode {
+    use crate::platform;
+    if name_utf8.is_null() {
+        return ErrorCode::Utf8Error;
+    }
+    let name = match cstr_to_str(name_utf8) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let hash = crate::helpers::fnv1a_64(name);
+    #[cfg(unix)]
+    let os_id = crate::platform::unix::make_os_id(crate::constants::PREFIX, hash);
+    #[cfg(target_os = "windows")]
+    let os_id = crate::platform::windows::make_os_id(crate::constants::PREFIX, hash);
+    // Call platform-specific drop/unlink directly
+    #[cfg(unix)]
+    {
+        platform::unix::platform_drop(&os_id);
+        ErrorCode::Success
+    }
+    #[cfg(target_os = "windows")]
+    {
+        platform::windows::platform_drop(&os_id);
+        ErrorCode::Success
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        ErrorCode::Unknown
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Error helpers (unchanged signatures)
 // ---------------------------------------------------------------------------
@@ -332,7 +364,7 @@ pub extern "C" fn cidr_strerror(code: ErrorCode) -> *const c_char {
          InvalidHandle, Utf8Error, LockInitFailed, ShmemOpenFailed, ResizeFailed,
          FlushFailed, TagTooLong, NotFound, Unknown]
             .iter()
-            .map(|c| CString::new(c.as_str()).unwrap())
+            .map(|c| CString::new(c.as_str()).expect("CString::new failed in cidr_strerror"))
             .collect()
     });
     TABLE[code as usize].as_ptr()

@@ -1,5 +1,9 @@
 //! Windows-specific platform code for cidrscan
-
+// Platform-specific OS identifier for shared memory regions
+#[cfg(target_os = "windows")]
+pub fn make_os_id(prefix: &str, hash: u64) -> String {
+    format!("{}{:016x}", prefix, hash)
+}
 #[cfg(all(target_os = "windows", feature = "enable_global_priv"))]
 fn has_global_priv() -> bool {
     use windows_sys::Win32::Security::*;

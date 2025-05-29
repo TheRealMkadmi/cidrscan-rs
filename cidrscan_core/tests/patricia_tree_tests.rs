@@ -11,7 +11,7 @@ use cidrscan_core::types::PatriciaTree;
 fn basic_ops() {
     let name = format!("test_shm_{}", std::process::id());
     let tree = PatriciaTree::open(&name, 1024).unwrap();
-    let ip = 0xC0A80001; // 192.168.0.1
+    let ip = 0xC0A80001;
     let key = v4_key(ip);
     let plen = v4_plen(32);
     let _ = tree.insert(key, plen, 60, None);
@@ -27,15 +27,18 @@ fn ttl_expiry() {
     let ip = 0x01020304;
     let key = v4_key(ip);
     let plen = v4_plen(32);
+
+    let _ = tree.insert(key, plen, 0, None);
+    assert!(tree.lookup(key).is_some());
+
     let _ = tree.insert(key, plen, 1, None);
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert!(tree.lookup(key).is_none());
 }
 #[test]
 fn split_creates_balanced_branches() {
-    // Two keys with a 31-bit common prefix, differing at bit 31 (MSB is bit 0)
-    let key1 = v4_key(0b10000000_00000000_00000000_00000000u32); // 128.0.0.0
-    let key2 = v4_key(0b00000000_00000000_00000000_00000000u32); // 0.0.0.0
+    let key1 = v4_key(0b10000000_00000000_00000000_00000000u32);
+    let key2 = v4_key(0b00000000_00000000_00000000_00000000u32);
     let plen = v4_plen(32);
 
     let name = format!("test_shm_split_{}", std::process::id());
@@ -43,11 +46,9 @@ fn split_creates_balanced_branches() {
     let _ = tree.insert(key1, plen, 6, None);
     _ = tree.insert(key2, plen, 60, None);
 
-    // Both keys should be found
     assert!(tree.lookup(key1).is_some());
     assert!(tree.lookup(key2).is_some());
 
-    // Deleting one should not affect the other
     _ = tree.delete(key1, plen);
     assert!(tree.lookup(key1).is_none());
     assert!(tree.lookup(key2).is_some());
@@ -62,9 +63,7 @@ proptest! {
 
     #[test]
     fn property_insert_delete_lookup(
-        // ① Unique keys
         keys in hash_set(0u128..1000, 3..8),
-        // ② Any prefix lengths (same cardinality upper‑bounded by keys.len())
         prefix_lens in pvec(8u8..32, 3..32)
     ) {
 
@@ -131,23 +130,18 @@ fn stress_concurrent_inserts_and_lookups() {
     }
 }
 
-// Test: Internal node terminal flag and deletion
 #[test]
 fn test_internal_node_terminal_flag_and_delete() {
     let tree = PatriciaTree::open("test_internal_node", 16).unwrap();
 
-    // Insert /32 and /24, so /24 is an internal node after /32
-    tree.insert(v4_key(0x01020304), v4_plen(32), 60,None).unwrap(); // exact /32 → 128 bits
-    tree.insert(v4_key(0x01020300), v4_plen(24), 60,None).unwrap(); // prefix /24
+    tree.insert(v4_key(0x01020304), v4_plen(32), 60,None).unwrap();
+    tree.insert(v4_key(0x01020300), v4_plen(24), 60,None).unwrap();
 
-    // Both should be found
     assert!(tree.lookup(v4_key(0x01020304)).is_some());
     assert!(tree.lookup(v4_key(0x01020300)).is_some());
 
-    // Delete /24 (internal node)
     tree.delete(v4_key(0x01020300), v4_plen(24)).unwrap();
 
-    // /24 should be gone, /32 should remain
     assert!(tree.lookup(v4_key(0x01020300)).is_none());
     assert!(tree.lookup(v4_key(0x01020304)).is_some());
 }

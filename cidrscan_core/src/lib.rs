@@ -22,6 +22,10 @@ static _BOOTSTRAP: fn() = _telemetry_bootstrap;
 
 use constants::*;
 use crossbeam_queue::SegQueue;
+#[cfg(unix)]
+use crate::platform::unix::make_os_id;
+#[cfg(target_os = "windows")]
+use crate::platform::windows::make_os_id;
 use helpers::*;
 use types::Offset;
 use crate::errors::Error;
@@ -42,10 +46,7 @@ use std::{
     cell::Cell,
 };
 
-#[cfg(target_os = "windows")]
-fn make_os_id(prefix: &str, hash: u64) -> String {
-    format!("{}{:016x}", prefix, hash)
-}
+
 
 
 // ===== Compile-time assertions for alignment and size =====
@@ -72,7 +73,8 @@ impl PatriciaTree {
     /// Helper to retire an offset safely for epoch-based reclamation.
     pub fn retire_offset(&self, off: Offset) {
         let cur = self.local_epoch.get();
-        self.freelist.push(off | ((cur & 0xFFFF) as u32) << 16);
+        let stamped: u64 = ((cur & 0xFFFF_FFFF) << 32) | off as u64;
+        self.freelist.push(stamped);
     }
     /// Insert an IPv4 prefix (automatically maps the 32-bit address into the high 96 bits).
     pub fn insert_v4(&self, addr: u32, prefix_len: u8, ttl_secs: u64) -> Result<(), Error> {
@@ -137,7 +139,7 @@ impl PatriciaTree {
             base.as_ptr()
                 .add(HEADER_PADDED + capacity * size_of::<Node>())
         };
-        let tag_base = NonNull::new(tag_base_ptr).unwrap();
+        let tag_base = NonNull::new(tag_base_ptr).expect("tag_base_ptr is null in PatriciaTree::open");
 
         // === PATCH 1: Header parameter mismatch guard ===
         if !is_creator {
@@ -219,10 +221,10 @@ impl PatriciaTree {
 
         // reclaim if two full epochs have passed
         while let Some(raw) = self.freelist.pop() {
-            let node_epoch = (raw >> 16) as u64;
+            let node_epoch = raw >> 32;
             if g.wrapping_sub(node_epoch) < 2 { self.freelist.push(raw); break }
             // real reclaim:
-            self.free_node((raw & 0xFFFF) as u64);
+            self.free_node((raw & 0xFFFF_FFFF) as u64);
         }
     }
 
@@ -261,7 +263,7 @@ impl PatriciaTree {
         } else {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("SystemTime before UNIX_EPOCH in insert; system clock is invalid")
                 .as_secs()
                 .saturating_add(ttl_secs)
         };
@@ -436,7 +438,8 @@ impl PatriciaTree {
                             return Err(Error::CapacityExceeded);
                         }
                         // Allocate internal node
-                        if let Some(offset) = self.freelist.pop() {
+                        if let Some(raw) = self.freelist.pop() {
+                            let offset = (raw & 0xFFFF_FFFF) as u32;
                             debug!(
                                 "[ALLOC] Reusing freed node for internal at offset={}",
                                 offset
@@ -486,7 +489,8 @@ impl PatriciaTree {
                             internal_gen = 1;
                         }
                         // Allocate leaf node
-                        if let Some(offset) = self.freelist.pop() {
+                        if let Some(raw) = self.freelist.pop() {
+                            let offset = (raw & 0xFFFF_FFFF) as u32;
                             debug!("[ALLOC] Reusing freed node for leaf at offset={}", offset);
                             let node_ptr =
                                 unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
@@ -664,7 +668,8 @@ impl PatriciaTree {
         let node_size = size_of::<Node>() as Offset;
         loop {
             // ① Try to reuse a freed slot first (cheap fast-path)
-            if let Some(offset) = self.freelist.pop() {
+            if let Some(raw) = self.freelist.pop() {
+                let offset = (raw & 0xFFFF_FFFF) as u32;
                 hdr.free_slots.fetch_sub(1, Ordering::Release);
                 let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
                 let gen = unsafe {
@@ -719,7 +724,8 @@ impl PatriciaTree {
                 return Err(Error::CapacityExceeded);
             }
             epoch::pin().flush();
-            if let Some(offset) = self.freelist.pop() {
+            if let Some(raw) = self.freelist.pop() {
+                let offset = (raw & 0xFFFF_FFFF) as u32;
                 hdr.free_slots.fetch_sub(1, Ordering::Release);
                 let node_ptr = unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
                 let gen = unsafe {
@@ -827,7 +833,7 @@ impl PatriciaTree {
         let mut parent_plen = 0u8;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("SystemTime before UNIX_EPOCH in lookup; system clock is invalid")
             .as_secs();
         while link != 0 {
             let (node, gen) = match self.follow(link) {
@@ -1176,7 +1182,7 @@ impl PatriciaTree {
                 let ttl = node.expires.load(Ordering::Acquire).saturating_sub(
                     SystemTime::now()
                         .duration_since(UNIX_EPOCH)
-                        .unwrap()
+                        .expect("SystemTime before UNIX_EPOCH in resize; system clock is invalid")
                         .as_secs(),
                 );
                 next.insert(node.key, node.prefix_len, ttl, None)?;

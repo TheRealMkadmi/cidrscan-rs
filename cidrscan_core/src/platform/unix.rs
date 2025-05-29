@@ -1,4 +1,8 @@
-//! Unix-specific platform code for cidrscan
+// Platform-specific OS identifier for shared memory regions
+#[cfg(unix)]
+pub fn make_os_id(prefix: &str, hash: u64) -> String {
+    format!("{}{:016x}", prefix, hash)
+}
 
 #[cfg(unix)]
 pub fn platform_drop(os_id: &str) {

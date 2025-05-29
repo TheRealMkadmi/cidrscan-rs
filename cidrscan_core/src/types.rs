@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 
 /// Offset type: always 32 bits, portable across 32/64-bit platforms
-pub type Offset = u32; // <= 4 294 967 295 bytes from base
+pub type Offset = u32;
 
 /// Shared‑memory header (aligned to cache line)
 #[repr(C, align(64))]
@@ -56,7 +56,7 @@ pub struct PatriciaTree {
     pub base: NonNull<u8>,    // Base pointer for node offsets
     pub tag_base: NonNull<u8>, // start of tag slab
     pub os_id: String,        // Track the shared memory name for Drop
-    pub freelist: Arc<SegQueue<Offset>>, // locally-owned queue of freed offsets
+    pub freelist: Arc<SegQueue<u64>>, // locally-owned queue of freed offsets (now u64 for epoch+offset)
     pub local_epoch: Cell<u64>,          // <── NEW (std::cell::Cell)
 }
 
