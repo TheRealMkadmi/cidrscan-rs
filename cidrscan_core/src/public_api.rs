@@ -5,130 +5,125 @@ use crate::{
     PatriciaTree,
 };
 use ipnet::IpNet;
-use once_cell::sync::Lazy;
 use std::{
-    ffi::{CStr, CString},
+    ffi::CStr,
     os::raw::c_char,
-    ptr,
 };
 
+/// Opaque handle – **always** treated as owned by the caller.
 pub type PatriciaHandle = *mut PatriciaTree;
 
-/// C-ABI view of a successful lookup.
+/// Full-match record returned by `cidr_lookup_full`.
 #[repr(C)]
 pub struct PatriciaMatchT {
     pub key_high: u64,
-    pub key_low: u64,
-    pub plen: u8,
-    pub tag: [c_char; TAG_MAX_LEN],
+    pub key_low:  u64,
+    pub plen:     u8,
+    pub tag:      [c_char; TAG_MAX_LEN],
 }
 
-// ---------------------------------------------------------------------------
-//  Helper utilities
-// ---------------------------------------------------------------------------
+// ─────────────────────────── helpers ─────────────────────────────────── //
 
-fn cstr_to_str<'a>(ptr: *const c_char) -> Result<&'a str, ErrorCode> {
-    if ptr.is_null() {
+#[inline]
+fn cstr<'a>(p: *const c_char) -> Result<&'a str, ErrorCode> {
+    if p.is_null() {
         return Err(ErrorCode::Utf8Error);
     }
-    unsafe { CStr::from_ptr(ptr) }
+    unsafe { CStr::from_ptr(p) }
         .to_str()
         .map_err(|_| ErrorCode::Utf8Error)
 }
 
-fn write_tag_buf(dst: &mut [c_char; TAG_MAX_LEN], tag: &str) {
-    for b in dst.iter_mut() {
-        *b = 0;
-    }
-    let bytes = tag.as_bytes();
-    let len = bytes.len().min(TAG_MAX_LEN);
-    for i in 0..len {
-        dst[i] = bytes[i] as c_char;
+#[inline]
+fn write_tag(dst: &mut [c_char; TAG_MAX_LEN], s: &str) {
+    dst.iter_mut().for_each(|b| *b = 0);
+    let n = s.len().min(TAG_MAX_LEN);
+    dst[..n].copy_from_slice(
+        &s.as_bytes()[..n]
+            .iter()
+            .map(|b| *b as c_char)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[inline]
+fn ip_to_u128(s: &str) -> Result<(u128, u8), ErrorCode> {
+    // Accept "addr/prefix" OR plain address
+    if let Ok(net) = s.parse::<IpNet>() {
+        let key = match net.network() {
+            std::net::IpAddr::V4(v4) => v4_key(u32::from_be_bytes(v4.octets())) as u128,
+            std::net::IpAddr::V6(v6) => u128::from(v6),
+        };
+        Ok((key, net.prefix_len() as u8))
+    } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => Ok((v4_key(u32::from_be_bytes(v4.octets())) as u128, 32)),
+            std::net::IpAddr::V6(v6) => Ok((u128::from(v6), 128)),
+        }
+    } else {
+        Err(ErrorCode::InvalidPrefix)
     }
 }
 
-// ---------------------------------------------------------------------------
-//  Lifetime
-// ---------------------------------------------------------------------------
+// ─── small helper to turn Result<T,ErrorCode> into early-return ──────────
+macro_rules! try_c { ($expr:expr) => { match $expr {
+    Ok(v)  => v,
+    Err(e) => return e,
+}}}
 
-/// Open or create a shared-memory arena and return an opaque handle.
-///
-/// * `name_utf8` – logical name (process-wide); will be hashed to an OS-specific
-///                 identifier, so any UTF-8 string is fine.
-/// * `capacity`  – maximum number of prefixes (nodes).
-///
-/// Returns **NULL** on error – consult `cidr_last_error()`.
+// ───────────────────────── lifetime ──────────────────────────────────── //
+
+/// Open (or create) a shared-memory arena.  
+/// Returns `Success` **and** stores the handle in `*out`
+/// -- or an error code otherwise.
 #[no_mangle]
-pub extern "C" fn cidr_open(name_utf8: *const c_char, capacity: usize) -> PatriciaHandle {
-    match cstr_to_str(name_utf8)
-        .and_then(|s| PatriciaTree::open(s, capacity).map_err(|_| ErrorCode::ShmemOpenFailed))
-    {
-        Ok(tree) => {
-            set_last_error(ErrorCode::Success);
-            Box::into_raw(Box::new(tree))
-        }
-        Err(code) => {
-            set_last_error(code);
-            ptr::null_mut()
-        }
+pub extern "C" fn cidr_open(
+    name_utf8: *const c_char,
+    capacity: usize,
+    out: *mut PatriciaHandle,
+) -> ErrorCode {
+    if out.is_null() {
+        return ErrorCode::InvalidHandle;
+    }
+    match cstr(name_utf8).and_then(|n| PatriciaTree::open(n, capacity).map_err(|_| ErrorCode::ShmemOpenFailed)) {
+        Ok(tree) => unsafe {
+            *out = Box::into_raw(Box::new(tree));
+            ErrorCode::Success
+        },
+        Err(code) => code,
     }
 }
 
-/// Close the handle (idempotent).  NULL is ignored.
 #[no_mangle]
 pub extern "C" fn cidr_close(h: PatriciaHandle) {
     if !h.is_null() {
-        // SAFETY – we created it with Box::into_raw
         unsafe { drop(Box::from_raw(h)) };
     }
 }
 
-// ---------------------------------------------------------------------------
-//  CRUD
-// ---------------------------------------------------------------------------
+// ───────────────────────── CRUD ──────────────────────────────────────── //
 
 #[no_mangle]
 pub extern "C" fn cidr_insert(
     h: PatriciaHandle,
     cidr_utf8: *const c_char,
     ttl: u64,
-    tag_utf8: *const c_char, // may be NULL
+    tag_utf8: *const c_char,       // may be NULL
 ) -> ErrorCode {
-    let tree = match unsafe { h.as_ref() } {
-        Some(t) => t,
-        None => return ErrorCode::InvalidHandle,
-    };
-    let cidr_str = match cstr_to_str(cidr_utf8) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let net: IpNet = match cidr_str.parse() {
+    let tree    = match unsafe { h.as_ref() } { Some(t) => t, None => return ErrorCode::InvalidHandle };
+    let cidr_s  = try_c!(cstr(cidr_utf8));
+    let tag_opt = if tag_utf8.is_null() { None } else { Some(try_c!(cstr(tag_utf8))) };
+
+    let net: IpNet = match cidr_s.parse() {
         Ok(n) => n,
         Err(_) => return ErrorCode::InvalidPrefix,
     };
-    
-    let tag = if tag_utf8.is_null() {
-        None
-    } else {
-        match cstr_to_str(tag_utf8) {
-            Ok(s) => Some(s),
-            Err(code) => return code,
-        }
-    };
-    
-    // Convert IpAddr to u128 based on type
     let key = match net.network() {
-        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
-        std::net::IpAddr::V6(ipv6) => {
-            let mut val = 0u128;
-            for (i, octet) in ipv6.octets().iter().enumerate() {
-                val |= (*octet as u128) << (120 - (i * 8));
-            }
-            val
-        }
+        std::net::IpAddr::V4(ip) => v4_key(u32::from_be_bytes(ip.octets())),
+        std::net::IpAddr::V6(ip) => u128::from(ip),
     };
-    
-    match tree.insert(key, net.prefix_len() as u8, ttl, tag) {
+
+    match tree.insert(key, net.prefix_len() as u8, ttl, tag_opt) {
         Ok(_) => ErrorCode::Success,
         Err(e) => map_error(&e),
     }
@@ -136,31 +131,16 @@ pub extern "C" fn cidr_insert(
 
 #[no_mangle]
 pub extern "C" fn cidr_delete(h: PatriciaHandle, cidr_utf8: *const c_char) -> ErrorCode {
-    let tree = match unsafe { h.as_ref() } {
-        Some(t) => t,
-        None => return ErrorCode::InvalidHandle,
-    };
-    let cidr_str = match cstr_to_str(cidr_utf8) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let net: IpNet = match cidr_str.parse() {
+    let tree   = match unsafe { h.as_ref() } { Some(t) => t, None => return ErrorCode::InvalidHandle };
+    let cidr_s = try_c!(cstr(cidr_utf8));
+    let net: IpNet = match cidr_s.parse() {
         Ok(n) => n,
         Err(_) => return ErrorCode::InvalidPrefix,
     };
-    
-    // Convert IpAddr to u128 based on type
     let key = match net.network() {
-        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
-        std::net::IpAddr::V6(ipv6) => {
-            let mut val = 0u128;
-            for (i, octet) in ipv6.octets().iter().enumerate() {
-                val |= (*octet as u128) << (120 - (i * 8));
-            }
-            val
-        }
+        std::net::IpAddr::V4(ip) => v4_key(u32::from_be_bytes(ip.octets())),
+        std::net::IpAddr::V6(ip) => u128::from(ip),
     };
-    
     match tree.delete(key, net.prefix_len() as u8) {
         Ok(_) => ErrorCode::Success,
         Err(e) => map_error(&e),
@@ -168,46 +148,17 @@ pub extern "C" fn cidr_delete(h: PatriciaHandle, cidr_utf8: *const c_char) -> Er
 }
 
 #[no_mangle]
-pub extern "C" fn cidr_lookup(h: PatriciaHandle, addr_utf8: *const c_char) -> bool {
-    let tree = match unsafe { h.as_ref() } {
-        Some(t) => t,
-        None => {
-            set_last_error(ErrorCode::InvalidHandle);
-            return false;
-        }
-    };
-    let addr_str = match cstr_to_str(addr_utf8) {
-        Ok(s) => s,
-        Err(code) => {
-            set_last_error(code);
-            return false;
-        }
-    };
-    
-    // Parse the address string into either IpNet or IpAddr
-    let ip_addr = if let Ok(n) = addr_str.parse::<IpNet>() {
-        n.network()
-    } else if let Ok(ip) = addr_str.parse() {
-        ip
-    } else {
-        set_last_error(ErrorCode::InvalidPrefix);
-        return false;
-    };
-    
-    // Convert IpAddr to u128 based on type
-    let key = match ip_addr {
-        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
-        std::net::IpAddr::V6(ipv6) => {
-            let mut val = 0u128;
-            for (i, octet) in ipv6.octets().iter().enumerate() {
-                val |= (*octet as u128) << (120 - (i * 8));
-            }
-            val
-        }
-    };
-    
-    set_last_error(ErrorCode::Success);
-    tree.lookup(key).is_some()
+pub extern "C" fn cidr_lookup(
+    h: PatriciaHandle,
+    addr_utf8: *const c_char,
+    out_found: *mut bool,
+) -> ErrorCode {
+    if out_found.is_null() { return ErrorCode::InvalidHandle; }
+    let tree   = match unsafe { h.as_ref() } { Some(t) => t, None => return ErrorCode::InvalidHandle };
+    let addr_s = try_c!(cstr(addr_utf8));
+    let (key, _) = try_c!(ip_to_u128(addr_s));
+    unsafe { *out_found = tree.lookup(key).is_some(); }
+    ErrorCode::Success
 }
 
 #[no_mangle]
@@ -216,156 +167,94 @@ pub extern "C" fn cidr_lookup_full(
     addr_utf8: *const c_char,
     out: *mut PatriciaMatchT,
 ) -> ErrorCode {
-    let tree = match unsafe { h.as_ref() } {
-        Some(t) => t,
-        None => return ErrorCode::InvalidHandle,
-    };
-    
-    let addr_str = match cstr_to_str(addr_utf8) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    
-    // Parse the address string into either IpNet or IpAddr
-    let ip_addr = if let Ok(n) = addr_str.parse::<IpNet>() {
-        n.network()
-    } else if let Ok(ip) = addr_str.parse() {
-        ip
-    } else {
-        return ErrorCode::InvalidPrefix;
-    };
-    
-    // Convert IpAddr to u128 based on type
-    let key = match ip_addr {
-        std::net::IpAddr::V4(ipv4) => v4_key(u32::from_be_bytes(ipv4.octets())),
-        std::net::IpAddr::V6(ipv6) => {
-            let mut val = 0u128;
-            for (i, octet) in ipv6.octets().iter().enumerate() {
-                val |= (*octet as u128) << (120 - (i * 8));
-            }
-            val
-        }
-    };
-    
+    if out.is_null() {
+        return ErrorCode::InvalidHandle;
+    }
+    let tree   = match unsafe { h.as_ref() } { Some(t) => t, None => return ErrorCode::InvalidHandle };
+    let addr_s = try_c!(cstr(addr_utf8));
+    let (key, _) = try_c!(ip_to_u128(addr_s));
+
     match tree.lookup(key) {
         Some(m) => unsafe {
-            if out.is_null() {
-                return ErrorCode::InvalidHandle;
-            }
             (*out).key_high = (m.cidr_key >> 64) as u64;
-            (*out).key_low = m.cidr_key as u64;
-            (*out).plen = m.plen;
-            write_tag_buf(&mut (*out).tag, m.tag);
+            (*out).key_low  =  m.cidr_key as u64;
+            (*out).plen     =  m.plen;
+            write_tag(&mut (*out).tag, m.tag);
             ErrorCode::Success
         },
         None => ErrorCode::NotFound,
     }
 }
 
-// ---------------------------------------------------------------------------
-//  Capacity & maintenance
-// ---------------------------------------------------------------------------
+// ───────────────────── capacity & maintenance ────────────────────────── //
 
 #[no_mangle]
-pub extern "C" fn cidr_available_capacity(h: PatriciaHandle) -> u64 {
+pub extern "C" fn cidr_available_capacity(
+    h: PatriciaHandle,
+    out: *mut u64,
+) -> ErrorCode {
+    if out.is_null() {
+        return ErrorCode::InvalidHandle;
+    }
     unsafe { h.as_ref() }
-        .map(|t| t.available_capacity() as u64)
-        .unwrap_or(0)
+        .map(|t| { unsafe { *out = t.available_capacity() as u64 };  ErrorCode::Success })
+        .unwrap_or(ErrorCode::InvalidHandle)
 }
 
+// flush retired nodes & expired slots
 #[no_mangle]
 pub extern "C" fn cidr_flush(h: PatriciaHandle) -> ErrorCode {
-    unsafe { h.as_ref() }
-        .map(|t| {
-            t.flush();
+    match unsafe { h.as_ref() } {
+        Some(tree) => {
+            tree.flush();
             ErrorCode::Success
-        })
-        .unwrap_or(ErrorCode::InvalidHandle)
+        }
+        None => ErrorCode::InvalidHandle,
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn cidr_clear(h: PatriciaHandle) -> ErrorCode {
-    unsafe { h.as_ref() }
-        .map(|t| match t.clear() {
+    match unsafe { h.as_ref() } {
+        Some(t) => match t.clear() {
             Ok(_) => ErrorCode::Success,
             Err(e) => map_error(&e),
-        })
-        .unwrap_or(ErrorCode::InvalidHandle)
+        },
+        None => ErrorCode::InvalidHandle,
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn cidr_resize(h: PatriciaHandle, new_capacity: usize) -> ErrorCode {
-    // Safety: we have exclusive ownership only if the caller guarantees no other
-    // threads use the handle.  That must be documented on the C side.
-    let tree = match unsafe { h.as_mut() } {
-        Some(t) => t,
-        None => return ErrorCode::InvalidHandle,
-    };
-    match tree.resize(new_capacity) {
-        Ok(_) => ErrorCode::Success,
-        Err(e) => map_error(&e),
+pub extern "C" fn cidr_resize(h: PatriciaHandle, new_cap: usize) -> ErrorCode {
+    // exclusive – caller must guarantee no concurrent use
+    if h.is_null() { return ErrorCode::InvalidHandle; }
+    let tree = unsafe { &mut *h };
+        match tree.resize(new_cap) {
+            Ok(_) => ErrorCode::Success,
+            Err(e) => map_error(&e),
+        }
     }
-}
 
 #[no_mangle]
 pub extern "C" fn cidr_force_destroy(name_utf8: *const c_char) -> ErrorCode {
-    use crate::platform;
-    if name_utf8.is_null() {
-        return ErrorCode::Utf8Error;
-    }
-    let name = match cstr_to_str(name_utf8) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+    let name = try_c!(cstr(name_utf8));
     let hash = crate::helpers::fnv1a_64(name);
     #[cfg(unix)]
-    let os_id = crate::platform::unix::make_os_id(crate::constants::PREFIX, hash);
-    #[cfg(target_os = "windows")]
-    let os_id = crate::platform::windows::make_os_id(crate::constants::PREFIX, hash);
-    // Call platform-specific drop/unlink directly
-    #[cfg(unix)]
     {
-        platform::unix::platform_drop(&os_id);
-        ErrorCode::Success
+        let os_id = crate::platform::unix::make_os_id(crate::constants::PREFIX, hash);
+        crate::platform::unix::platform_drop(&os_id);
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
-        platform::windows::platform_drop(&os_id);
-        ErrorCode::Success
+        let os_id = crate::platform::windows::make_os_id(crate::constants::PREFIX, hash);
+        crate::platform::windows::platform_drop(&os_id);
     }
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
-        ErrorCode::Unknown
-    }
+    ErrorCode::Success
 }
 
-// ---------------------------------------------------------------------------
-//  Error helpers (unchanged signatures)
-// ---------------------------------------------------------------------------
-
-thread_local! {
-    static LAST_ERROR: std::cell::Cell<ErrorCode> = std::cell::Cell::new(ErrorCode::Success);
-}
-
-pub(crate) fn set_last_error(code: ErrorCode) {
-    LAST_ERROR.with(|c| c.set(code));
-}
-
-#[no_mangle]
-pub extern "C" fn cidr_last_error() -> ErrorCode {
-    LAST_ERROR.with(|c| c.get())
-}
+// ───────────────────── convenience ─────────────────────────────────── //
 
 #[no_mangle]
 pub extern "C" fn cidr_strerror(code: ErrorCode) -> *const c_char {
-    static TABLE: Lazy<Vec<CString>> = Lazy::new(|| {
-        use ErrorCode::*;
-        [Success, CapacityExceeded, ZeroCapacity, InvalidPrefix, BranchHasChildren,
-         InvalidHandle, Utf8Error, LockInitFailed, ShmemOpenFailed, ResizeFailed,
-         FlushFailed, TagTooLong, NotFound, Unknown]
-            .iter()
-            .map(|c| CString::new(c.as_str()).expect("CString::new failed in cidr_strerror"))
-            .collect()
-    });
-    TABLE[code as usize].as_ptr()
+    code.as_str().as_ptr() as *const c_char
 }
