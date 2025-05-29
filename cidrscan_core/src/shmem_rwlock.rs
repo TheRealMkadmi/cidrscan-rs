@@ -7,6 +7,8 @@ use raw_sync::events::{Event as RawEvent, EventImpl, EventInit};
 use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
 use core::marker::PhantomData;
+use memoffset::offset_of;
+use crate::Header;
 
 #[cfg(unix)]
 use crate::platform::unix::robust_mutex;
@@ -70,12 +72,13 @@ impl RawRwLock {
         });
 
         unsafe {
-            let (m, _) = RawMutex::new(lock.mutex_buf.as_mut_ptr(), ptr::null_mut())
+            let (m_raw, _) = RawMutex::new(lock.mutex_buf.as_mut_ptr(), ptr::null_mut())
                 .map_err(|e| crate::errors::Error::from(format!("mutex init failed: {e}")))?;
-            let (e, _) = RawEvent::new(lock.event_buf.as_mut_ptr(), true)
+            let m_box: Box<dyn LockImpl> = m_raw;
+            let (e_box, _) = RawEvent::new(lock.event_buf.as_mut_ptr(), true)
                 .map_err(|e| crate::errors::Error::from(format!("event init failed: {e}")))?;
-            lock.mutex_handle = Some(m);
-            lock.event_handle = Some(e);
+            lock.mutex_handle = Some(m_box);
+            lock.event_handle = Some(e_box);
         }
         Ok(lock)
     }
@@ -97,16 +100,22 @@ impl RawRwLock {
         this.mutex_handle = None;
         this.event_handle = None;
 
+        // Initialize mutex handle as Box<dyn LockImpl>
         #[cfg(unix)]
-        let (m, _) = robust_mutex(this.mutex_buf.as_mut_ptr())
-            .map_err(|e| crate::errors::Error::from(format!("robust_mutex init failed: {e}")))?;
+        let m_box: Box<dyn LockImpl> = robust_mutex(this.mutex_buf.as_mut_ptr())
+            .map_err(|e| crate::errors::Error::from(format!("robust_mutex init failed: {e}")))?
+            .0;
         #[cfg(not(unix))]
-        let (m, _) = RawMutex::new(this.mutex_buf.as_mut_ptr(), ptr::null_mut())
-            .map_err(|e: Box<dyn std::error::Error>| crate::errors::Error::Other(format!("mutex init failed: {e}")))?;
-        let (e, _) = RawEvent::new(this.event_buf.as_mut_ptr(), true)
+        let m_box: Box<dyn LockImpl> = {
+            let (m_raw, _) = RawMutex::new(this.mutex_buf.as_mut_ptr(), ptr::null_mut())
+                .map_err(|e: Box<dyn std::error::Error>| crate::errors::Error::Other(format!("mutex init failed: {e}")))?;
+            m_raw
+        };
+        // Initialize event handle
+        let (e_box, _) = RawEvent::new(this.event_buf.as_mut_ptr(), true)
             .map_err(|e: Box<dyn std::error::Error>| crate::errors::Error::Other(format!("event init failed: {e}")))?;
-        this.mutex_handle = Some(m);
-        this.event_handle = Some(e);
+        this.mutex_handle = Some(m_box);
+        this.event_handle = Some(e_box);
 
         Ok(())
     }

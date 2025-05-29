@@ -24,6 +24,7 @@ crossbeam-queue = "0.3.12"
 metrics = "0.22"
 ipnet = "2.11.0"
 memoffset = "0.9"               # ⟵ offset_of! helper
+errno = "0.3"
 
 
 [target.'cfg(windows)'.dependencies]
