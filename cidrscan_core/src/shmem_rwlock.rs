@@ -9,6 +9,7 @@ use raw_sync::Timeout;
 use core::marker::PhantomData;
 use memoffset::offset_of;
 use crate::Header;
+use libc::{pthread_mutex_consistent, pthread_mutex_t};
 
 #[cfg(unix)]
 use crate::platform::unix::robust_mutex;
@@ -183,7 +184,6 @@ impl RawRwLock {
     pub fn write_lock(&self) -> Result<WriteGuard<'_>, crate::errors::Error> {
         #[cfg(unix)]
         {
-            use libc::{pthread_mutex_consistent, EOWNERDEAD, pthread_mutex_t};
             let result = self.mutex().lock();
             let guard = match result {
                 Ok(g) => g,

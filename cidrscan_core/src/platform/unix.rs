@@ -1,4 +1,6 @@
-// Platform-specific OS identifier for shared memory regions
+use libc::{pthread_mutex_t, pthread_mutexattr_t, pthread_mutexattr_init, pthread_mutexattr_setrobust, PTHREAD_MUTEX_ROBUST};
+use raw_sync::locks::{Mutex as RawMutex, LockInit};
+use errno::errno;
 
 #[cfg(unix)]
 pub fn make_os_id(prefix: &str, hash: u64) -> String {
@@ -16,13 +18,8 @@ pub fn platform_drop(os_id: &str) {
 }
 #[cfg(unix)]
 pub fn robust_mutex(mutex_ptr: *mut u8) -> Result<(Box<dyn raw_sync::locks::LockImpl>, *mut libc::pthread_mutex_t), i32> {
-    use libc::{pthread_mutex_t, pthread_mutexattr_t, pthread_mutexattr_init, pthread_mutexattr_setrobust, PTHREAD_MUTEX_ROBUST};
-    use std::ptr;
-    use raw_sync::locks::{Mutex as RawMutex, LockInit, LockImpl};
-    use errno::errno;
-
     let mut attr: pthread_mutexattr_t = unsafe { std::mem::zeroed() };
-    let mut mutex_addr = mutex_ptr as *mut pthread_mutex_t;
+    let mutex_addr = mutex_ptr as *mut pthread_mutex_t;
     unsafe {
         if pthread_mutexattr_init(&mut attr) != 0 {
             return Err(errno().0);
