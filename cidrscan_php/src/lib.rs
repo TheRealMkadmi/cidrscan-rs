@@ -63,9 +63,13 @@ pub fn cidr_close_php(handle: isize) {
 pub fn cidr_insert_php(handle: isize, cidr: String, ttl: u64, tag: Option<String>) -> PhpResult<()> {
     let h = handle as PatriciaHandle;
     let cidr_c = to_cstr(&cidr)?;
-    let tag_ptr: *const c_char = match tag {
-        Some(t) => to_cstr(&t)?.as_ptr(),
-        None => ptr::null(),
+    let (_tag_c, tag_ptr): (Option<CString>, *const c_char) = match tag {
+        Some(t) => {
+            let tag_cstring = to_cstr(&t)?;
+            let ptr = tag_cstring.as_ptr();
+            (Some(tag_cstring), ptr)
+        },
+        None => (None, ptr::null()),
     };
     let rc = cidr_insert(h, cidr_c.as_ptr(), ttl, tag_ptr);
     if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
