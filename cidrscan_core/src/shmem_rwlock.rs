@@ -20,7 +20,7 @@ const _: () = {
 
 
 /// Our shared-memory lock layout: [mutex-bytes][event-bytes][reader_count]
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct RawRwLock {
     mutex_buf: [u8; 128],
     event_buf: [u8; 128],

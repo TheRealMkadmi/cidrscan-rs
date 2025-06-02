@@ -9,7 +9,9 @@ use std::{
 /// Helper: allocate and initialise a RawRwLock on the heap, wrapped in Arc.
 fn make_lock() -> Arc<RawRwLock> {
     print!("make_lock");
-    Arc::new(*RawRwLock::new().expect("RawRwLock::new() failed"))
+    // Convert Box<RawRwLock> to Arc<RawRwLock> without moving the contents
+    let boxed_lock = RawRwLock::new().expect("RawRwLock::new() failed");
+    Arc::from(boxed_lock)
 }
 
 #[test]
