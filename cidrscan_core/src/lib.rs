@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod errors;
+pub mod handle_registry;
 pub mod helpers;
 pub mod platform;
 pub mod shmem_rwlock;

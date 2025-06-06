@@ -17,8 +17,8 @@ use core::{
 };
 use cidrscan_core::errors::ErrorCode;
 
-/// Handle type for CIDR scanner instances
-pub type CidrHandle = i64;
+/// Handle type for CIDR scanner instances - now using safe handle IDs
+pub type CidrHandle = u64;
 
 /// Match information returned by cidrscan_match function
 #[derive(Debug, Clone)]
@@ -72,13 +72,13 @@ fn str_to_cstring(s: &str) -> Result<CString, PhpException> {
     CString::new(s).map_err(|_| PhpException::default("String contains NUL byte".into()))
 }
 
-/// Validate and convert handle to PatriciaHandle pointer
+/// Validate handle ID
 #[inline]
-fn handle_to_ptr(handle: CidrHandle) -> Result<PatriciaHandle, PhpException> {
+fn validate_handle(handle: CidrHandle) -> Result<PatriciaHandle, PhpException> {
     if handle == 0 {
         return Err(PhpException::default("Invalid handle: cannot be zero".into()));
     }
-    Ok(handle as PatriciaHandle)
+    Ok(handle)
 }
 
 // ───────────────────────── lifetime ──────────────────────────────────── //
@@ -94,11 +94,11 @@ fn handle_to_ptr(handle: CidrHandle) -> Result<PatriciaHandle, PhpException> {
 #[php_function]
 pub fn cidr_open(name: String, capacity: u64) -> PhpResult<CidrHandle> {
     let name_cstr = str_to_cstring(&name)?;
-    let mut handle: PatriciaHandle = ptr::null_mut();
+    let mut handle: PatriciaHandle = 0;
     
     let result = core_cidr_open(name_cstr.as_ptr(), capacity.try_into().unwrap(), &mut handle);
     match result {
-        ErrorCode::Success => Ok(handle as CidrHandle),
+        ErrorCode::Success => Ok(handle),
         error_code => Err(map_error_to_exception(error_code))
     }
 }
@@ -112,9 +112,12 @@ pub fn cidr_open(name: String, capacity: u64) -> PhpResult<CidrHandle> {
 /// True on success
 #[php_function]
 pub fn cidr_close(handle: CidrHandle) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
-    core_cidr_close(ptr);
-    Ok(true)
+    let handle_id = validate_handle(handle)?;
+    let result = core_cidr_close(handle_id);
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
+    }
 }
 
 // ───────────────────────── CRUD operations ──────────────────────────── //
@@ -131,7 +134,7 @@ pub fn cidr_close(handle: CidrHandle) -> PhpResult<bool> {
 /// True on success
 #[php_function]
 pub fn cidr_insert(handle: CidrHandle, cidr: String, ttl: u64, tag: Option<String>) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     let cidr_cstr = str_to_cstring(&cidr)?;
     
     let (_tag_cstr, tag_ptr): (Option<CString>, *const c_char) = match tag {
@@ -143,7 +146,7 @@ pub fn cidr_insert(handle: CidrHandle, cidr: String, ttl: u64, tag: Option<Strin
         None => (None, ptr::null()),
     };
     
-    let result = core_cidr_insert(ptr, cidr_cstr.as_ptr(), ttl, tag_ptr);
+    let result = core_cidr_insert(handle_id, cidr_cstr.as_ptr(), ttl, tag_ptr);
     match result {
         ErrorCode::Success => Ok(true),
         error_code => Err(map_error_to_exception(error_code))
@@ -160,10 +163,10 @@ pub fn cidr_insert(handle: CidrHandle, cidr: String, ttl: u64, tag: Option<Strin
 /// True on success
 #[php_function]
 pub fn cidr_delete(handle: CidrHandle, cidr: String) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     let cidr_cstr = str_to_cstring(&cidr)?;
     
-    let result = core_cidr_delete(ptr, cidr_cstr.as_ptr());
+    let result = core_cidr_delete(handle_id, cidr_cstr.as_ptr());
     match result {
         ErrorCode::Success => Ok(true),
         error_code => Err(map_error_to_exception(error_code))
@@ -180,11 +183,11 @@ pub fn cidr_delete(handle: CidrHandle, cidr: String) -> PhpResult<bool> {
 /// `true` if the address matches a stored prefix, `false` otherwise
 #[php_function]
 pub fn cidr_lookup(handle: CidrHandle, addr: String) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     let addr_cstr = str_to_cstring(&addr)?;
     let mut found: bool = false;
     
-    let result = core_cidr_lookup(ptr, addr_cstr.as_ptr(), &mut found);
+    let result = core_cidr_lookup(handle_id, addr_cstr.as_ptr(), &mut found);
     match result {
         ErrorCode::Success => Ok(found),
         error_code => Err(map_error_to_exception(error_code))
@@ -201,7 +204,7 @@ pub fn cidr_lookup(handle: CidrHandle, addr: String) -> PhpResult<bool> {
 /// CidrMatch object with match details, or null if no match found
 #[php_function]
 pub fn cidrscan_match(handle: CidrHandle, addr: String) -> PhpResult<Option<CidrMatch>> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     let addr_cstr = str_to_cstring(&addr)?;
     let mut match_info = PatriciaMatchT {
         key_high: 0,
@@ -209,7 +212,7 @@ pub fn cidrscan_match(handle: CidrHandle, addr: String) -> PhpResult<Option<Cidr
         plen: 0,
         tag: [0; TAG_MAX_LEN],
     };
-      let result = core_cidr_lookup_full(ptr, addr_cstr.as_ptr(), &mut match_info);
+      let result = core_cidr_lookup_full(handle_id, addr_cstr.as_ptr(), &mut match_info);
     match result {
         ErrorCode::Success => {
             // Convert the tag from C string
@@ -239,10 +242,10 @@ pub fn cidrscan_match(handle: CidrHandle, addr: String) -> PhpResult<Option<Cidr
 /// Number of available capacity slots
 #[php_function]
 pub fn cidr_get_capacity(handle: CidrHandle) -> PhpResult<u64> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     let mut capacity: u64 = 0;
     
-    let result = cidr_available_capacity(ptr, &mut capacity);
+    let result = cidr_available_capacity(handle_id, &mut capacity);
     match result {
         ErrorCode::Success => Ok(capacity),
         error_code => Err(map_error_to_exception(error_code))
@@ -258,9 +261,9 @@ pub fn cidr_get_capacity(handle: CidrHandle) -> PhpResult<u64> {
 /// True on success
 #[php_function]
 pub fn cidr_flush(handle: CidrHandle) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     
-    let result = core_cidr_flush(ptr);
+    let result = core_cidr_flush(handle_id);
     match result {
         ErrorCode::Success => Ok(true),
         error_code => Err(map_error_to_exception(error_code))
@@ -276,9 +279,9 @@ pub fn cidr_flush(handle: CidrHandle) -> PhpResult<bool> {
 /// True on success
 #[php_function]
 pub fn cidr_clear(handle: CidrHandle) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     
-    let result = core_cidr_clear(ptr);
+    let result = core_cidr_clear(handle_id);
     match result {
         ErrorCode::Success => Ok(true),
         error_code => Err(map_error_to_exception(error_code))
@@ -295,9 +298,9 @@ pub fn cidr_clear(handle: CidrHandle) -> PhpResult<bool> {
 /// True on success
 #[php_function]
 pub fn cidr_resize(handle: CidrHandle, new_capacity: u64) -> PhpResult<bool> {
-    let ptr = handle_to_ptr(handle)?;
+    let handle_id = validate_handle(handle)?;
     
-    let result = core_cidr_resize(ptr, new_capacity.try_into().unwrap());
+    let result = core_cidr_resize(handle_id, new_capacity.try_into().unwrap());
     match result {
         ErrorCode::Success => Ok(true),
         error_code => Err(map_error_to_exception(error_code))
