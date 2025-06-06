@@ -10,8 +10,10 @@ use core::marker::PhantomData;
 use memoffset::offset_of;
 use crate::Header;
 use std::{mem::MaybeUninit, sync::Arc};
+#[cfg(target_os = "linux")]
+use libc::pthread_mutex_consistent;
 #[cfg(unix)]
-use libc::{pthread_mutex_consistent, pthread_mutex_t};
+use libc::pthread_mutex_t;
 
 #[cfg(unix)]
 use crate::platform::unix::robust_mutex;
@@ -233,9 +235,14 @@ impl RawRwLock {
                             );
                         }
                         let mtx_ptr = self.mutex_buf.as_ptr() as *mut pthread_mutex_t;
-                        let rc = unsafe { pthread_mutex_consistent(mtx_ptr) };
-                        if rc != 0 {
-                            return Err(crate::errors::Error::from(format!("pthread_mutex_consistent failed: {rc}")));
+                        #[cfg(target_os = "linux")] {
+                            let rc = unsafe { pthread_mutex_consistent(mtx_ptr) };
+                            if rc != 0 {
+                                return Err(crate::errors::Error::from(format!("pthread_mutex_consistent failed: {rc}")));
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))] {
+                            // no robust support; skip mutex consistency
                         }
                         self.mutex().lock().map_err(|e| crate::errors::Error::from(format!("mutex lock failed after recovery: {e}")))?
                     } else {
