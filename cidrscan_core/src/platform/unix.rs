@@ -2,7 +2,6 @@ use libc::{pthread_mutex_t, pthread_mutexattr_t, pthread_mutexattr_init};
 #[cfg(target_os = "linux")]
 use libc::{pthread_mutexattr_setrobust, PTHREAD_MUTEX_ROBUST};
 use raw_sync::locks::{Mutex as RawMutex, LockInit};
-use std::ptr;
 use errno::errno;
 
 /// Generate a unique shared-memory identifier from a prefix and hash.

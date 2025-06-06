@@ -74,7 +74,7 @@ fn concurrent_readers() {
     }
 }
 
-#[test] // BROKEN
+#[test] 
 fn writer_excludes_readers() {
     use std::sync::mpsc;
 
@@ -98,7 +98,7 @@ fn writer_excludes_readers() {
     writer.join().unwrap();
 }
 
-#[test] // tcache_thread_shutdown(): unaligned tcache chunk detected
+#[test] 
 fn try_write_lock_behavior() {
     let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
     let guard = lock.try_write_lock(Timeout::Val(Duration::ZERO));
@@ -177,7 +177,7 @@ fn init_and_reopen_in_place_roundtrip() {
 /// Spawn multiple reader threads, ensure they all acquire simultaneously
 /// and block a writer until they're done.
 #[test]
-fn multiple_readers_block_writer() { // BROKEN 
+fn multiple_readers_block_writer() { 
     let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
 
     let n_readers = 4;
@@ -213,7 +213,7 @@ fn multiple_readers_block_writer() { // BROKEN
 
 /// Test try_write_lock with timeout: immediate failure when readers present.
 #[test]
-fn try_write_lock_timeout_behavior() { // tcache_thread_shutdown(): unaligned tcache chunk detected
+fn try_write_lock_timeout_behavior() { 
     use std::sync::mpsc;
 
     let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");

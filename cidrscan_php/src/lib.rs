@@ -3,7 +3,6 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
-use std::collections::HashMap;
 
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
@@ -11,170 +10,353 @@ use ext_php_rs::prelude::*;
 use cidrscan_core as core;
 use core::constants::TAG_MAX_LEN;
 use core::{
-    cidr_available_capacity, cidr_clear, cidr_close, cidr_flush, cidr_force_destroy, cidr_insert,
-    cidr_lookup, cidr_lookup_full, cidr_open, cidr_resize, cidr_strerror,
+    cidr_available_capacity, cidr_clear as core_cidr_clear, cidr_close as core_cidr_close, cidr_delete as core_cidr_delete, cidr_flush as core_cidr_flush, 
+    cidr_force_destroy, cidr_insert as core_cidr_insert, cidr_lookup as core_cidr_lookup, 
+    cidr_lookup_full as core_cidr_lookup_full, cidr_open as core_cidr_open, cidr_resize as core_cidr_resize, cidr_strerror,
     PatriciaHandle, PatriciaMatchT,
 };
 use cidrscan_core::errors::ErrorCode;
-use ext_php_rs::types::Zval;
+
+/// Handle type for CIDR scanner instances
+pub type CidrHandle = i64;
+
+/// Match information returned by cidrscan_match function
+#[derive(Debug, Clone)]
+#[php_class]
+pub struct CidrMatch {
+    /// High part of the network key
+    pub key_high: i64,
+    
+    /// Low part of the network key  
+    pub key_low: i64,
+    
+    /// Prefix length (e.g., 24 for /24)
+    pub prefix_length: i64,
+    
+    /// Associated tag string
+    pub tag: String,
+}
+
+#[php_impl]
+impl CidrMatch {
+    /// Create a new CidrMatch instance
+    pub fn __construct(key_high: i64, key_low: i64, prefix_length: i64, tag: String) -> Self {
+        Self {
+            key_high,
+            key_low,
+            prefix_length,
+            tag,
+        }
+    }
+    
+    /// Get the CIDR notation string representation
+    pub fn get_cidr_string(&self) -> String {
+        // This would need to be implemented based on the key format
+        format!("key_high:{}, key_low:{}, /{}", self.key_high, self.key_low, self.prefix_length)
+    }
+}
 
 // ───────────────────────── helpers ──────────────────────────────────── //
 
 /// Convert an `ErrorCode` into a `PhpException` using `cidr_strerror`.
-fn err(code: ErrorCode) -> PhpException {
+fn map_error_to_exception(code: ErrorCode) -> PhpException {
     let msg = unsafe { CStr::from_ptr(cidr_strerror(code)) }
         .to_string_lossy()
         .into_owned();
     PhpException::default(msg)
 }
 
-/// Convert a Rust `&str` to a *nul‑terminated* `CString`.
+/// Convert a Rust `&str` to a nul-terminated `CString`.
 #[inline]
-fn to_cstr(s: &str) -> Result<CString, PhpException> {
+fn str_to_cstring(s: &str) -> Result<CString, PhpException> {
     CString::new(s).map_err(|_| PhpException::default("String contains NUL byte".into()))
+}
+
+/// Validate and convert handle to PatriciaHandle pointer
+#[inline]
+fn handle_to_ptr(handle: CidrHandle) -> Result<PatriciaHandle, PhpException> {
+    if handle == 0 {
+        return Err(PhpException::default("Invalid handle: cannot be zero".into()));
+    }
+    Ok(handle as PatriciaHandle)
 }
 
 // ───────────────────────── lifetime ──────────────────────────────────── //
 
-/// Open (or create) a shared‑memory arena and return the opaque handle.
+/// Open or create a shared-memory CIDR scanner arena.
+/// 
+/// # Parameters
+/// * `name` - Name of the shared memory segment
+/// * `capacity` - Maximum number of entries the arena can hold
+/// 
+/// # Returns
+/// Handle to the CIDR scanner instance on success
 #[php_function]
-pub fn cidr_open_php(name: String, capacity: usize) -> PhpResult<isize> {
-    let cname = to_cstr(&name)?;
+pub fn cidr_open(name: String, capacity: u64) -> PhpResult<CidrHandle> {
+    let name_cstr = str_to_cstring(&name)?;
     let mut handle: PatriciaHandle = ptr::null_mut();
-    let rc = cidr_open(cname.as_ptr(), capacity, &mut handle);
-    if rc == ErrorCode::Success {
-        Ok(handle as isize)
-    } else {
-        Err(err(rc))
+    
+    let result = core_cidr_open(name_cstr.as_ptr(), capacity.try_into().unwrap(), &mut handle);
+    match result {
+        ErrorCode::Success => Ok(handle as CidrHandle),
+        error_code => Err(map_error_to_exception(error_code))
     }
 }
 
-/// Close a previously obtained handle (idempotent).
+/// Close a CIDR scanner handle and free associated resources.
+/// 
+/// # Parameters  
+/// * `handle` - Handle to the CIDR scanner instance
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_close_php(handle: isize) {
-    if handle != 0 {
-        cidr_close(handle as PatriciaHandle);
-    }
+pub fn cidr_close(handle: CidrHandle) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    core_cidr_close(ptr);
+    Ok(true)
 }
 
-// ───────────────────────── CRUD ──────────────────────────────────────── //
+// ───────────────────────── CRUD operations ──────────────────────────── //
 
+/// Insert a CIDR prefix into the scanner.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// * `cidr` - CIDR notation string (e.g., "192.168.1.0/24")
+/// * `ttl` - Time-to-live in seconds (0 for permanent)
+/// * `tag` - Optional tag string to associate with this prefix
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_insert_php(handle: isize, cidr: String, ttl: u64, tag: Option<String>) -> PhpResult<()> {
-    let h = handle as PatriciaHandle;
-    let cidr_c = to_cstr(&cidr)?;
-    let (_tag_c, tag_ptr): (Option<CString>, *const c_char) = match tag {
+pub fn cidr_insert(handle: CidrHandle, cidr: String, ttl: u64, tag: Option<String>) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    let cidr_cstr = str_to_cstring(&cidr)?;
+    
+    let (_tag_cstr, tag_ptr): (Option<CString>, *const c_char) = match tag {
         Some(t) => {
-            let tag_cstring = to_cstr(&t)?;
+            let tag_cstring = str_to_cstring(&t)?;
             let ptr = tag_cstring.as_ptr();
             (Some(tag_cstring), ptr)
         },
         None => (None, ptr::null()),
     };
-    let rc = cidr_insert(h, cidr_c.as_ptr(), ttl, tag_ptr);
-    if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
-}
-
-#[php_function]
-pub fn cidr_delete_php(handle: isize, cidr: String) -> PhpResult<()> {
-    let h = handle as PatriciaHandle;
-    let cidr_c = to_cstr(&cidr)?;
-    let rc = core::cidr_delete(h, cidr_c.as_ptr());
-    if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
-}
-
-#[php_function]
-pub fn cidr_lookup_php(handle: isize, addr: String) -> PhpResult<bool> {
-    let h = handle as PatriciaHandle;
-    let addr_c = to_cstr(&addr)?;
-    let mut found: bool = false;
-    let rc = cidr_lookup(h, addr_c.as_ptr(), &mut found);
-    if rc == ErrorCode::Success {
-        Ok(found)
-    } else {
-        Err(err(rc))
+    
+    let result = core_cidr_insert(ptr, cidr_cstr.as_ptr(), ttl, tag_ptr);
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
     }
 }
 
+/// Remove a CIDR prefix from the scanner.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance  
+/// * `cidr` - CIDR notation string to remove
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_lookup_full_php(handle: isize, addr: String) -> PhpResult<HashMap<String, Zval>> {
-    let h = handle as PatriciaHandle;
-    let addr_c = to_cstr(&addr)?;
-    let mut m = PatriciaMatchT {
+pub fn cidr_delete(handle: CidrHandle, cidr: String) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    let cidr_cstr = str_to_cstring(&cidr)?;
+    
+    let result = core_cidr_delete(ptr, cidr_cstr.as_ptr());
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
+    }
+}
+
+/// Check if an IP address matches any stored CIDR prefix.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// * `addr` - IP address string to check
+/// 
+/// # Returns
+/// `true` if the address matches a stored prefix, `false` otherwise
+#[php_function]
+pub fn cidr_lookup(handle: CidrHandle, addr: String) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    let addr_cstr = str_to_cstring(&addr)?;
+    let mut found: bool = false;
+    
+    let result = core_cidr_lookup(ptr, addr_cstr.as_ptr(), &mut found);
+    match result {
+        ErrorCode::Success => Ok(found),
+        error_code => Err(map_error_to_exception(error_code))
+    }
+}
+
+/// Get detailed information about a matching CIDR prefix.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// * `addr` - IP address string to check
+/// 
+/// # Returns
+/// CidrMatch object with match details, or null if no match found
+#[php_function]
+pub fn cidrscan_match(handle: CidrHandle, addr: String) -> PhpResult<Option<CidrMatch>> {
+    let ptr = handle_to_ptr(handle)?;
+    let addr_cstr = str_to_cstring(&addr)?;
+    let mut match_info = PatriciaMatchT {
         key_high: 0,
         key_low: 0,
         plen: 0,
         tag: [0; TAG_MAX_LEN],
     };
-    let rc = cidr_lookup_full(h, addr_c.as_ptr(), &mut m);
-    if rc != ErrorCode::Success {
-        return Err(err(rc));
+      let result = core_cidr_lookup_full(ptr, addr_cstr.as_ptr(), &mut match_info);
+    match result {
+        ErrorCode::Success => {
+            // Convert the tag from C string
+            let tag_cstr = unsafe { CStr::from_ptr(match_info.tag.as_ptr()) };
+            let tag_string = tag_cstr.to_string_lossy().into_owned();
+            
+            Ok(Some(CidrMatch {
+                key_high: match_info.key_high as i64,
+                key_low: match_info.key_low as i64,
+                prefix_length: match_info.plen as i64,
+                tag: tag_string,
+            }))
+        },
+        ErrorCode::NotFound => Ok(None),
+        error_code => Err(map_error_to_exception(error_code))
     }
-    // Build associative array for PHP.
-    let mut out: HashMap<String, Zval> = HashMap::with_capacity(4);
-
-    let mut zv = Zval::new();
-    zv.set_long(m.key_high as i64);
-    out.insert("key_high".into(), zv);
-
-    let mut zv = Zval::new();
-    zv.set_long(m.key_low as i64);
-    out.insert("key_low".into(), zv);
-
-    let mut zv = Zval::new();
-    zv.set_long(m.plen as i64);
-    out.insert("plen".into(), zv);
-
-    let tag_cstr = unsafe { CStr::from_ptr(m.tag.as_ptr()) };
-    let tag_str: String = tag_cstr.to_string_lossy().into_owned();
-    let mut zv = Zval::new();
-    zv.set_string(&tag_str, false).expect("failed to set string zval");
-    out.insert("tag".into(), zv);
-
-    Ok(out)
 }
 
 // ───────────────────── capacity & maintenance ───────────────────────── //
 
+/// Get the number of available slots in the scanner.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// 
+/// # Returns
+/// Number of available capacity slots
 #[php_function]
-pub fn cidr_available_capacity_php(handle: isize) -> PhpResult<u64> {
-    let h = handle as PatriciaHandle;
-    let mut cap: u64 = 0;
-    let rc = cidr_available_capacity(h, &mut cap);
-    if rc == ErrorCode::Success { Ok(cap) } else { Err(err(rc)) }
+pub fn cidr_get_capacity(handle: CidrHandle) -> PhpResult<u64> {
+    let ptr = handle_to_ptr(handle)?;
+    let mut capacity: u64 = 0;
+    
+    let result = cidr_available_capacity(ptr, &mut capacity);
+    match result {
+        ErrorCode::Success => Ok(capacity),
+        error_code => Err(map_error_to_exception(error_code))
+    }
 }
 
+/// Flush expired entries and perform maintenance on the scanner.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_flush_php(handle: isize) -> PhpResult<()> {
-    let rc = cidr_flush(handle as PatriciaHandle);
-    if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
+pub fn cidr_flush(handle: CidrHandle) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    
+    let result = core_cidr_flush(ptr);
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
+    }
 }
 
+/// Clear all entries from the scanner.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_clear_php(handle: isize) -> PhpResult<()> {
-    let rc = cidr_clear(handle as PatriciaHandle);
-    if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
+pub fn cidr_clear(handle: CidrHandle) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    
+    let result = core_cidr_clear(ptr);
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
+    }
 }
 
+/// Resize the scanner's capacity.
+/// 
+/// # Parameters
+/// * `handle` - Handle to the CIDR scanner instance
+/// * `new_capacity` - New maximum number of entries
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_resize_php(handle: isize, new_capacity: usize) -> PhpResult<()> {
-    let rc = cidr_resize(handle as PatriciaHandle, new_capacity);
-    if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
+pub fn cidr_resize(handle: CidrHandle, new_capacity: u64) -> PhpResult<bool> {
+    let ptr = handle_to_ptr(handle)?;
+    
+    let result = core_cidr_resize(ptr, new_capacity.try_into().unwrap());
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
+    }
 }
 
-// ───────────────────── misc helpers ─────────────────────────────────── //
+// ───────────────────── utility functions ─────────────────────────────── //
 
+/// Get a human-readable error message for an error code.
+/// 
+/// # Parameters
+/// * `error_code` - Error code value
+/// 
+/// # Returns
+/// Human-readable error message
 #[php_function]
-pub fn cidr_strerror_php(code: i32) -> String {
-    let code_enum: ErrorCode = unsafe { std::mem::transmute(code) };
-    unsafe { CStr::from_ptr(cidr_strerror(code_enum)).to_string_lossy().into_owned() }
+pub fn cidr_error_message(error_code: i64) -> PhpResult<String> {
+    let code_enum = match error_code {
+        0 => ErrorCode::Success,
+        1 => ErrorCode::CapacityExceeded,
+        2 => ErrorCode::ZeroCapacity,
+        3 => ErrorCode::InvalidPrefix,
+        4 => ErrorCode::BranchHasChildren,
+        5 => ErrorCode::InvalidHandle,
+        6 => ErrorCode::Utf8Error,
+        7 => ErrorCode::LockInitFailed,
+        8 => ErrorCode::ShmemOpenFailed,
+        9 => ErrorCode::ResizeFailed,
+        10 => ErrorCode::FlushFailed,
+        11 => ErrorCode::TagTooLong,
+        12 => ErrorCode::NotFound,
+        255 => ErrorCode::Unknown,
+        _ => return Err(PhpException::default("Invalid error code".into())),
+    };
+    
+    let message = unsafe { 
+        CStr::from_ptr(cidr_strerror(code_enum))
+            .to_string_lossy()
+            .into_owned()
+    };
+    Ok(message)
 }
 
+/// Force destroy a shared memory segment by name.
+/// 
+/// # Parameters
+/// * `name` - Name of the shared memory segment to destroy
+/// 
+/// # Returns
+/// True on success
 #[php_function]
-pub fn cidr_force_destroy_php(name: String) -> PhpResult<()> {
-    let cname = to_cstr(&name)?;
-    let rc = cidr_force_destroy(cname.as_ptr());
-    if rc == ErrorCode::Success { Ok(()) } else { Err(err(rc)) }
+pub fn cidr_destroy(name: String) -> PhpResult<bool> {
+    let name_cstr = str_to_cstring(&name)?;
+    
+    let result = cidr_force_destroy(name_cstr.as_ptr());
+    match result {
+        ErrorCode::Success => Ok(true),
+        error_code => Err(map_error_to_exception(error_code))
+    }
 }
 
 // ───────────────────── module registration ──────────────────────────── //
