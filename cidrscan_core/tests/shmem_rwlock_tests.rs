@@ -1,38 +1,63 @@
 use cidrscan_core::shmem_rwlock::RawRwLock;
 use raw_sync::Timeout;
+use log::info;
 use std::{
     sync::{atomic::Ordering, Arc, Barrier},
     thread,
     time::{Duration, Instant},
 };
-
-/// Helper: allocate and initialise a RawRwLock on the heap, wrapped in Arc.
-fn make_lock() -> Arc<RawRwLock> {
-    print!("make_lock");
-    // Convert Box<RawRwLock> to Arc<RawRwLock> without moving the contents
-    let boxed_lock = RawRwLock::new().expect("RawRwLock::new() failed");
-    Arc::from(boxed_lock)
-}
+use std::mem::MaybeUninit;
 
 #[test]
 fn basic_lock_unlock() {
-        println!("Starting test");
+    info!("Starting test");
+    // Safe constructor: no in‐place, no raw memory.
+    let lock = RawRwLock::new().expect("mutex/event initialization failed");
 
-    let lock = make_lock();
     {
         let _read_guard = lock.read_lock();
     }
-    println!("Read lock released");
+    info!("Read lock released");
+
     {
-        print!("Write lock: {:p}\n", lock.as_ref());
-        let _write_guard = lock.write_lock();
+        info!("Write lock: {:p}", lock.as_ref());
+        let _write_guard = lock.write_lock().expect("write_lock failed");
     }
-    println!("Write lock released");
+    info!("Write lock released");
+}
+
+#[test]
+fn basic_lock_unlock_in_place() {
+    info!("Starting test");
+
+    // Allocate uninitialized RawRwLock memory
+    let mut uninit_lock = MaybeUninit::<RawRwLock>::uninit();
+    let lock_ptr = uninit_lock.as_mut_ptr();
+
+    unsafe {
+        // SAFETY: 'lock_ptr' points to uninitialized memory; new_in_place zeros it
+        RawRwLock::new_in_place(lock_ptr)
+            .expect("new_in_place failed: ensure zeroed memory and alignment");
+    }
+
+    // SAFETY: Now 'lock_ptr' has been fully initialized by new_in_place()
+    let lock: &RawRwLock = unsafe { &*lock_ptr };
+
+    {
+        let _read_guard = lock.read_lock();
+    }
+    info!("Read lock released");
+
+    {
+        info!("Write lock: {:p}", lock as *const _);
+        let _write_guard = lock.write_lock().expect("write_lock failed");
+    }
+    info!("Write lock released");
 }
 
 #[test]
 fn concurrent_readers() {
-    let lock = make_lock();
+    let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
     let mut handles = Vec::new();
 
     for _ in 0..10 {
@@ -49,11 +74,11 @@ fn concurrent_readers() {
     }
 }
 
-#[test]
+#[test] // BROKEN
 fn writer_excludes_readers() {
     use std::sync::mpsc;
 
-    let lock = make_lock();
+    let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
     let (ready_tx, ready_rx) = mpsc::channel();
 
     let l = Arc::clone(&lock);
@@ -73,9 +98,9 @@ fn writer_excludes_readers() {
     writer.join().unwrap();
 }
 
-#[test]
+#[test] // tcache_thread_shutdown(): unaligned tcache chunk detected
 fn try_write_lock_behavior() {
-    let lock = make_lock();
+    let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
     let guard = lock.try_write_lock(Timeout::Val(Duration::ZERO));
     assert!(guard.is_some());
 
@@ -152,8 +177,8 @@ fn init_and_reopen_in_place_roundtrip() {
 /// Spawn multiple reader threads, ensure they all acquire simultaneously
 /// and block a writer until they're done.
 #[test]
-fn multiple_readers_block_writer() {
-    let lock = make_lock();
+fn multiple_readers_block_writer() { // BROKEN 
+    let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
 
     let n_readers = 4;
     let barrier = Arc::new(Barrier::new(n_readers + 1));
@@ -188,10 +213,10 @@ fn multiple_readers_block_writer() {
 
 /// Test try_write_lock with timeout: immediate failure when readers present.
 #[test]
-fn try_write_lock_timeout_behavior() {
+fn try_write_lock_timeout_behavior() { // tcache_thread_shutdown(): unaligned tcache chunk detected
     use std::sync::mpsc;
 
-    let lock = make_lock();
+    let lock = RawRwLock::new_arc().expect("RawRwLock::new_arc() failed");
     let (ready_tx, ready_rx) = mpsc::channel();
 
     {

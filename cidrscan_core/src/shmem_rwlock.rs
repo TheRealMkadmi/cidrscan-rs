@@ -9,6 +9,8 @@ use raw_sync::Timeout;
 use core::marker::PhantomData;
 use memoffset::offset_of;
 use crate::Header;
+use std::{mem::MaybeUninit, sync::Arc};
+#[cfg(unix)]
 use libc::{pthread_mutex_consistent, pthread_mutex_t};
 
 #[cfg(unix)]
@@ -18,13 +20,10 @@ const _: () = {
     assert!(core::mem::size_of::<RawRwLock>() % core::mem::align_of::<RawRwLock>() == 0);
 };
 
-
-/// Our shared-memory lock layout: [mutex-bytes][event-bytes][reader_count]
 #[repr(C, align(8))]
 pub struct RawRwLock {
     mutex_buf: [u8; 128],
     event_buf: [u8; 128],
-    /// number of readers (low 31 bits), high bit is "writer present" flag
     pub readers: AtomicU32,
     mutex_handle: Option<Box<dyn LockImpl>>,
     event_handle: Option<Box<dyn EventImpl>>,
@@ -86,8 +85,10 @@ impl RawRwLock {
 
     /// In-place initialization for shared memory usage.
     /// # Safety
-    /// - `ptr` must be valid, properly aligned, and point to zeroed memory.
+    /// - `ptr` must be valid and properly aligned.
     pub unsafe fn new_in_place(ptr: *mut RawRwLock) -> Result<(), crate::errors::Error> {
+        // Zero entire RawRwLock memory so readers starts at 0 even if caller forgets to supply zeroed memory
+        ptr::write_bytes(ptr as *mut u8, 0, core::mem::size_of::<RawRwLock>());
         let this = &mut *ptr;
         let msz = RawMutex::size_of(None);
         let esz = RawEvent::size_of(None);
@@ -144,14 +145,45 @@ impl RawRwLock {
     }
     // Readers field state is preserved.
 
+    /// Safe, cross-platform constructor that returns an `Arc<Self>`.
+    /// Allocates and initializes the lock in-place within the Arc, so internal pointers never move.
+    pub fn new_arc() -> Result<Arc<Self>, crate::errors::Error> {
+        // 1. Allocate uninitialized Arc<MaybeUninit<Self>>
+        let arc_uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
+        // 2. Get raw pointer to the inner Self for stable placement
+        let ptr = Arc::as_ptr(&arc_uninit) as *mut Self;
+        unsafe {
+            // 3. Construct Self in-place
+            ptr.write(Self {
+                mutex_buf: [0u8; 128],
+                event_buf: [0u8; 128],
+                readers: AtomicU32::new(0),
+                mutex_handle: None,
+                event_handle: None,
+                _marker: PhantomData,
+            });
+            // 4. Initialize OS handles in-place
+            let (raw_mtx, _) = RawMutex::new((*ptr).mutex_buf.as_mut_ptr(), ptr::null_mut())
+                .map_err(|e| crate::errors::Error::from(format!("mutex init failed: {e}")))?;
+            let (raw_evt, _) = RawEvent::new((*ptr).event_buf.as_mut_ptr(), true)
+                .map_err(|e| crate::errors::Error::from(format!("event init failed: {e}")))?;
+            (*ptr).mutex_handle = Some(raw_mtx);
+            (*ptr).event_handle = Some(raw_evt);
+        }
+        // 5. Convert uninitialized Arc into initialized Arc<Self>
+        let arc_self: Arc<Self> = unsafe { <Arc<MaybeUninit<Self>>>::assume_init(arc_uninit) };
+        Ok(arc_self)
+    }
+
     /// Acquire a **shared** (read) lock.
     /// Spins only if a writer holds the lock or is waiting.
     /// Returns a guard that releases the lock when dropped.
     pub fn read_lock(&self) -> ReadGuard<'_> {
         loop {
-            let current_readers = self.readers.load(Ordering::Relaxed);
+            let current_readers = self.readers.load(Ordering::Acquire);
             if current_readers & WRITER_BIT != 0 {
-                core::hint::spin_loop();
+                // Wait for writer to release lock
+                let _ = self.event().wait(Timeout::Infinite);
                 continue;
             }
             match self.readers.compare_exchange_weak(
