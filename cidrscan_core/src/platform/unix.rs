@@ -3,6 +3,7 @@ use libc::{pthread_mutex_t, pthread_mutexattr_t, pthread_mutexattr_init};
 use libc::{pthread_mutexattr_setrobust, PTHREAD_MUTEX_ROBUST};
 use raw_sync::locks::{Mutex as RawMutex, LockInit};
 use errno::errno;
+use std::ptr;
 
 /// Generate a unique shared-memory identifier from a prefix and hash.
 pub fn make_os_id(prefix: &str, hash: u64) -> String {

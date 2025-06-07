@@ -3,19 +3,21 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
-
 use ext_php_rs::exception::PhpException;
 use ext_php_rs::prelude::*;
 
 use cidrscan_core as core;
 use core::constants::TAG_MAX_LEN;
 use core::{
-    cidr_available_capacity, cidr_clear as core_cidr_clear, cidr_close as core_cidr_close, cidr_delete as core_cidr_delete, cidr_flush as core_cidr_flush, 
-    cidr_force_destroy, cidr_insert as core_cidr_insert, cidr_lookup as core_cidr_lookup, 
-    cidr_lookup_full as core_cidr_lookup_full, cidr_open as core_cidr_open, cidr_resize as core_cidr_resize, cidr_strerror,
+    cidr_available_capacity as core_cidr_available_capacity, cidr_clear as core_cidr_clear,
+    cidr_close as core_cidr_close, cidr_delete as core_cidr_delete,
+    cidr_flush as core_cidr_flush, cidr_force_destroy as core_cidr_force_destroy,
+    cidr_insert as core_cidr_insert, cidr_lookup as core_cidr_lookup,
+    cidr_lookup_full as core_cidr_lookup_full, cidr_open as core_cidr_open,
+    cidr_resize as core_cidr_resize, cidr_strerror as core_cidr_strerror,
     PatriciaHandle, PatriciaMatchT,
 };
-use cidrscan_core::errors::ErrorCode;
+use core::errors::ErrorCode;
 
 /// Handle type for CIDR scanner instances - now using safe handle IDs
 pub type CidrHandle = u64;
@@ -54,13 +56,17 @@ impl CidrMatch {
         // This would need to be implemented based on the key format
         format!("key_high:{}, key_low:{}, /{}", self.key_high, self.key_low, self.prefix_length)
     }
+    /// Get the CIDR notation string representation
+    pub fn get_tag(&self) -> Option<String> {
+        Some(format!("Tag: {}", self.tag))
+    }
 }
 
 // ───────────────────────── helpers ──────────────────────────────────── //
 
 /// Convert an `ErrorCode` into a `PhpException` using `cidr_strerror`.
 fn map_error_to_exception(code: ErrorCode) -> PhpException {
-    let msg = unsafe { CStr::from_ptr(cidr_strerror(code)) }
+    let msg = unsafe { CStr::from_ptr(core_cidr_strerror(code)) }
         .to_string_lossy()
         .into_owned();
     PhpException::default(msg)
@@ -203,7 +209,7 @@ pub fn cidr_lookup(handle: CidrHandle, addr: String) -> PhpResult<bool> {
 /// # Returns
 /// CidrMatch object with match details, or null if no match found
 #[php_function]
-pub fn cidrscan_match(handle: CidrHandle, addr: String) -> PhpResult<Option<CidrMatch>> {
+pub fn cidr_lookup_full(handle: CidrHandle, addr: String) -> PhpResult<Option<CidrMatch>> {
     let handle_id = validate_handle(handle)?;
     let addr_cstr = str_to_cstring(&addr)?;
     let mut match_info = PatriciaMatchT {
@@ -241,11 +247,11 @@ pub fn cidrscan_match(handle: CidrHandle, addr: String) -> PhpResult<Option<Cidr
 /// # Returns
 /// Number of available capacity slots
 #[php_function]
-pub fn cidr_get_capacity(handle: CidrHandle) -> PhpResult<u64> {
+pub fn cidr_available_capacity(handle: CidrHandle) -> PhpResult<u64> {
     let handle_id = validate_handle(handle)?;
     let mut capacity: u64 = 0;
     
-    let result = cidr_available_capacity(handle_id, &mut capacity);
+    let result = core_cidr_available_capacity(handle_id, &mut capacity);
     match result {
         ErrorCode::Success => Ok(capacity),
         error_code => Err(map_error_to_exception(error_code))
@@ -337,7 +343,7 @@ pub fn cidr_error_message(error_code: i64) -> PhpResult<String> {
     };
     
     let message = unsafe { 
-        CStr::from_ptr(cidr_strerror(code_enum))
+        CStr::from_ptr(core_cidr_strerror(code_enum))
             .to_string_lossy()
             .into_owned()
     };
@@ -352,10 +358,10 @@ pub fn cidr_error_message(error_code: i64) -> PhpResult<String> {
 /// # Returns
 /// True on success
 #[php_function]
-pub fn cidr_destroy(name: String) -> PhpResult<bool> {
+pub fn cidr_force_destroy(name: String) -> PhpResult<bool> {
     let name_cstr = str_to_cstring(&name)?;
     
-    let result = cidr_force_destroy(name_cstr.as_ptr());
+    let result = core_cidr_force_destroy(name_cstr.as_ptr());
     match result {
         ErrorCode::Success => Ok(true),
         error_code => Err(map_error_to_exception(error_code))
