@@ -18,11 +18,11 @@ use core::{
     PatriciaHandle, PatriciaMatchT,
 };
 use core::errors::ErrorCode;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Handle type for CIDR scanner instances - now using safe handle IDs
 pub type CidrHandle = u64;
 
-/// Match information returned by cidrscan_match function
 #[derive(Debug, Clone)]
 #[php_class]
 pub struct CidrMatch {
@@ -53,12 +53,21 @@ impl CidrMatch {
     
     /// Get the CIDR notation string representation
     pub fn get_cidr_string(&self) -> String {
-        // This would need to be implemented based on the key format
-        format!("key_high:{}, key_low:{}, /{}", self.key_high, self.key_low, self.prefix_length)
+        let high = self.key_high as u64;
+        let low = self.key_low as u64;
+        let key = ((high as u128) << 64) | (low as u128);
+        let plen = self.prefix_length as u8;
+        if plen <= 32 {
+            let ip4 = Ipv4Addr::from((key >> 96) as u32);
+            format!("{}/{}", ip4, plen)
+        } else {
+            let ip6 = Ipv6Addr::from(key);
+            format!("{}/{}", ip6, plen)
+        }
     }
     /// Get the CIDR notation string representation
     pub fn get_tag(&self) -> Option<String> {
-        Some(format!("Tag: {}", self.tag))
+        Some(self.tag.clone())
     }
 }
 

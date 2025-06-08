@@ -14,7 +14,6 @@ use std::{
 /// Handle ID type for Patricia tree instances
 pub type PatriciaHandle = HandleId;
 
-/// Full-match record returned by `cidr_lookup_full`.
 #[repr(C)]
 pub struct PatriciaMatchT {
     pub key_high: u64,

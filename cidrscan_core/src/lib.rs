@@ -509,6 +509,20 @@ impl PatriciaTree {
                             }
                             leaf_offset = offset;
                             leaf_gen = gen;
+                            let idx = (leaf_offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+                            if let Some(s) = tag {
+                                if s.len() > TAG_MAX_LEN {
+                                    return Err(Error::TagTooLong);
+                                }
+                                unsafe {
+                                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                                    core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+                                }
+                            }
+                            unsafe {
+                                (*node_ptr).tag_off.store(idx, Ordering::Release);
+                            }
                         } else {
                             let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
                             if (index as usize) >= hdr.capacity {
@@ -540,6 +554,20 @@ impl PatriciaTree {
                                 (*node_ptr).refcnt.store(1, Ordering::Relaxed); // first occurrence
                             }
                             leaf_gen = 1;
+                            let idx = (leaf_offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+                            if let Some(s) = tag {
+                                if s.len() > TAG_MAX_LEN {
+                                    return Err(Error::TagTooLong);
+                                }
+                                unsafe {
+                                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                                    core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+                                }
+                            }
+                            unsafe {
+                                (*node_ptr).tag_off.store(idx, Ordering::Release);
+                            }
                         }
                     }
                     // This whole block needs to be atomic with respect to the parent link update
@@ -1207,6 +1235,8 @@ impl PatriciaTree {
             std::ptr::swap(&mut self.hdr, &mut next.hdr);
             std::ptr::swap(&mut self.os_id, &mut next.os_id);
         }
+        // Release the lock while the old mapping is still valid.
+        drop(_guard);
         // `next` now owns the *old* mapping and will unmap it on drop.
         Ok(())
     }
