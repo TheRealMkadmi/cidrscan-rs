@@ -323,7 +323,7 @@ pub fn cidr_resize(handle: CidrHandle, new_capacity: u64) -> PhpResult<bool> {
 /// # Returns
 /// Human-readable error message
 #[php_function]
-pub fn cidr_error_message(error_code: i64) -> PhpResult<String> {
+pub fn cidr_strerror(error_code: i64) -> PhpResult<String> {
     let code_enum = match error_code {
         0 => ErrorCode::Success,
         1 => ErrorCode::CapacityExceeded,
