@@ -210,7 +210,7 @@ Time‑complexity: ***O(log W)*** where `W ≤ 128`.
 * **Cross-process support is baseline, not fully coordinated**: separate processes can open the same shared-memory arena and observe each other's inserts, but the freelist and epoch queue remain process-local to each handle.
 * **`resize()` is in-process only**: it swaps the current handle to a new arena mapping, but other processes do not automatically discover or follow that replacement.
 * **TTL cleanup is opportunistic**: expired prefixes are removed during later lookups or explicit maintenance, so an expired entry can remain resident until something touches that branch again.
-* **Crash recovery semantics vary by platform**: Linux uses robust pthread mutexes for writer owner-death recovery; macOS does not expose equivalent robust mutex support, so a writer crash is not recovered the same way there.
+* **Crash recovery semantics vary by platform**: Linux uses robust pthread mutexes for writer owner-death recovery; macOS does not expose equivalent robust mutex support, so a writer crash is not recovered the same way there. See [`docs/macos-robust-mutex.md`](docs/macos-robust-mutex.md).
 * **Capacity is fixed per arena**: the trie does not grow automatically and there is no background compactor, so long-running deployments need explicit capacity planning.
 
 ---
