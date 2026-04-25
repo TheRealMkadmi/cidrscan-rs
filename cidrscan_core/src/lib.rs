@@ -271,8 +271,18 @@ impl PatriciaTree {
                 .saturating_add(ttl_secs)
         };
 
-        let mut current_link_ptr = &hdr.root_offset as *const AtomicU64 as *mut AtomicU64;
+        self.insert_inner(stored_key, prefix_len, expires, tag)
+    }
 
+    fn insert_inner(
+        &self,
+        stored_key: u128,
+        prefix_len: u8,
+        expires: u64,
+        tag: Option<&str>,
+    ) -> Result<(), Error> {
+        let hdr = unsafe { &*self.hdr.as_ptr() };
+        let mut current_link_ptr = &hdr.root_offset as *const AtomicU64 as *mut AtomicU64;
         loop {
             let current_ptr = unsafe { (*current_link_ptr).load(Ordering::Relaxed) };
             let (current_offset, current_gen) = unpack(current_ptr);
@@ -440,139 +450,21 @@ impl PatriciaTree {
                             error!("[INSERT] Not enough capacity for split (need 2 slots, have={}).", available);
                             return Err(Error::CapacityExceeded);
                         }
-                        // Allocate internal node
-                        if let Some(raw) = self.freelist.pop() {
-                            let offset = (raw & 0xFFFF_FFFF) as u32;
-                            debug!(
-                                "[ALLOC] Reusing freed node for internal at offset={}",
-                                offset
-                            );
-                            let node_ptr =
-                                unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
-                            let gen = unsafe {
-                                (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1
-                            };
-                            unsafe {
-                                core::ptr::write_volatile(
-                                    &mut (*node_ptr).key,
-                                    stored_key & mask(split_bit),
-                                );
-                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
-                                (*node_ptr).is_terminal.store(0, Ordering::Relaxed); // internal nodes are not terminal
-                                (*node_ptr).left.store(0, Ordering::Relaxed);
-                                (*node_ptr).right.store(0, Ordering::Relaxed);
-                                (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
-                            }
-                            internal_offset = offset;
-                            internal_gen = gen;
-                        } else {
-                            let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
-                            if (index as usize) >= hdr.capacity {
-                                hdr.next_index.fetch_sub(1, Ordering::Relaxed);
-                                return Err(Error::CapacityExceeded);
-                            }
-                            internal_offset = HEADER_PADDED as Offset
-                                + (index as Offset) * size_of::<Node>() as Offset;
-                            let node_ptr = unsafe {
-                                self.base.as_ptr().add(internal_offset as usize) as *mut Node
-                            };
-                            unsafe {
-                                core::ptr::write_volatile(
-                                    &mut (*node_ptr).key,
-                                    stored_key & mask(split_bit),
-                                );
-                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, split_bit);
-                                (*node_ptr).generation.store(1, Ordering::Relaxed);
-                                (*node_ptr).left.store(0, Ordering::Relaxed);
-                                (*node_ptr).right.store(0, Ordering::Relaxed);
-                                (*node_ptr).expires.store(u64::MAX, Ordering::Relaxed);
-                                (*node_ptr).is_terminal.store(0, Ordering::Relaxed);
-                                // internal nodes are not terminal
-                            }
-                            internal_gen = 1;
-                        }
-                        // Allocate leaf node
-                        if let Some(raw) = self.freelist.pop() {
-                            let offset = (raw & 0xFFFF_FFFF) as u32;
-                            debug!("[ALLOC] Reusing freed node for leaf at offset={}", offset);
-                            let node_ptr =
-                                unsafe { self.base.as_ptr().add(offset as usize) as *mut Node };
-                            let gen = unsafe {
-                                (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1
-                            };
-                            unsafe {
-                                core::ptr::write_volatile(&mut (*node_ptr).key, stored_key);
-                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-                                (*node_ptr).left.store(0, Ordering::Relaxed);
-                                (*node_ptr).right.store(0, Ordering::Relaxed);
-                                (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                                (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // ← NEW: mark leaf as terminal
-                                (*node_ptr).refcnt.store(1, Ordering::Relaxed); // first occurrence
-                            }
-                            leaf_offset = offset;
-                            leaf_gen = gen;
-                            let idx = (leaf_offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
-                            unsafe {
-                                let dst =
-                                    self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
-                                core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
-                                if let Some(s) = tag {
-                                    core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
-                                }
-                            }
-                            unsafe {
-                                (*node_ptr).tag_off.store(idx, Ordering::Release);
-                            }
-                        } else {
-                            let index = hdr.next_index.fetch_add(1, Ordering::Relaxed);
-                            if (index as usize) >= hdr.capacity {
-                                hdr.next_index.fetch_sub(1, Ordering::Relaxed);
-                                let internal_index = ((internal_offset as usize)
-                                    - size_of::<Header>())
-                                    / size_of::<Node>();
-                                if internal_index == (index as usize) - 1 {
-                                    // Retire the internal_offset using epoch-based reclamation
-                                    let off = internal_offset;
-                                    // No free_slots update needed here, as this is a failed allocation rollback
-                                    self.retire_offset(off);
-                                }
-                                return Err(Error::CapacityExceeded);
-                            }
-                            leaf_offset = HEADER_PADDED as Offset
-                                + (index as Offset) * size_of::<Node>() as Offset;
-                            let node_ptr = unsafe {
-                                self.base.as_ptr().add(leaf_offset as usize) as *mut Node
-                            };
-                            unsafe {
-                                core::ptr::write_volatile(&mut (*node_ptr).key, stored_key);
-                                core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-                                (*node_ptr).generation.store(1, Ordering::Relaxed);
-                                (*node_ptr).left.store(0, Ordering::Relaxed);
-                                (*node_ptr).right.store(0, Ordering::Relaxed);
-                                (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                                (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // ← NEW: mark leaf as terminal
-                                (*node_ptr).refcnt.store(1, Ordering::Relaxed); // first occurrence
-                            }
-                            leaf_gen = 1;
-                            let idx = (leaf_offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
-                            unsafe {
-                                let dst =
-                                    self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
-                                core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
-                                if let Some(s) = tag {
-                                    core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
-                                }
-                            }
-                            unsafe {
-                                (*node_ptr).tag_off.store(idx, Ordering::Release);
-                            }
-                        }
+                        (internal_offset, internal_gen, _) = self.alloc_raw_node(
+                            stored_key & mask(split_bit),
+                            split_bit,
+                            u64::MAX,
+                            false,
+                            None,
+                        )?;
+                        (leaf_offset, leaf_gen, _) =
+                            self.alloc_raw_node(stored_key, prefix_len, expires, true, tag)?;
                     }
                     // This whole block needs to be atomic with respect to the parent link update
                     unsafe {
                         let internal_node =
                             &*(self.base.as_ptr().add(internal_offset as usize) as *const Node);
-                        let new_bit = get_bit(key, split_bit);
+                        let new_bit = get_bit(stored_key, split_bit);
                         trace!("[INSERT] Split branching: new_key_bit={}", new_bit);
                         if new_bit == 0 {
                             internal_node
@@ -669,7 +561,7 @@ impl PatriciaTree {
             // cpl < prefix_len was handled by Insert Above.
             // So, this path should only be taken if cpl == current_node.prefix_len < prefix_len.
             trace!("[INSERT] Subcase 2d: Traverse Down needed.");
-            let next_bit = get_bit(key, current_node.prefix_len); // Bit *after* current prefix
+            let next_bit = get_bit(stored_key, current_node.prefix_len); // Bit *after* current prefix
             trace!("[INSERT] Traverse direction bit={}", next_bit);
             let next_link_atomic_ptr = if next_bit == 0 {
                 &current_node.left as *const AtomicU64 as *mut AtomicU64
@@ -682,14 +574,20 @@ impl PatriciaTree {
         }
     }
 
-    // Helper to allocate a new node (assumes lock is held)
-    /// Allocates a new node and returns (offset, generation).
-    fn allocate_node_with_gen(
+    /// Allocates a raw node slot, initializes its fields, and writes the tag slab.
+    fn alloc_raw_node(
         &self,
         key: u128,
         prefix_len: u8,
         expires: u64,
-    ) -> Result<(Offset, u32), Error> {
+        is_terminal: bool,
+        tag: Option<&str>,
+    ) -> Result<(Offset, u32, u32), Error> {
+        if let Some(s) = tag {
+            if s.len() > TAG_MAX_LEN {
+                return Err(Error::TagTooLong);
+            }
+        }
         let hdr = unsafe { &*self.hdr.as_ptr() };
         let hdr_size = HEADER_PADDED as Offset;
         let node_size = size_of::<Node>() as Offset;
@@ -703,14 +601,23 @@ impl PatriciaTree {
                     let g = (*node_ptr).generation.fetch_add(1, Ordering::Relaxed) + 1;
                     core::ptr::write_volatile(&mut (*node_ptr).key, key);
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
-                    (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // new leaves are stored prefixes
-                    (*node_ptr).refcnt.store(1, Ordering::Relaxed); // first occurrence
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                    (*node_ptr).is_terminal.store(u8::from(is_terminal), Ordering::Relaxed);
+                    (*node_ptr).refcnt.store(if is_terminal { 1 } else { 0 }, Ordering::Relaxed);
                     g
                 };
-                return Ok((offset, gen));
+                let idx = (offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+                unsafe {
+                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                    if let Some(s) = tag {
+                        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+                    }
+                    (*node_ptr).tag_off.store(idx, Ordering::Release);
+                }
+                return Ok((offset, gen, idx));
             }
 
             // ② Try bump allocation
@@ -722,13 +629,21 @@ impl PatriciaTree {
                     core::ptr::write_volatile(&mut (*node_ptr).key, key);
                     core::ptr::write_volatile(&mut (*node_ptr).prefix_len, prefix_len);
                     (*node_ptr).generation.store(1, Ordering::Relaxed);
-                    (*node_ptr).is_terminal.store(1, Ordering::Relaxed); // new leaves are stored prefixes
-                    (*node_ptr).refcnt.store(1, Ordering::Relaxed); // first occurrence
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
+                    (*node_ptr).is_terminal.store(u8::from(is_terminal), Ordering::Relaxed);
+                    (*node_ptr).refcnt.store(if is_terminal { 1 } else { 0 }, Ordering::Relaxed);
+                    let idx = (offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                    if let Some(s) = tag {
+                        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+                    }
+                    (*node_ptr).tag_off.store(idx, Ordering::Release);
                 }
-                return Ok((offset, 1));
+                let idx = (offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+                return Ok((offset, 1, idx));
             }
             // === PATCH 4: Race-free next_index rollback (CAS loop) ===
             // ─── PATCH 4: only the thread that over‑allocated rolls back ───
@@ -762,10 +677,20 @@ impl PatriciaTree {
                     (*node_ptr).left.store(0, Ordering::Relaxed);
                     (*node_ptr).right.store(0, Ordering::Relaxed);
                     (*node_ptr).expires.store(expires, Ordering::Relaxed);
-                    (*node_ptr).refcnt.store(1, Ordering::Relaxed); // first occurrence
+                    (*node_ptr).is_terminal.store(u8::from(is_terminal), Ordering::Relaxed);
+                    (*node_ptr).refcnt.store(if is_terminal { 1 } else { 0 }, Ordering::Relaxed);
                     g
                 };
-                return Ok((offset, gen));
+                let idx = (offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
+                unsafe {
+                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                    if let Some(s) = tag {
+                        core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
+                    }
+                    (*node_ptr).tag_off.store(idx, Ordering::Release);
+                }
+                return Ok((offset, gen, idx));
             } else {
                 return Err(Error::CapacityExceeded); // caller will drop lock and retry
             }
@@ -781,23 +706,7 @@ impl PatriciaTree {
         ttl: u64,
         tag: Option<&str>,
     ) -> Result<(Offset, u32, u32), Error> {
-        if let Some(s) = tag {
-            if s.len() > TAG_MAX_LEN {
-                return Err(Error::TagTooLong);
-            }
-        }
-        let (off, gen) = self.allocate_node_with_gen(key, plen, ttl)?;
-        let idx = (off - HEADER_PADDED as u32) / size_of::<Node>() as u32;
-        unsafe {
-            let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
-            core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
-            if let Some(s) = tag {
-                core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
-            }
-        }
-        let node = unsafe { &*(self.base.as_ptr().add(off as usize) as *const Node) };
-        node.tag_off.store(idx, Ordering::Release);
-        Ok((off, gen, idx))
+        self.alloc_raw_node(key, plen, ttl, true, tag)
     }
 
     #[inline(always)]
@@ -1079,8 +988,30 @@ impl PatriciaTree {
 
     /// Bulk insert multiple entries
     pub fn bulk_insert(&self, items: &[(u128, u8, u64)]) -> Result<(), Error> {
+        let hdr = unsafe { &*self.hdr.as_ptr() };
+        if hdr.capacity == 0 {
+            return Err(Error::ZeroCapacity);
+        }
+        let _write_guard = unsafe {
+            hdr.lock.assume_init_ref().write_lock(&self.lock_handles)
+                .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
+        };
+
         for &(k, l, t) in items {
-            self.insert(k, l, t, None)?;
+            if l > 128 {
+                return Err(Error::InvalidPrefix);
+            }
+            let stored_key = canonical(k, l);
+            let expires = if t == 0 {
+                u64::MAX
+            } else {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("SystemTime before UNIX_EPOCH in bulk_insert; system clock is invalid")
+                    .as_secs()
+                    .saturating_add(t)
+            };
+            self.insert_inner(stored_key, l, expires, None)?;
         }
         Ok(())
     }
