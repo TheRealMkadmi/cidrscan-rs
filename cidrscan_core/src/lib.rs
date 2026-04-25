@@ -709,6 +709,19 @@ impl PatriciaTree {
         self.alloc_raw_node(key, plen, ttl, true, tag)
     }
 
+    #[inline]
+    fn read_tag(&self, idx: u32) -> &str {
+        unsafe {
+            let ptr = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN);
+            let slice = std::slice::from_raw_parts(ptr, TAG_MAX_LEN);
+            let mut len = TAG_MAX_LEN;
+            while len > 0 && slice[len - 1] == 0 {
+                len -= 1;
+            }
+            core::str::from_utf8_unchecked(&slice[..len])
+        }
+    }
+
     #[inline(always)]
     fn follow(&self, packed: u64) -> Option<(&Node, u32)> {
         if packed == 0 {
@@ -820,20 +833,12 @@ impl PatriciaTree {
                     }
                     // Return the match info
                     let idx = node.tag_off.load(Ordering::Acquire);
-                    unsafe {
-                        let ptr = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN);
-                        let slice = std::slice::from_raw_parts(ptr, TAG_MAX_LEN);
-                        let mut len = TAG_MAX_LEN;
-                        while len > 0 && slice[len - 1] == 0 {
-                            len -= 1;
-                        }
-                        let tag = core::str::from_utf8_unchecked(&slice[..len]);
-                        return Some(Match {
-                            cidr_key: node.key,
-                            plen: node.prefix_len,
-                            tag,
-                        });
-                    }
+                    let tag = self.read_tag(idx);
+                    return Some(Match {
+                        cidr_key: node.key,
+                        plen: node.prefix_len,
+                        tag,
+                    });
                 }
                 // else: internal node expired, but traversal continues
             }
@@ -1142,7 +1147,10 @@ impl PatriciaTree {
                         .expect("SystemTime before UNIX_EPOCH in resize; system clock is invalid")
                         .as_secs(),
                 );
-                next.insert(node.key, node.prefix_len, ttl, None)?;
+                let idx = node.tag_off.load(Ordering::Acquire);
+                let tag = self.read_tag(idx);
+                let tag = if tag.is_empty() { None } else { Some(tag) };
+                next.insert(node.key, node.prefix_len, ttl, tag)?;
             }
             let l = node.left.load(Ordering::Acquire);
             let r = node.right.load(Ordering::Acquire);
@@ -1161,6 +1169,7 @@ impl PatriciaTree {
             std::ptr::swap(&mut self.shmem, &mut next.shmem);
             std::ptr::swap(&mut self.base, &mut next.base);
             std::ptr::swap(&mut self.hdr, &mut next.hdr);
+            std::ptr::swap(&mut self.tag_base, &mut next.tag_base);
             std::ptr::swap(&mut self.os_id, &mut next.os_id);
         }
         // Release the lock while the old mapping is still valid.

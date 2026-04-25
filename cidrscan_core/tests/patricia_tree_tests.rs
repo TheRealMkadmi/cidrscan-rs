@@ -220,3 +220,17 @@ fn reused_slot_changes_generation_and_old_pointer_goes_stale() {
     assert!(tree.lookup(key1).is_none());
     assert!(tree.lookup(key2).is_some());
 }
+
+#[test]
+fn resize_preserves_tags() {
+    let name = format!("test_resize_tag_{}", std::process::id());
+    let mut tree = PatriciaTree::open(&name, 8).unwrap();
+    let key = v4_key(0x0A0B0C00);
+    let plen = v4_plen(24);
+
+    tree.insert(key, plen, 3600, Some("edge-tag")).unwrap();
+    tree.resize(32).unwrap();
+
+    let m = tree.lookup(key).unwrap();
+    assert_eq!(m.tag, "edge-tag");
+}
