@@ -45,28 +45,6 @@ jobs:
     runs-on: ubuntu-latest   
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: stable
-      - name: Setup PHP
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.3'
-      - name: Install libclang
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-php --locked
-      - name: Build stubs
-        run: cargo php stubs --manifest cidrscan_php/Cargo.toml -o cidrscan_php.phpstub
-        continue-on-error: true
-      - name: Fallback - use committed stubs
-        if: failure()
-        run: |
-          if [ -f cidrscan_php/cidrscan_php.phpstub ]; then
-            cp cidrscan_php/cidrscan_php.phpstub .
-          else
-            echo '<?php // stub generation failed - rebuild manually' > cidrscan_php.phpstub
-          fi
       - name: Upload stub artifact
         uses: actions/upload-artifact@v4
         with:
