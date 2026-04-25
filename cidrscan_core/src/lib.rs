@@ -31,7 +31,7 @@ use helpers::*;
 use types::Offset;
 use crate::errors::Error;
 use types::*;
-use crate::shmem_rwlock::RawRwLock;
+use crate::shmem_rwlock::{LockHandles, RawRwLock};
 use crossbeam_epoch as epoch;
 use log::{debug, error, info, trace, warn};
 use metrics::{counter, gauge};
@@ -43,6 +43,7 @@ use std::{
     mem::size_of,
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
     cell::Cell,
 };
@@ -142,21 +143,8 @@ impl PatriciaTree {
         };
         let tag_base = NonNull::new(tag_base_ptr).expect("tag_base_ptr is null in PatriciaTree::open");
 
-        // === PATCH 1: Header parameter mismatch guard ===
-        if !is_creator {
-            if hdr_mut.version != HEADER_VERSION || hdr_mut.capacity != capacity {
-                // Return error if version or capacity mismatches
-                return Err(ShmemError::MapOpenFailed(69));
-            }
-        }
-
-        // Initialise the RW-lock and header when the region is (re-)created
-        if is_creator
-            || hdr_mut.magic != HEADER_MAGIC
-            || hdr_mut.version != HEADER_VERSION
-            || hdr_mut.capacity != capacity
-        {
-            // -- write full header once (lock still zero) --
+        let mut creator_initialized = false;
+        if is_creator {
             unsafe {
                 core::ptr::write(
                     hdr_ptr,
@@ -176,22 +164,31 @@ impl PatriciaTree {
                     },
                 );
             }
-        }
-        if is_creator { hdr_mut.global_epoch.store(1, Ordering::Release); }
-        let prev = hdr_mut.lock_init.fetch_or(1, Ordering::AcqRel);
-        if prev == 0 {
-            // first opener in this process: initialise the bytes
             unsafe {
                 RawRwLock::new_in_place((&mut hdr_mut.lock).as_mut_ptr())
                     .map_err(|_| ShmemError::MapOpenFailed(73))?;
             }
-        } else {
-            // subsequent opens: attach to existing lock state
-            unsafe {
-                RawRwLock::reopen_in_place((&mut hdr_mut.lock).as_mut_ptr())
-                    .map_err(|_| ShmemError::MapOpenFailed(74))?;
+            hdr_mut.init_flag.store(1, Ordering::Release);
+            creator_initialized = true;
+        }
+
+        while hdr_mut.init_flag.load(Ordering::Acquire) == 0 {
+            thread::yield_now();
+        }
+
+        if !creator_initialized {
+            if hdr_mut.magic != HEADER_MAGIC
+                || hdr_mut.version != HEADER_VERSION
+                || hdr_mut.capacity != capacity
+            {
+                return Err(ShmemError::MapOpenFailed(69));
             }
         }
+
+        let lock_handles = unsafe {
+            LockHandles::from_existing(hdr_mut.lock.assume_init_ref())
+                .map_err(|_| ShmemError::MapOpenFailed(74))?
+        };
         let hdr_ref = unsafe { &*hdr_ptr };
         hdr_ref
             .ref_count
@@ -204,6 +201,7 @@ impl PatriciaTree {
             shmem,
             base,
             tag_base,
+            lock_handles,
             hdr,
             os_id: os_name.clone(),
             freelist: Arc::new(SegQueue::new()),
@@ -248,7 +246,7 @@ impl PatriciaTree {
         }
         // Acquire write lock using guard
         let _write_guard = unsafe {
-            hdr.lock.assume_init_ref().write_lock()
+            hdr.lock.assume_init_ref().write_lock(&self.lock_handles)
                 .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
         };
         debug!(
@@ -892,7 +890,7 @@ impl PatriciaTree {
                         if let Some(_g) = unsafe {
                             hdr.lock
                                 .assume_init_ref()
-                                .try_write_lock(Timeout::Val(Duration::from_secs(0)))
+                                .try_write_lock(&self.lock_handles, Timeout::Val(Duration::from_secs(0)))
                         } {
                             // double‑check under lock
                             if node.expires.load(Ordering::Acquire) < now {
@@ -964,7 +962,7 @@ impl PatriciaTree {
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
         let _write_guard = unsafe {
-            hdr.lock.assume_init_ref().write_lock()
+            hdr.lock.assume_init_ref().write_lock(&self.lock_handles)
                 .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
         };
         debug!("[DELETE] Lock acquired.");
@@ -1089,7 +1087,7 @@ impl PatriciaTree {
         let hdr = unsafe { &*self.hdr.as_ptr() };
         // Acquire write lock using guard
         let _write_guard = unsafe {
-            hdr.lock.assume_init_ref().write_lock()
+            hdr.lock.assume_init_ref().write_lock(&self.lock_handles)
                 .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
         };
         debug!("[CLEAR] Lock acquired.");
@@ -1182,7 +1180,7 @@ impl PatriciaTree {
 
         // ---- exclusive lock: no mutators, look‑ups keep running ----------
         let _guard = unsafe {
-            hdr.lock.assume_init_ref().write_lock()
+            hdr.lock.assume_init_ref().write_lock(&self.lock_handles)
                 .map_err(|e| Error::Lock(format!("write_lock failed: {e}")))?
         };
 
@@ -1232,6 +1230,7 @@ impl PatriciaTree {
         }
         // Release the lock while the old mapping is still valid.
         drop(_guard);
+        std::mem::swap(&mut self.lock_handles, &mut next.lock_handles);
         // `next` now owns the *old* mapping and will unmap it on drop.
         Ok(())
     }

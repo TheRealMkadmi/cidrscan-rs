@@ -1,7 +1,7 @@
 //! Data structures for Patricia tree
 
 
-use crate::shmem_rwlock::RawRwLock;
+use crate::shmem_rwlock::{LockHandles, RawRwLock};
 use std::mem::MaybeUninit;
 use std::{
     ptr::NonNull,
@@ -55,6 +55,7 @@ pub struct PatriciaTree {
     pub hdr: NonNull<Header>, // Pointer to header in shared memory
     pub base: NonNull<u8>,    // Base pointer for node offsets
     pub tag_base: NonNull<u8>, // start of tag slab
+    pub lock_handles: LockHandles, // process-local lock/event handles
     pub os_id: String,        // Track the shared memory name for Drop
     pub freelist: Arc<SegQueue<u64>>, // locally-owned queue of freed offsets (now u64 for epoch+offset)
     pub local_epoch: Cell<u64>,          // <── NEW (std::cell::Cell)
