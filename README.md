@@ -21,7 +21,7 @@
    * [Delete (Writer‑exclusive)](#delete)
 6. [Design Philosophy](#design-philosophy)
 7. [Safety & Correctness](#safety--correctness)
-8. [Benchmarks](#benchmarks)
+8. [Known Limitations](#known-limitations)
 9. [Road‑map](#road‑map)
 10. [License](#license)
 
@@ -52,7 +52,7 @@ Traditional LPM libraries fall into two camps:
 * **ABA‑safe pointers**: every child link stores `(offset, generation)`; stale readers restart instead of following reused nodes.
 * **Process-local reclamation queue**: freed offsets are retired locally and become reusable after `flush()` advances the local epoch.
 * **In-process resize**: `tree.resize(new_capacity)` copies live prefixes into a bigger mapping, including tags, then swaps the current handle to the new arena.
-* **Custom shared RW‑lock** (`RawRwLock`): writer‑preferential, fits entirely in the shared page, works on Linux, macOS, and Windows.
+* **Custom shared RW‑lock** (`RawRwLock`): writer‑preferential, fits entirely in the shared page, and runs on Linux, macOS, and Windows, though owner-death recovery differs by platform.
 * **Tiny build‑time footprint**: single `cargo build`, no `unsafe` outside thin FFI & atomics.
 * **Language‑agnostic packages**: CI publishes pre‑built `*.zip` bundles with **`.dll` / `.so` / `.dylib` + `cidrscan.h`**.
 
@@ -202,6 +202,16 @@ Time‑complexity: ***O(log W)*** where `W ≤ 128`.
 * Header `magic` + `version` checked on every `open`; mismatches fail early.
 * Every public API returns an `ErrorCode`; the last error is thread‑local and human‑readable via `patricia_strerror`.
 * Property tests and stress tests cover ABA reuse detection, TTL expiry, resize tag preservation, stale-tag reuse, and shared-memory visibility.
+
+---
+
+## Known Limitations
+
+* **Cross-process support is baseline, not fully coordinated**: separate processes can open the same shared-memory arena and observe each other's inserts, but the freelist and epoch queue remain process-local to each handle.
+* **`resize()` is in-process only**: it swaps the current handle to a new arena mapping, but other processes do not automatically discover or follow that replacement.
+* **TTL cleanup is opportunistic**: expired prefixes are removed during later lookups or explicit maintenance, so an expired entry can remain resident until something touches that branch again.
+* **Crash recovery semantics vary by platform**: Linux uses robust pthread mutexes for writer owner-death recovery; macOS does not expose equivalent robust mutex support, so a writer crash is not recovered the same way there.
+* **Capacity is fixed per arena**: the trie does not grow automatically and there is no background compactor, so long-running deployments need explicit capacity planning.
 
 ---
 
