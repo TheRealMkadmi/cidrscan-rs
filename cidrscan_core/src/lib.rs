@@ -255,7 +255,7 @@ impl PatriciaTree {
         };
         debug!(
             "[INSERT] Lock acquired. Current next_index={}",
-            hdr.next_index.load(Ordering::Relaxed)
+            hdr.next_index.load(Ordering::Acquire)
         );
 
         // Store canonical key
@@ -284,7 +284,7 @@ impl PatriciaTree {
         let hdr = unsafe { &*self.hdr.as_ptr() };
         let mut current_link_ptr = &hdr.root_offset as *const AtomicU64 as *mut AtomicU64;
         loop {
-            let current_ptr = unsafe { (*current_link_ptr).load(Ordering::Relaxed) };
+            let current_ptr = unsafe { (*current_link_ptr).load(Ordering::Acquire) };
             let (current_offset, current_gen) = unpack(current_ptr);
             trace!(
                 "[INSERT] Loop start. current_offset={}, current_gen={}",
@@ -295,7 +295,7 @@ impl PatriciaTree {
             // --- Case 1: Empty Link ---
             if current_offset == 0 {
                 trace!("[INSERT] Case 1: Empty link found.");
-                let current_node_count = hdr.next_index.load(Ordering::Relaxed);
+                let current_node_count = hdr.next_index.load(Ordering::Acquire);
                 trace!(
                     "[INSERT] Checking capacity: count={}, capacity={}",
                     current_node_count,
@@ -359,7 +359,7 @@ impl PatriciaTree {
             if cpl == prefix_len && cpl == current_node.prefix_len && stored_key == current_node.key
             {
                 debug!("[INSERT] Subcase 2a: Exact match found (full key). Updating TTL.");
-                current_node.expires.store(expires, Ordering::Relaxed);
+                current_node.expires.store(expires, Ordering::Release);
                 current_node.is_terminal.store(1, Ordering::Release); // mark as stored
                 current_node.refcnt.fetch_add(1, Ordering::AcqRel); // increment multiplicity
                 debug!("[INSERT] Finished Subcase 2a.");
@@ -374,7 +374,7 @@ impl PatriciaTree {
                     "[INSERT] Subcase 2b: Insert-above (shorter prefix) required at cpl={}.",
                     cpl
                 );
-                let current_node_count = hdr.next_index.load(Ordering::Relaxed);
+                let current_node_count = hdr.next_index.load(Ordering::Acquire);
                 trace!(
                     "[INSERT] Checking capacity for insert above: count={}, capacity={}",
                     current_node_count,
@@ -891,7 +891,7 @@ impl PatriciaTree {
         // Track parent links for pruning
         let mut links: Vec<(&AtomicU64, u8)> = Vec::with_capacity(128);
         links.push((&hdr.root_offset, 0)); // root has fictitious plen 0
-        let mut current_ptr = hdr.root_offset.load(Ordering::Relaxed);
+        let mut current_ptr = hdr.root_offset.load(Ordering::Acquire);
         let mut current_offset;
         let mut current_gen;
         (current_offset, current_gen) = unpack(current_ptr);
@@ -909,7 +909,7 @@ impl PatriciaTree {
                 // ABA detected, restart from root
                 links.clear();
                 links.push((&(*hdr).root_offset, 0));
-                current_ptr = hdr.root_offset.load(Ordering::Relaxed);
+                current_ptr = hdr.root_offset.load(Ordering::Acquire);
                 (current_offset, current_gen) = unpack(current_ptr);
                 continue;
             }
@@ -996,7 +996,7 @@ impl PatriciaTree {
             } else {
                 &node.right
             };
-            current_ptr = child_atomic.load(Ordering::Relaxed);
+            current_ptr = child_atomic.load(Ordering::Acquire);
             links.push((child_atomic, node.prefix_len));
             (current_offset, current_gen) = unpack(current_ptr);
         }
@@ -1078,7 +1078,7 @@ impl PatriciaTree {
             let (off, _) = unpack(packed);
             let root = self.node(off as u64);
 
-            if root.is_terminal.load(Ordering::Relaxed) != 0 {
+            if root.is_terminal.load(Ordering::Acquire) != 0 {
                 return;
             }
 
