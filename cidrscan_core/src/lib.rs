@@ -330,8 +330,8 @@ impl PatriciaTree {
                 current_offset
             );
             let current_node = unsafe {
-                let ptr = self.base.as_ptr().add(current_offset as usize) as *mut Node;
-                &mut *ptr
+                let ptr = self.base.as_ptr().add(current_offset as usize) as *const Node;
+                &*ptr
             };
             trace!(
                 "[INSERT] Current node: key={:x}, prefix_len={}",
@@ -382,7 +382,7 @@ impl PatriciaTree {
 
                 unsafe {
                     let new_node =
-                        &mut *(self.base.as_ptr().add(new_node_offset as usize) as *mut Node);
+                        &*(self.base.as_ptr().add(new_node_offset as usize) as *const Node);
                     // Bit to check in the *existing* node's key at the *new* node's prefix length
                     let existing_node_bit = get_bit(current_node.key, prefix_len);
                     trace!(
@@ -569,7 +569,7 @@ impl PatriciaTree {
                     // This whole block needs to be atomic with respect to the parent link update
                     unsafe {
                         let internal_node =
-                            &mut *(self.base.as_ptr().add(internal_offset as usize) as *mut Node);
+                            &*(self.base.as_ptr().add(internal_offset as usize) as *const Node);
                         let new_bit = get_bit(key, split_bit);
                         trace!("[INSERT] Split branching: new_key_bit={}", new_bit);
                         if new_bit == 0 {
