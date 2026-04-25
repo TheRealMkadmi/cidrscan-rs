@@ -52,6 +52,8 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-php --locked
       - name: Build stubs
