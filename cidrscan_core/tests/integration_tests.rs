@@ -1,10 +1,15 @@
 use std::{
+    env,
+    process::Command,
     sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant},
 };
 
 use cidrscan_core::types::PatriciaTree;
+
+const XPROC_CHILD_FLAG: &str = "CIDRSCAN_XPROC_CHILD";
+const XPROC_SHM_NAME: &str = "CIDRSCAN_XPROC_SHM_NAME";
 
 /// Helper to convert an IPv4 octets into our u128 key representation.
 fn ipv4_to_u128(a: u8, b: u8, c: u8, d: u8) -> u128 {
@@ -15,12 +20,31 @@ fn ipv4_to_u128(a: u8, b: u8, c: u8, d: u8) -> u128 {
 fn basic_insert_lookup_delete() {
     let name = format!("test_basic_insert_delete_{}", std::process::id());
     let tree = PatriciaTree::open(&name, 1024).unwrap();
-        let key = ipv4_to_u128(192, 168, 0, 1);
+    let key = ipv4_to_u128(192, 168, 0, 1);
     assert!(tree.lookup(key).is_none());
     let _ = tree.insert(key, 32, 60, None);
     assert!(tree.lookup(key).is_some());
     let _ = tree.delete(key, 32);
     assert!(tree.lookup(key).is_none());
+}
+
+#[test]
+fn cross_process_child_helper() {
+    if env::var_os(XPROC_CHILD_FLAG).is_none() {
+        return;
+    }
+
+    let name = env::var(XPROC_SHM_NAME).expect("missing shared-memory name for child process");
+    let tree = PatriciaTree::open(&name, 1024).expect("child failed to open shared-memory tree");
+
+    assert!(
+        tree.lookup_v4(u32::from_be_bytes([192, 168, 0, 1]))
+            .is_some(),
+        "child could not observe parent insert for 192.168.0.1/32"
+    );
+
+    tree.insert_v4(u32::from_be_bytes([10, 0, 0, 1]), 32, 60)
+        .expect("child failed to insert 10.0.0.1/32");
 }
 
 #[test]
@@ -72,6 +96,37 @@ fn shared_memory_visibility_between_handles() {
 }
 
 #[test]
+fn cross_process_visibility() {
+    let name = format!("test_xproc_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 1024).unwrap();
+    let parent_key = u32::from_be_bytes([192, 168, 0, 1]);
+    let child_key = u32::from_be_bytes([10, 0, 0, 1]);
+
+    tree.insert_v4(parent_key, 32, 60).unwrap();
+
+    let output = Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("cross_process_child_helper")
+        .arg("--nocapture")
+        .env(XPROC_CHILD_FLAG, "1")
+        .env(XPROC_SHM_NAME, &name)
+        .output()
+        .expect("failed to spawn child test process");
+
+    assert!(
+        output.status.success(),
+        "child process failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        tree.lookup_v4(child_key).is_some(),
+        "parent could not observe child insert for 10.0.0.1/32"
+    );
+}
+
+#[test]
 fn concurrent_threaded_inserts_and_lookups() {
     const THREADS: usize = 8;
     const OPS_PER_THREAD: usize = 1_000;
@@ -83,7 +138,7 @@ fn concurrent_threaded_inserts_and_lookups() {
     let mut handles = vec![];
     for t in 0..THREADS {
         let tr = Arc::clone(&tree);
-        let b  = Arc::clone(&barrier);
+        let b = Arc::clone(&barrier);
         handles.push(thread::spawn(move || {
             b.wait();
             for i in 0..OPS_PER_THREAD {
@@ -97,7 +152,9 @@ fn concurrent_threaded_inserts_and_lookups() {
             }
         }));
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 #[test]
@@ -108,14 +165,18 @@ fn stress_test_timing() {
     let name = format!("test_stress_{}", std::process::id());
     let tree = PatriciaTree::open(&name, CAPACITY).unwrap();
     let keys: Vec<u128> = (0..NUM_KEYS).map(|i| i as u128).collect();
-    
+
     for &k in &keys {
         let _ = tree.insert(k, 64, 3600, None);
     }
 
     let start = Instant::now();
     for &k in &keys {
-        assert!(tree.lookup(k).is_some(), "Lookup failed for key {} during stress test", k);
+        assert!(
+            tree.lookup(k).is_some(),
+            "Lookup failed for key {} during stress test",
+            k
+        );
     }
     let elapsed = start.elapsed();
     let avg = elapsed.as_micros() as f64 / keys.len() as f64;
