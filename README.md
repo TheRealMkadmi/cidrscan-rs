@@ -1,6 +1,6 @@
 # CIDRScan‑rs
 
-*A cross‑process, lock‑free‑read, memory‑resident Patricia‑trie engine for **O( log W )** longest‑prefix matching (LPM) with per‑prefix TTLs and a tiny, language‑agnostic C ABI.*
+*A shared-memory, lock-free-read Patricia-trie engine for **O(log W)** longest-prefix matching (LPM) with per-prefix TTLs, tags, and a tiny language-agnostic C ABI.*
 
 ---
 
@@ -36,11 +36,11 @@ Traditional LPM libraries fall into two camps:
 | **Kernel‑style radix trees**       | Tightly coupled to in‑kernel allocators; not shareable across processes. |
 | **User‑space hash / tree hybrids** | Require coarse locks or exotic GC; do not support TTLs.                  |
 
-**CIDRScan‑rs** is purpose‑built for *application‑space firewalls, geo‑fencing, and abuse‑detection engines* that spawn dozens of workers (Laravel Octane, Puma, Gunicorn, etc.).  It delivers:
+**CIDRScan‑rs** is aimed at *application‑space firewalls, geo‑fencing, and abuse‑detection engines* that want a single memory-mapped trie with cheap reads and explicit operational tradeoffs. It delivers:
 
-* **Lock‑free reads** – every lookup is a wait‑free walk of atomic pointers.
-* **True cross‑process sharing** – the entire arena is one POSIX/Win32 shared‑memory region.
-* **Per‑prefix TTLs** – each node ages out automatically.
+* **Lock‑free reads** – lookups walk atomic pointers without taking the global writer lock; opportunistic TTL GC may briefly attempt a best-effort write lock.
+* **Shared-memory arenas** – the trie lives in one POSIX/Win32 shared-memory region that multiple handles can open.
+* **Per‑prefix TTLs** – expired prefixes are reclaimed opportunistically.
 * **Built‑in C ABI** – call from PHP/Ruby/Node/Python in < 5 lines.
 * **Deterministic memory usage** – capacity is fixed up‑front; no heap allocations at runtime.
 
@@ -48,10 +48,10 @@ Traditional LPM libraries fall into two camps:
 
 ## Feature Highlights
 
-* **Opportunistic pruning**: unary internal nodes are collapsed on‑the‑fly during lookups; the tree stays compact with *zero* background threads.
-* **ABA‑safe pointers**: every child link stores `(offset, generation)`; stale readers restart without panicking.
-* **Epoch‑based reclamation**: freed offsets are recycled lock‑free once all readers in *every* thread of *every* process have advanced.
-* **Atomically growing arenas**: `tree.resize(new_capacity)` copies live prefixes into a bigger mapping and drops the old one lazily.
+* **Opportunistic pruning**: unary internal nodes are collapsed during lookups; no background compactor is required.
+* **ABA‑safe pointers**: every child link stores `(offset, generation)`; stale readers restart instead of following reused nodes.
+* **Process-local reclamation queue**: freed offsets are retired locally and become reusable after `flush()` advances the local epoch.
+* **In-process resize**: `tree.resize(new_capacity)` copies live prefixes into a bigger mapping, including tags, then swaps the current handle to the new arena.
 * **Custom shared RW‑lock** (`RawRwLock`): writer‑preferential, fits entirely in the shared page, works on Linux, macOS, and Windows.
 * **Tiny build‑time footprint**: single `cargo build`, no `unsafe` outside thin FFI & atomics.
 * **Language‑agnostic packages**: CI publishes pre‑built `*.zip` bundles with **`.dll` / `.so` / `.dylib` + `cidrscan.h`**.
@@ -147,7 +147,7 @@ Because every pointer is an *offset* from `base`, the region may be mapped at di
         free (delete / TTL)  ← retire (epoch) ← all readers left
 ```
 
-A freed node’s offset is pushed into a per‑process `SegQueue`; once `crossbeam‑epoch` certifies that no thread still sees the old generation, the slot is immediately reusable.
+A freed node’s offset is retired into a process-local queue and becomes reusable after a later `flush()` advances the handle’s local epoch.
 
 ### Cross‑process RW‑Lock
 
@@ -165,7 +165,7 @@ A freed node’s offset is pushed into a per‑process `SegQueue`; once `crossbe
 2. Compare common‑prefix length; if shorter, return **miss**.
 3. Descend via `get_bit(key, plen)` – *no locks, no branches on the hot path*.
 4. On the way *back up*, try `prune(parent)` if the node we just left became unary.
-5. TTL expired? opportunistically GC under a best‑effort `try_write_lock`.
+5. TTL expired? opportunistically GC under a best-effort `try_write_lock`.
 
 Time‑complexity: ***O(log W)*** where `W ≤ 128`.
 
@@ -189,7 +189,7 @@ Time‑complexity: ***O(log W)*** where `W ≤ 128`.
 | Principle                        | Practice                                                       |
 | -------------------------------- | -------------------------------------------------------------- |
 | **Determinism beats heuristics** | Fixed‑size arenas, explicit TTLs, no GC threads.               |
-| **Wait‑free reads**              | All hot‑path operations are atomic loads & pointer chases.     |
+| **Lock‑free reads**              | Hot-path lookups are atomic loads and pointer chases.          |
 | **Explainable behaviour**        | Every mutation path is \~200 LOC, fully unit‑tested.           |
 | **No surprise allocations**      | All memory comes from the pre‑mapped region.                   |
 | **One binary, any language**     | C ABI + pre‑generated headers; no `bindgen` needed at runtime. |
@@ -201,7 +201,7 @@ Time‑complexity: ***O(log W)*** where `W ≤ 128`.
 * `#[repr(C, align(64))]` on all shared structs – no padding surprises.
 * Header `magic` + `version` checked on every `open`; mismatches fail early.
 * Every public API returns an `ErrorCode`; the last error is thread‑local and human‑readable via `patricia_strerror`.
-* 400+ lines of property tests (proptest) + stress tests exercising ABA, TTL expiry, and multi‑process visibility.
+* Property tests and stress tests cover ABA reuse detection, TTL expiry, resize tag preservation, stale-tag reuse, and shared-memory visibility.
 
 ---
 
