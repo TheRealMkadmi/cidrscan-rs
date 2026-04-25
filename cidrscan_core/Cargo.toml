@@ -38,6 +38,7 @@ proptest = "1"
 num_cpus = "1"
 rand = "0.9.1"
 cargo-make = "0.37"
+loom = "0.7"
 
 [build-dependencies]
 cbindgen = "0.28.0"
@@ -45,3 +46,4 @@ cbindgen = "0.28.0"
 [features]
 trace = []
 enable_global_priv = []
+loom-tests = []
