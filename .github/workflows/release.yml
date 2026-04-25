@@ -200,6 +200,7 @@ jobs:
   build-php:
     needs: generate-stubs
     strategy:
+      fail-fast: false
       matrix:
         include:
           # Linux NTS (x86_64 + aarch64)
@@ -244,6 +245,7 @@ jobs:
           version: ${{ matrix.version }}
           arch: x64
           ts: ${{ matrix.phpts }}
+        continue-on-error: true
 
       - if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
