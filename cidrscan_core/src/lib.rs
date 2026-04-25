@@ -219,11 +219,15 @@ impl PatriciaTree {
         self.local_epoch.set(g);
 
         // reclaim if two full epochs have passed
+        let mut reclaimed = Vec::new();
         while let Some(raw) = self.freelist.pop() {
             let node_epoch = raw >> 32;
             if g.wrapping_sub(node_epoch) < 2 { self.freelist.push(raw); break }
-            // real reclaim:
-            self.free_node((raw & 0xFFFF_FFFF) as u64);
+            reclaimed.push(raw & 0xFFFF_FFFF);
+        }
+        for off in reclaimed {
+            // Mature retired nodes become directly reusable allocation slots.
+            self.freelist.push(off);
         }
     }
 

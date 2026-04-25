@@ -6,8 +6,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use raw_sync::events::{Event as RawEvent, EventImpl, EventInit};
 use raw_sync::locks::{LockImpl, LockInit, Mutex as RawMutex};
 use raw_sync::Timeout;
-use memoffset::offset_of;
-use crate::Header;
 use std::{mem::MaybeUninit, sync::Arc};
 #[cfg(target_os = "linux")]
 use libc::pthread_mutex_consistent;
@@ -153,21 +151,11 @@ impl RawRwLock {
         #[cfg(unix)]
         {
             let result = self.mutex(handles).lock();
-            let guard = match result {
-                Ok(g) => g,
+            let (guard, recovered_owner_dead) = match result {
+                Ok(g) => (Some(g), false),
                 Err(e) => {
                     let msg = format!("{}", e);
                     if msg.contains("EOWNERDEAD") {
-                        unsafe {
-                            let hdr_ptr = (self as *const _ as *const u8)
-                                .offset(-(offset_of!(Header, lock) as isize))
-                                as *const Header;
-                            let _ = (*hdr_ptr).ref_count.fetch_update(
-                                Ordering::SeqCst,
-                                Ordering::SeqCst,
-                                |v| if v > 0 { Some(v - 1) } else { None },
-                            );
-                        }
                         let mtx_ptr = self.mutex_buf.as_ptr() as *mut pthread_mutex_t;
                         #[cfg(target_os = "linux")] {
                             let rc = unsafe { pthread_mutex_consistent(mtx_ptr) };
@@ -178,7 +166,7 @@ impl RawRwLock {
                         #[cfg(not(target_os = "linux"))] {
                             // no robust support; skip mutex consistency
                         }
-                        self.mutex(handles).lock().map_err(|e| crate::errors::Error::from(format!("mutex lock failed after recovery: {e}")))?
+                        (None, true)
                     } else {
                         return Err(crate::errors::Error::from(format!("mutex lock failed: {e}")));
                     }
@@ -198,7 +186,8 @@ impl RawRwLock {
             Ok(WriteGuard {
                 lock: self,
                 handles,
-                _guard: guard,
+                guard,
+                recovered_owner_dead,
             })
         }
         #[cfg(not(unix))]
@@ -218,7 +207,8 @@ impl RawRwLock {
             Ok(WriteGuard {
                 lock: self,
                 handles,
-                _guard: guard,
+                guard: Some(guard),
+                recovered_owner_dead: false,
             })
         }
     }
@@ -238,7 +228,8 @@ impl RawRwLock {
         Some(WriteGuard {
             lock: self,
             handles,
-            _guard: guard,
+            guard: Some(guard),
+            recovered_owner_dead: false,
         })
     }
 
@@ -275,7 +266,8 @@ impl LockHandles {
 pub struct WriteGuard<'a> {
     lock: &'a RawRwLock,
     handles: &'a LockHandles,
-    _guard: raw_sync::locks::LockGuard<'a>,
+    guard: Option<raw_sync::locks::LockGuard<'a>>,
+    recovered_owner_dead: bool,
 }
 
 impl<'a> Drop for WriteGuard<'a> {
@@ -285,6 +277,11 @@ impl<'a> Drop for WriteGuard<'a> {
             .lock
             .event(self.handles)
             .set(raw_sync::events::EventState::Signaled);
+        if self.recovered_owner_dead {
+            let _ = self.handles.mutex.release();
+        } else {
+            let _ = self.guard.take();
+        }
     }
 }
 

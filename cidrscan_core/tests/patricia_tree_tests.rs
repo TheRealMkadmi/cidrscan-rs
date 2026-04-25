@@ -2,10 +2,12 @@ use num_cpus;
 use proptest::collection::{hash_set, vec as pvec};
 use proptest::prelude::*;
 use rand;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::thread;
-use cidrscan_core::helpers::{v4_key, v4_plen};
-use cidrscan_core::types::PatriciaTree;
+use cidrscan_core::helpers::{unpack, v4_key, v4_plen};
+use cidrscan_core::types::{Node, PatriciaTree};
 
 #[test]
 fn basic_ops() {
@@ -154,4 +156,67 @@ fn v4_lookup_returns_tag() {
     let m = t.lookup(v4_key(0x08080808)).unwrap();
     assert_eq!(m.plen, v4_plen(24));
     assert_eq!(m.tag, "Google-DNS");
+}
+
+#[test]
+fn reused_node_has_no_stale_tag() {
+    let name = format!("test_stale_tag_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 4).unwrap();
+    tree.insert(v4_key(0x01020304), v4_plen(32), 60, Some("secret")).unwrap();
+    tree.delete(v4_key(0x01020304), v4_plen(32)).unwrap();
+    tree.flush();
+    tree.insert(v4_key(0x05060708), v4_plen(32), 60, None).unwrap();
+
+    let m = tree.lookup(v4_key(0x05060708)).unwrap();
+    assert_eq!(m.tag, "");
+}
+
+#[test]
+fn lock_survives_writer_panic() {
+    let name = format!("test_writer_panic_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 1024).unwrap();
+
+    let _ = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
+        let hdr = &*tree.hdr.as_ptr();
+        let _guard = hdr
+            .lock
+            .assume_init_ref()
+            .write_lock(&tree.lock_handles)
+            .expect("write_lock should succeed before panic");
+        panic!("simulated panic while holding write lock");
+    }));
+
+    tree.insert_v4(0xC0A80001, 32, 60).unwrap();
+    assert!(tree.lookup_v4(0xC0A80001).is_some());
+}
+
+#[test]
+fn reused_slot_changes_generation_and_old_pointer_goes_stale() {
+    let name = format!("test_aba_regression_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 2).unwrap();
+    let key1 = v4_key(0x0A000001);
+    let key2 = v4_key(0x0A000002);
+    let plen = v4_plen(32);
+
+    tree.insert(key1, plen, 60, None).unwrap();
+    let hdr = unsafe { &*tree.hdr.as_ptr() };
+    let stale_packed = hdr.root_offset.load(Ordering::Acquire);
+    let (stale_off, stale_gen) = unpack(stale_packed);
+    assert_ne!(stale_off, 0);
+
+    tree.delete(key1, plen).unwrap();
+    tree.flush();
+    tree.flush();
+    tree.insert(key2, plen, 60, None).unwrap();
+
+    let fresh_packed = hdr.root_offset.load(Ordering::Acquire);
+    let (fresh_off, fresh_gen) = unpack(fresh_packed);
+    assert_eq!(fresh_off, stale_off, "test expects slot reuse at same offset");
+    assert_ne!(fresh_gen, stale_gen, "generation must change on reuse");
+
+    let reused_node = unsafe { &*(tree.base.as_ptr().add(fresh_off as usize) as *const Node) };
+    assert_eq!(reused_node.generation.load(Ordering::Acquire), fresh_gen);
+    assert_ne!(reused_node.generation.load(Ordering::Acquire), stale_gen);
+    assert!(tree.lookup(key1).is_none());
+    assert!(tree.lookup(key2).is_some());
 }
