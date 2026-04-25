@@ -510,13 +510,11 @@ impl PatriciaTree {
                             leaf_offset = offset;
                             leaf_gen = gen;
                             let idx = (leaf_offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
-                            if let Some(s) = tag {
-                                if s.len() > TAG_MAX_LEN {
-                                    return Err(Error::TagTooLong);
-                                }
-                                unsafe {
-                                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
-                                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                            unsafe {
+                                let dst =
+                                    self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                                core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                                if let Some(s) = tag {
                                     core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
                                 }
                             }
@@ -555,13 +553,11 @@ impl PatriciaTree {
                             }
                             leaf_gen = 1;
                             let idx = (leaf_offset - HEADER_PADDED as u32) / size_of::<Node>() as u32;
-                            if let Some(s) = tag {
-                                if s.len() > TAG_MAX_LEN {
-                                    return Err(Error::TagTooLong);
-                                }
-                                unsafe {
-                                    let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
-                                    core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                            unsafe {
+                                let dst =
+                                    self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+                                core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+                                if let Some(s) = tag {
                                     core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
                                 }
                             }
@@ -790,11 +786,10 @@ impl PatriciaTree {
         }
         let (off, gen) = self.allocate_node_with_gen(key, plen, ttl)?;
         let idx = (off - HEADER_PADDED as u32) / size_of::<Node>() as u32;
-        // Only write into the slab if we actually have a tag
-        if let Some(s) = tag {
-            unsafe {
-                let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
-                core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+        unsafe {
+            let dst = self.tag_base.as_ptr().add(idx as usize * TAG_MAX_LEN) as *mut u8;
+            core::ptr::write_bytes(dst, 0, TAG_MAX_LEN);
+            if let Some(s) = tag {
                 core::ptr::copy_nonoverlapping(s.as_ptr(), dst, s.len());
             }
         }
