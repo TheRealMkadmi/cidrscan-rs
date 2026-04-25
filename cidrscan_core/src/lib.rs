@@ -1129,7 +1129,7 @@ impl PatriciaTree {
     pub fn resize(&mut self, new_capacity: usize) -> Result<(), Error> {
         let hdr = unsafe { &*self.hdr.as_ptr() };
         if new_capacity <= hdr.capacity {
-            return Err(Error::InvalidPrefix); // “too small”
+            return Err(Error::InvalidCapacity);
         }
 
         // ---- exclusive lock: no mutators, look‑ups keep running ----------

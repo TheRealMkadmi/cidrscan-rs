@@ -9,6 +9,7 @@ use std::fmt;
 #[derive(Debug)]
 pub enum Error {
     CapacityExceeded,
+    InvalidCapacity,
     ZeroCapacity,
     InvalidPrefix,
     BranchHasChildren,
@@ -22,6 +23,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::CapacityExceeded => write!(f, "Capacity exceeded"),
+            Error::InvalidCapacity => write!(f, "Invalid capacity"),
             Error::ZeroCapacity => write!(f, "Zero capacity is not allowed"),
             Error::InvalidPrefix => write!(f, "Invalid prefix"),
             Error::BranchHasChildren => write!(f, "Branch has children"),
@@ -127,6 +129,7 @@ pub extern "C" fn patricia_strerror(code: ErrorCode) -> *const c_char {
 pub fn map_error(e: &Error) -> ErrorCode {
     match e {
         Error::CapacityExceeded => ErrorCode::CapacityExceeded,
+        Error::InvalidCapacity => ErrorCode::ResizeFailed,
         Error::ZeroCapacity => ErrorCode::ZeroCapacity,
         Error::InvalidPrefix => ErrorCode::InvalidPrefix,
         Error::BranchHasChildren => ErrorCode::BranchHasChildren,
