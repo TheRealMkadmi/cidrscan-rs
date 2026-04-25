@@ -234,3 +234,19 @@ fn resize_preserves_tags() {
     let m = tree.lookup(key).unwrap();
     assert_eq!(m.tag, "edge-tag");
 }
+
+#[test]
+fn double_delete_is_idempotent() {
+    let name = format!("test_double_delete_{}", std::process::id());
+    let tree = PatriciaTree::open(&name, 16).unwrap();
+    let key = v4_key(0xC0A80101);
+    let plen = v4_plen(32);
+
+    tree.insert(key, plen, 60, None).unwrap();
+    tree.delete(key, plen).unwrap();
+    tree.delete(key, plen).unwrap();
+
+    assert!(tree.lookup(key).is_none());
+    tree.insert(key, plen, 60, None).unwrap();
+    assert!(tree.lookup(key).is_some());
+}

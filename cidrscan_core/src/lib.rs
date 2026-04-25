@@ -929,7 +929,21 @@ impl PatriciaTree {
 
             // Unmark the stored-prefix flag first (masked)
             if cpl == node.prefix_len && node.key == stored_key && node.prefix_len == prefix_len {
-                if node.refcnt.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let prev = loop {
+                    let prev = node.refcnt.load(Ordering::Acquire);
+                    if prev == 0 {
+                        debug!("[DELETE] Node refcnt already zero. No-op.");
+                        return Ok(());
+                    }
+                    if node
+                        .refcnt
+                        .compare_exchange(prev, prev - 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        break prev;
+                    }
+                };
+                if prev == 1 {
                     // last stored copy vanished
                     let left = node.left.load(Ordering::Acquire);
                     let right = node.right.load(Ordering::Acquire);
@@ -955,8 +969,8 @@ impl PatriciaTree {
                     info!("[DELETE] Node cleared (or recycled) and prune pass done.");
                     return Ok(());
                 } else {
-                    // Already un-marked: idempotent no-op
-                    debug!("[DELETE] Node was already not terminal. No-op.");
+                    // Multiple identical inserts remain; keep the node live.
+                    debug!("[DELETE] Decremented refcnt, node remains terminal.");
                     return Ok(());
                 }
             }
