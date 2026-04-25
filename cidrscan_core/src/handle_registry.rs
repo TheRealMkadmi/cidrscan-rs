@@ -1,6 +1,6 @@
 use crate::{errors::ErrorCode, PatriciaTree};
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use dashmap::DashMap;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Handle ID type - safer than raw pointers
@@ -8,14 +8,14 @@ pub type HandleId = u64;
 
 /// Global handle registry for managing PatriciaTree instances
 struct HandleRegistry {
-    handles: Mutex<HashMap<HandleId, Box<PatriciaTree>>>,
+    handles: DashMap<HandleId, Box<PatriciaTree>>,
     next_id: AtomicU64,
 }
 
 impl HandleRegistry {
     fn new() -> Self {
         Self {
-            handles: Mutex::new(HashMap::new()),
+            handles: DashMap::new(),
             next_id: AtomicU64::new(1), // Start from 1, reserve 0 for null/invalid
         }
     }
@@ -23,19 +23,8 @@ impl HandleRegistry {
     /// Register a new PatriciaTree and return its handle ID
     fn register(&self, tree: PatriciaTree) -> HandleId {
         let handle_id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let mut handles = self.handles.lock().unwrap();
-        handles.insert(handle_id, Box::new(tree));
+        self.handles.insert(handle_id, Box::new(tree));
         handle_id
-    }
-
-    /// Get a reference to a PatriciaTree by handle ID
-    fn get(&self, handle_id: HandleId) -> Result<std::sync::MutexGuard<'_, HashMap<HandleId, Box<PatriciaTree>>>, ErrorCode> {
-        if handle_id == 0 {
-            return Err(ErrorCode::InvalidHandle);
-        }
-        
-        self.handles.lock()
-            .map_err(|_| ErrorCode::InvalidHandle)
     }
 
     /// Remove a PatriciaTree from the registry
@@ -43,11 +32,8 @@ impl HandleRegistry {
         if handle_id == 0 {
             return Err(ErrorCode::InvalidHandle);
         }
-        
-        let mut handles = self.handles.lock()
-            .map_err(|_| ErrorCode::InvalidHandle)?;
-        
-        if handles.remove(&handle_id).is_some() {
+
+        if self.handles.remove(&handle_id).is_some() {
             Ok(())
         } else {
             Err(ErrorCode::InvalidHandle)
@@ -71,9 +57,12 @@ pub fn with_handle<T, F>(handle_id: HandleId, f: F) -> Result<T, ErrorCode>
 where
     F: FnOnce(&PatriciaTree) -> T,
 {
-    let handles = get_registry().get(handle_id)?;
-    match handles.get(&handle_id) {
-        Some(tree) => Ok(f(tree)),
+    if handle_id == 0 {
+        return Err(ErrorCode::InvalidHandle);
+    }
+
+    match get_registry().handles.get(&handle_id) {
+        Some(tree) => Ok(f(tree.value())),
         None => Err(ErrorCode::InvalidHandle),
     }
 }
@@ -83,9 +72,12 @@ pub fn with_handle_mut<T, F>(handle_id: HandleId, f: F) -> Result<T, ErrorCode>
 where
     F: FnOnce(&mut PatriciaTree) -> T,
 {
-    let mut handles = get_registry().get(handle_id)?;
-    match handles.get_mut(&handle_id) {
-        Some(tree) => Ok(f(tree)),
+    if handle_id == 0 {
+        return Err(ErrorCode::InvalidHandle);
+    }
+
+    match get_registry().handles.get_mut(&handle_id) {
+        Some(mut tree) => Ok(f(tree.value_mut())),
         None => Err(ErrorCode::InvalidHandle),
     }
 }
@@ -106,7 +98,7 @@ mod tests {
         let registry = HandleRegistry::new();
         
         // Test invalid handle
-        assert!(registry.get(0).is_err());
+        assert!(with_handle(0, |_| ()).is_err());
         assert!(registry.unregister(999).is_err());
     }
 }
